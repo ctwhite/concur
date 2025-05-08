@@ -1,9 +1,10 @@
 ;;; concur-proc.el --- Run commandline process asynchronously -*- lexical-binding: t; -*-
 
+(require 'ansi-color)
 (require 'cl-lib)
+(require 'concur-var)
 (require 'dash)
 (require 's)
-(require 'ansi-color)
 
 (defun concur--exec-process-output (output discard-ansi die-on-error exit-code &optional stderr)
   "Process OUTPUT from an async command.

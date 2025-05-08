@@ -9,6 +9,7 @@
 
 (require 'cl-lib)
 (require 'concur-promise)
+(require 'concur-var)
 (require 'dash)
 (require 'eieio)
 (require 'ht)
@@ -377,8 +378,8 @@ CALLBACK is passed to the FN-BODY if used interactively or eagerly."
 
     (setf (slot-value obj slot) future)
 
-    (when (and (fboundp 'log!) (concur-lazy-opts-auto-fetch opts))
-      (log! "Slot `%s` on `%s` initialized with auto-fetch." slot obj))
+    (when (concur-lazy-opts-auto-fetch opts)
+      (concur--log! "Slot `%s` on `%s` initialized with auto-fetch." slot obj))
 
     (or promise
         ;; Return a forceable thunk if auto-fetch is off
@@ -406,8 +407,7 @@ OPT supports `:auto-fetch`, `:retry`, `:timeout`, etc."
      ((and val
            (not (concur-future-p val))
            (not (concur-promise-p val)))
-      (when (fboundp 'log!)
-        (log! "Slot `%s` on `%s` already resolved to: %s" slot obj val))
+        (concur--log! "Slot `%s` on `%s` already resolved to: %s" slot obj val)
       val)
 
      ;; Slot holds a future — attempt resolution
@@ -417,12 +417,10 @@ OPT supports `:auto-fetch`, `:retry`, `:timeout`, etc."
          ((concur-promise-p promise)
           (let ((resolved (concur-promise-await promise)))
             (setf (slot-value obj slot) resolved)
-            (when (fboundp 'log!)
-              (log! "Slot `%s` on `%s` auto-fetched to: %s" slot obj resolved))
+            (concur--log! "Slot `%s` on `%s` auto-fetched to: %s" slot obj resolved)
             resolved))
          (t
-          (when (fboundp 'log!)
-            (log! "Slot `%s` on `%s` held a non-promise future: %S" slot obj promise))
+            (concur--log! "Slot `%s` on `%s` held a non-promise future: %S" slot obj promise)
           val))))
 
      ;; Otherwise: initialize it lazily
@@ -432,21 +430,18 @@ OPT supports `:auto-fetch`, `:retry`, `:timeout`, etc."
          ((and auto-fetch (concur-promise-p result))
           (let ((resolved (concur-promise-await result)))
             (setf (slot-value obj slot) resolved)
-            (when (fboundp 'log!)
-              (log! "Slot `%s` on `%s` post-init resolved to: %s" slot obj resolved))
+            (concur--log! "Slot `%s` on `%s` post-init resolved to: %s" slot obj resolved)
             resolved))
 
          ;; If result is primitive or already resolved
          ((and auto-fetch result)
           (setf (slot-value obj slot) result)
-          (when (fboundp 'log!)
-            (log! "Slot `%s` on `%s` post-init returned non-promise: %s" slot obj result))
+          (concur--log! "Slot `%s` on `%s` post-init returned non-promise: %s" slot obj result)
           result)
 
          ;; Lazy mode (no fetch)
          (t
-          (when (fboundp 'log!)
-            (log! "Slot `%s` on `%s` initialized for deferred resolution." slot obj))
+          (concur--log! "Slot `%s` on `%s` initialized for deferred resolution." slot obj)
           (slot-value obj slot))))))))
 
 (provide 'concur-slot)

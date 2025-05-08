@@ -42,6 +42,7 @@
 
 (require 'cl-lib)
 (require 'concur-proc)
+(require 'concur-var)
 (require 'dash)
 (require 'ht)
 

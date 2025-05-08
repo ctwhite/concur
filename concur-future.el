@@ -17,7 +17,9 @@
 
 (require 'cl-lib)   
 (require 'dash)
+(require 'concur-lock)
 (require 'concur-promise)
+(require 'concur-var)
 (require 'ht)
 
 (cl-defstruct
@@ -46,42 +48,47 @@ resolves or rejects it. It won't be executed until forced via
    :promise (concur-promise-new)  ;; Create an empty promise
    :thunk thunk                   ;; The thunk to resolve/reject the promise
    :evaluated? nil))              ;; Flag indicating the future hasn't been evaluated yet
-
+         
 (defmacro concur-future-once! (future &rest body)
   "Evaluate BODY only once per FUTURE. Safe to call multiple times.
-Does not return the promise directly — use `concur-future-force`."
-  (declare (indent 1))
-  `(once-do! (concur-future-evaluated? ,future)
-     (:else
-      (concur--log "[future] Already evaluated: %S" ,future)
-      (if (concur-future-promise ,future)
-          (concur--log "[future] Promise is already resolved: %S" ,future)
-        (concur--log "[future] Promise is not resolved, but future was marked evaluated.")))
 
-     (concur--log "[future] Evaluating thunk for: %S" ,future)
+This macro ensures that the FUTURE's thunk is only evaluated once, even if
+called multiple times. The evaluation is guarded by the `concur-future-evaluated?`
+slot, which is set to `t` after the first execution.
+
+Does not return the promise directly — use `concur-future-force` for that."
+  (declare (indent 1))
+  `(concur-once-do! (concur-future-evaluated? ,future)
+     (:else
+      (concur--log! "[future] Already evaluated: %S" ,future)
+      (if (concur-future-promise ,future)
+          (concur--log! "[future] Promise is already resolved: %S" ,future)
+        (concur--log! "[future] Promise is not resolved, but future was marked evaluated.")))
+
+     (concur--log! "[future] Evaluating thunk for: %S" ,future)
      (let ((thunk (concur-future-thunk ,future))
            (promise (concur-future-promise ,future)))
        (if (and thunk promise)
            (funcall thunk promise)
-         (concur--log "[future] Missing thunk or promise in FUTURE: %S" ,future)))))
-
+         (concur--log! "[future] Missing thunk or promise in FUTURE: %S" ,future)))))
+         
 ;;;###autoload
 (defun concur-future-force (future)
   "Force FUTURE's thunk to run if not already. Returns the internal promise.
 Returns nil if FUTURE is nil or not a valid concur-future object."
   (cond
    ((null future)
-    (concur--log "[future-force] FUTURE is nil. Nothing to evaluate.")
+    (concur--log! "[future-force] FUTURE is nil. Nothing to evaluate.")
     nil)
 
    ((not (concur-future-p future))
-    (concur--log "[future-force] Invalid FUTURE object: %S" future)
+    (concur--log! "[future-force] Invalid FUTURE object: %S" future)
     nil)
 
    (t
     (concur-future-once! future)
     (let ((promise (concur-future-promise future)))
-      (concur--log "[future-force] Returning promise from FUTURE: %S" promise)
+      (concur--log! "[future-force] Returning promise from FUTURE: %S" promise)
       promise))))
 
 (defalias 'concur-future-evaluate #'concur-future-force)
@@ -95,9 +102,9 @@ its result. If FN throws an error, it is caught and causes rejection."
    (lambda (promise)  ; This lambda is executed when the future is forced
      (condition-case ex
          (progn
-           (let ((result (funcall fn)))  ; Capture result of fn
-             (concur-promise-resolve promise result)))  ; Resolve promise with the result
-       (error (concur-promise-reject promise ex)))))  ; Reject promise on error
+           (let ((result (funcall fn)))
+             (concur-promise-resolve promise result)))  
+       (error (concur-promise-reject promise ex))))))
 
 ;;;###autoload
 (defun concur-future-attach (future promise &optional evaluate)

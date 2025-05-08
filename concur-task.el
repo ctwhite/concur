@@ -1,26 +1,22 @@
 ;;; concur-task.el --- Cooperative async primitives for Emacs -*- lexical-binding: t; -*-
 
-;; Author: Christian White
-;; Version: 0.1
-;; Package-Requires: ((emacs "27.1") (dash "2.19.1") (duque "0.1"))
-;; Keywords: concurrency, async, promise, future
-;; URL: https://github.com/ctwhite/concur
-
 ;;; Commentary:
 
 ;; `concur-task.el` provides lightweight cooperative concurrency for Emacs.
 ;; It introduces the `concur-async!` macro to run coroutines, with
 ;; `concur-await!` for async result waiting and `concur-with-semaphore!` for
 ;; cooperative critical sections. A task scheduler runs via idle timers
-;; and requeues coroutines using `duque`.
+;; and requeues coroutines using `ring`.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'concur-future)
+(require 'concur-lock)
 (require 'concur-promise)
+(require 'concur-var)
 (require 'dash)
-(require 'duque)
+(require 'ring)
 
 (cl-defstruct concur-semaphore
   "A semaphore to limit concurrent access to shared resources."
@@ -51,8 +47,8 @@ A small value (e.g. 0.005 = 5ms) gives more responsiveness, but may use more CPU
   "Hook run if a task throws during async scheduler execution.")
 
 (defvar concur--task-queue
-  (duque-make :max concur-scheduler-max-queue-length)
-  "FIFO queue of pending tasks for the async scheduler.")
+  (make-ring concur-scheduler-max-queue-length)
+  "FIFO ring buffer of pending tasks for the async scheduler.")
 
 (defvar concur--scheduler-idle-timer nil
   "Idle timer that processes the async task queue.")
@@ -117,15 +113,15 @@ Side Effects:
 Error Handling:
 - Any errors during task execution are caught by `condition-case`, and the error
   is passed to a hook (`concur-scheduler-error-hook`) for further handling."
-  (if (duque-empty-p concur--task-queue)
+  (if (ring-empty-p concur--task-queue)
       (concur-scheduler-stop)
-    (let ((task (duque-pop! concur--task-queue))
-          (concur--inside-scheduler t))  ;; Dynamically bind concur--inside-scheduler
-      (condition-case err
-          (funcall task)
-        (error
-         (run-hook-with-args 'concur-scheduler-error-hook err)
-         (concur--log! "Task error: %S" err))))))
+    (let ((task (ring-remove concur--task-queue)))  ;; Remove the task from the front
+      (let ((concur--inside-scheduler t))  ;; Dynamically bind concur--inside-scheduler
+        (condition-case err
+            (funcall task)
+          (error
+           (run-hook-with-args 'concur-scheduler-error-hook err)
+           (concur--log! "Task error: %S" err)))))))
 
 ;;;###autoload
 (defun concur-scheduler-queue-task (task)
@@ -145,33 +141,15 @@ Side Effects:
 Precondition:
 - The TASK argument must be a function (`functionp`). An assertion is made to ensure this."
   (cl-assert (functionp task))
-  (duque-push! concur--task-queue task)
-  (concur-scheduler-start))
-
-;;;###autoload
-(defun concur-scheduler-reset-queue ()
-  "Reset the task queue by clearing all pending tasks.
-
-This function reinitializes the task queue to an empty state, ensuring that
-all previously queued asynchronous tasks are removed. The queue is recreated
-with a maximum length defined by `concur-scheduler-max-queue-length`.
-
-Side Effects:
-- Resets the task queue to an empty state using `duque-make`.
-- The maximum length of the queue is determined by `concur-scheduler-max-queue-length`."
-  (setq concur--task-queue
-        (duque-make :max concur-scheduler-max-queue-length)))
+  (if (ring-full-p concur--task-queue)
+      (ring-remove concur--task-queue)  ;; Remove the oldest item if the ring is full
+    (ring-insert concur--task-queue task))  ;; Insert the new task at the end of the ring
+  (concur-scheduler-start))  ;; Ensure the scheduler starts if not already running
 
 ;;;###autoload
 (defsubst concur-scheduler-clear-queue ()
-  "Clear all pending asynchronous tasks in the task queue.
-
-This function is a shorthand for `concur-scheduler-reset-queue`, clearing the
-queue of any tasks that are pending.
-
-Side Effects:
-- Calls `concur-scheduler-reset-queue` to clear the task queue."
-  (concur-scheduler-reset-queue))
+  "Clear all pending asynchronous tasks in the task queue."
+  (ring-clear concur--task-queue))  ;; Clear the ring buffer
 
 ;;;###autoload
 (defsubst concur-scheduler-pending-count ()
@@ -182,7 +160,7 @@ the number of tasks that are currently queued for execution.
 
 Return Value:
 - The number of pending tasks in the task queue as an integer."
-  (duque-length concur--task-queue))
+  (ring-length concur--task-queue))  
 
 ;;; Cooperative tasking
 
@@ -214,119 +192,7 @@ Side Effects:
 - Causes the current task to yield control back to the async scheduler using `throw`."
   `(throw 'concur-yield nil))
 
-;;; Locking
-
-(defmacro concur-once-do! (place fallback &rest body)
-  "Run BODY once if PLACE is nil. Otherwise, run FALLBACK.
-
-This macro ensures that a block of code is executed only once based on the
-state of PLACE. If PLACE is nil, BODY is executed, and PLACE is set to `t`.
-If PLACE is non-nil, FALLBACK is executed instead. FALLBACK can be either
-a value or a list of forms to be evaluated.
-
-Arguments:
-- PLACE: A variable or place (could be a symbol or a generalized variable) 
-  that determines whether the body of code should be executed.
-- FALLBACK: The code to run if PLACE is non-nil. Can either be a value or
-  a list of forms (e.g., `(:else FORM...)`).
-- BODY: The code to run once if PLACE is nil.
-
-Side Effects:
-- Sets PLACE to `t` after executing BODY.
-- If PLACE is non-nil, executes FALLBACK instead of BODY.
-
-Example:
-  (concur-once-do! my-variable '(:else (message \"Already done!\")) (message \"Doing it!\"))"
-  (declare (indent 2))
-  `(if ,place
-       ,(if (and (consp fallback) (eq (car fallback) :else))
-            `(progn ,@(cdr fallback))
-          fallback)
-     (progn
-       ,(if (symbolp place)
-            `(setf ,place t)  ;; Simple variable modification
-          `(gv-letplace (getter setter) ,place
-             (funcall setter t)))  ;; For generalized variables
-       ,@body))
-
-(defmacro concur-with-lock! (place fallback &rest body)
-  "Acquire a lock on PLACE temporarily during the execution of BODY.
-
-This macro ensures that the code in BODY will only execute if PLACE is not
-locked. If PLACE is already locked (non-nil), FALLBACK will be executed instead.
-The lock is released after the execution of BODY, regardless of whether BODY
-is successful or not.
-
-Arguments:
-- PLACE: A place (e.g., a symbol or generalized variable) that acts as a lock.
-- FALLBACK: Code to execute if PLACE is already locked (can be a value or
-  `(:else FORMS...)`).
-- BODY: Code that will run while PLACE is locked.
-
-Side Effects:
-- Modifies PLACE to `t` temporarily during the execution of BODY.
-- Releases the lock on PLACE after executing BODY.
-
-Example:
-  (concur-with-lock! my-lock (:else (message \"Already locked!\")) (do-something))"
-  (declare (indent 2))
-  (let ((lock-held (gensym "lock-held")))
-    `(if ,place
-         ,(if (and (consp fallback) (eq (car fallback) :else))
-              `(progn ,@(cdr fallback))
-            fallback)
-       (let ((,lock-held t))
-         ,(if (symbolp place)
-              `(setf ,place ,lock-held)  ;; Simple variable modification
-            `(gv-letplace (getter setter) ,place
-               (funcall setter ,lock-held)))  ;; For generalized variables
-         (unwind-protect (progn ,@body)
-           ,(if (symbolp place)
-                `(setf ,place nil)  ;; Simple variable modification
-              `(gv-letplace (getter setter) ,place
-                 (funcall setter nil)))))))
-
-(defmacro concur-with-mutex! (place fallback &rest body)
-  "Generic lock macro with optional permanent form.
-Acquire a lock on PLACE, and ensure that the lock persists across runs if 
-needed.
-
-PLACE may be of the form `(:permanent SYM)` to create a lock that persists
-across multiple executions. If not permanent, the lock will only be held
-during the execution of BODY. 
-
-Arguments:
-- PLACE: The place acting as a lock, which can be `(:permanent SYM)` to 
-  indicate persistence or a symbol representing a simple lock.
-- FALLBACK: Code to run if the lock cannot be acquired (can be a value or
-  `(:else FORMS...)`).
-- BODY: Code that will run while the lock is held.
-
-Side Effects:
-- Modifies PLACE to `t` temporarily during the execution of BODY.
-- If PLACE is permanent, the lock persists across runs.
-- Releases the lock on PLACE after executing BODY.
-
-Example:
-  (concur-with-mutex! my-mutex (:permanent my-lock) (do-something))"
-  (declare (indent 2))
-  (let ((real-place (gensym "real-place"))
-        (permanent (gensym "perm")))
-    `(let* ((,permanent (and (consp ,place) (eq (car ,place) :permanent)))
-            (,real-place (if ,permanent (cadr ,place) ,place)))
-       (if ,real-place
-           ,(if (and (consp fallback) (eq (car fallback) :else))
-                `(progn ,@(cdr fallback))
-              fallback)
-         (concur-with-lock! ,real-place
-           (:else nil)
-           (concur-once-do! (not ,real-place)
-             (:else
-              ,(if (symbolp real-place)
-                   `(setf ,real-place t)  ;; Simple variable modification
-                 `(gv-letplace (getter setter) ,real-place
-                    (funcall setter t)))  ;; For generalized variables
-              ,@body)))))))
+;;; Semaphore
 
 (defun concur-semaphore-create (n)
   "Create a semaphore with N available slots.
@@ -464,7 +330,8 @@ Returns:
   - A string representing the semaphore's name."
   (let ((data (concur-semaphore-data sem)))
     (or (plist-get data :name)
-        (symbol-name (gensym "sem")))))  ;; Fallback identifier if no name is provided
+        ;; Fallback identifier if no name is provided
+        (symbol-name (gensym "sem")))))  
 
 (defmacro concur-with-semaphore! (sem &rest body)
   "Run BODY in a cooperative critical section guarded by SEM.
@@ -573,7 +440,7 @@ Returns:
          (cl-labels ((,self ()
                       (catch 'concur-yield
                         (setq ,result
-                              ,(if ,semaphore
+                              ,(if semaphore  ;; Corrected conditional here
                                    `(concur-with-semaphore! ,semaphore ,@body)
                                  `(progn ,@body)))
                         (setq ,done t))))
@@ -597,7 +464,7 @@ Returns:
                  (concur--log! "Bypassing task pool with :schedule nil")
                  (concur-promise-task ,promise)))
            ,promise)))))
-
+           
 (defmacro concur-await! (form)
   "Await the result of FORM, which must evaluate to a `concur-future`.
 
