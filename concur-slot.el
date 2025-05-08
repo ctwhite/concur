@@ -37,7 +37,6 @@ Slots:
 (defun concur-lazy-opts-create-defaults (options)
   "Create a `concur-lazy-opts' struct from OPTIONS with defaults applied.
 OPTIONS can be either a lambda expression or a plist."
-
   (let ((opts (if (functionp options)
                   (funcall options)  ;; Call the lambda to evaluate it
                 options)))  ;; Otherwise, treat it as a plist
@@ -54,7 +53,6 @@ OPTIONS can be either a lambda expression or a plist."
   "Expand placeholders in FORM.
 Supports <> for the first argument, <cb> for the callback, <1>, <2>, etc for indexed args.
 REPLACEMENTS is an optional list of cons cells for custom placeholder replacements."
-
   (let ((replacements (or replacements '())))
     ;; Helper function to walk the form and replace placeholders
     (cl-labels ((walk (x)
@@ -88,7 +86,6 @@ REPLACEMENTS is an optional list of cons cells for custom placeholder replacemen
 (cl-defmacro concur-generic-accessor! (field &optional type)
   "Define a named generic getter/setter for FIELD in struct TYPE.
 Checks that TYPE is a known `cl-defstruct` and FIELD is a valid slot."
-
  (let* ((type-symbol (or type 'generic))
          (type-name (symbol-name type-symbol))
          (field-name (symbol-name field))
@@ -115,7 +112,6 @@ Arguments:
 - :type: Optional struct type symbol. If not provided, defaults to 'generic.
 
 This macro expands placeholders in BODY (e.g., `<>`) to refer to the object instance."
-
   (let* ((type-sym (or (and type (if (eq (car-safe type) 'quote) (cadr type) type)) 'generic)) 
          (getter (intern (format "%s-%s" type-sym slot)))  
          (setter (intern (format "setf-%s-%s" type-sym slot))) 
@@ -155,7 +151,6 @@ This defines:
 - `setf-TYPE-SLOT`: Optional setter if one does not exist.
 - `TYPE-init-SLOT`: Eager initialization trigger for the slot.
 - Hooks into the constructor (once) to auto-fetch the slot after creation."
-
   (let* ((type (or type 'generic))
          (getter (intern (format "%s-%s" type slot)))
          (setter (intern (format "setf-%s-%s" type slot)))
@@ -219,7 +214,6 @@ Arguments:
 - :async: If non-nil, defines an async accessor via `concur-lazy-async!`.
 - :auto-fetch: Optional property passed to async fetchers.
 - :options: Extra keyword arguments passed to the underlying fetch logic."
-
   (let* ((type-sym (or type 'generic))
          ;; Wrap options if :auto-fetch is provided.
          (options-arg (when auto-fetch
@@ -242,7 +236,6 @@ Arguments:
 - SLOT: Slot name to define the accessor for.
 - TYPE: Struct type symbol.
 - FN: Expression to compute the slot value, may use `<>` for object."
-
   (let* ((fn-name (intern (format "%s-%s" type slot)))
          (predicate (intern (format "%s-p" type)))
          (obj (gensym "obj"))
@@ -275,9 +268,7 @@ Each accessor group accepts a list of field specifications:
 
 Additionally, this macro auto-generates a fallback TYPE-get function if one does not already exist.
 The generated getter attempts to use a slot-specific accessor if defined, and falls back to direct slot lookup."
-
   (declare (indent defun))
-
   (let* ((type (plist-get args :type))
          (eager (plist-get args :eager))
          (async (plist-get args :async))
@@ -353,7 +344,6 @@ OPT fields supported:
 The future is stored in SLOT and will be resolved or deferred accordingly.
 
 CALLBACK is passed to the FN-BODY if used interactively or eagerly."
-
   (unless (and obj slot fn-body)
     (error "lazy--maybe-init-slot: must provide OBJ, SLOT, and FN-BODY"))
 
@@ -406,7 +396,6 @@ This function inspects the current state of SLOT:
 If AUTO-FETCH is disabled, this will only initialize the slot and return a deferred value (future or thunk).
 
 OPT supports `:auto-fetch`, `:retry`, `:timeout`, etc."
-
   (unless (and obj slot fn-body)
     (error "lazy--await-slot!: must provide OBJ, SLOT, and FN-BODY"))
 

@@ -192,7 +192,6 @@ Return:
 Example:
   (let ((p (concur-promise-rejected! \"Oops\")))
     (concur-promise-rejected? p)) ; => t"
-  
   (not (null (concur-promise-error promise))))
 
 ;;;###autoload
@@ -208,7 +207,6 @@ Return:
 Example:
   (let ((p (concur-promise-rejected! \"Oops\")))
     (concur-promise-rejected? p)) ; => t"
-  
   (let ((promise (concur-promise-new)))  
     (setf (concur-promise-resolved? promise) t
           (concur-promise-error promise) error
@@ -233,7 +231,6 @@ Example:
   (let ((p (concur-promise-new)))
     (concur-promise-cancel p \"Cancelled by user\")
     (concur-promise-rejected? p)) ; => t"
-  
   (let ((proc (concur-promise-proc promise)))
     (when (and proc (process-live-p proc))
       (message "[concur-promise] Cancelling promise: %S and killing process: %S" promise proc)
@@ -256,7 +253,6 @@ Example:
   (let ((p (concur-promise-new)))
     (concur-promise-cancel p)
     (concur-promise-cancelled? p)) ; => t"
-  
   (let ((err (concur-promise-error promise)))
     ;; Log for debugging
     (if (or (equal err '(:error "Promise cancelled"))
@@ -285,7 +281,6 @@ Return:
 Example:
   (let ((p (concur-promise-resolved! 42)))
     (concur-promise-await p)) ; => 42"
-  
   (let ((start (float-time))
         (proc (concur-promise-proc promise))
         (interval (or proc-time 0.1)))
@@ -363,7 +358,6 @@ Example:
                         (lambda (_ err)
                           (message \"Recovered from: %s\" err)
                           \"default-value\"))"
-
   (let ((next (concur-promise-new)))
     (concur-promise-on-resolve
      promise
@@ -390,7 +384,6 @@ Example:
   (concur-promise-finally some-promise
                           (lambda (_res _err)
                             (message \"Cleaning up\")))"
-
   (let ((next (concur-promise-new)))
     (concur-promise-on-resolve
      promise
@@ -417,7 +410,6 @@ A string describing the error, or nil if no error is present.
 
 Example:
   (message \"Error: %s\" (concur-promise-error-message my-promise))"
-
   (let ((err (concur-promise-error promise)))
     (cond
      ((stringp err) err)
@@ -440,7 +432,6 @@ A `concur-promise` resolved with the result, or rejected with the error if FN fa
 Example:
   (concur-promise-wrap (lambda () (/ 1 0)))  ;; rejected
   (concur-promise-wrap #'length '(1 2 3))    ;; resolved with 3"
-
   (let ((p (concur-promise-new)))
     (condition-case ex
         (concur-promise-resolve p (apply fn args))
@@ -463,7 +454,6 @@ None. TARGET is updated in-place.
 Example:
   (concur-promise-apply-transform
    (lambda (res _err) (concat res \"!\")) \"Hello\" nil target-promise)"
-
   (condition-case ex
       (let ((result (funcall transform res err)))
         (if (concur-promise-p result)
@@ -493,7 +483,6 @@ Example:
                           (if err
                               (format \"Failed: %s\" err)
                             (concat res \"!\"))))"
-
   (let ((next (concur-promise-new)))
     (concur-promise-then
      promise
@@ -528,7 +517,6 @@ Example:
    :then    (s-upcase <>)
    :catch   (message \"Oops: %s\" <>)
    :finally (message \"Finished\"))"
-
   (let ((catch-fn nil)
         (finally-fn nil)
         (core-steps '()))
@@ -584,7 +572,6 @@ Example:
     (concur-promise-all (list p1 p2)
       (lambda (results)
         (message \"Results: %s\" results))))"
-
   (if (null promises)
       (concur-promise-resolve (concur-promise-new) '())
     (let* ((total (length promises))
@@ -623,7 +610,6 @@ Example:
     (concur-promise-race (list p1 p2)
       (lambda (result)
         (message \"First resolved: %s\" result))))"
-  
   (if (null promises)
       (concur-promise-reject (concur-promise-new) 'no-promises)
     (let ((winner (concur-promise-new)))
@@ -652,7 +638,6 @@ Example:
   (concur-promise-delay 2 \"Done\"
     (lambda (result)
       (message \"Resolved after delay: %s\" result)))"
-
   (if (<= seconds 0)
       (concur-promise-resolve (concur-promise-new) (or value t))
     (let ((p (concur-promise-new)))
@@ -681,7 +666,6 @@ Example:
         (message \"Resolved\"))
       (lambda (err)
         (message \"Failed: %s\" err))))"
-  
   (let ((wrapper (concur-promise-new)))
     (run-at-time timeout-seconds nil
                  (lambda ()
@@ -715,7 +699,6 @@ Example:
 In this example, `concur-promise-retry` retries a command (such as a `curl` request) until it
 either succeeds or reaches the retry limit. The promise resolves with the result of the
 successful command or rejects after the retries are exhausted."
-
   (let ((p (concur-promise-new))
         (attempt 1)) 
     (cl-labels ((try ()
@@ -745,7 +728,6 @@ BODY should include code for handling `resolve` and `reject` to fulfill the prom
 Example usage:
   (concur-promise-run (concur-promise-lambda!
       (run-at-time 1 nil (lambda () (funcall resolve \"hello\")))))"
-
   (if body
       `(lambda ()
          (let ((promise (concur-promise-new)))
@@ -767,7 +749,6 @@ In this example, both `x` and `y` are resolved in parallel. `x` is the result of
 `fetch-data`, and `y` is processed after `x` completes.
 
 The `<>` symbol can be used in BODY to represent the resolved values of the bindings."
-
   (let ((vars (--map #'car bindings))
         (forms (--map #'cadr bindings)))
     `(concur-promise-then
@@ -779,7 +760,6 @@ The `<>` symbol can be used in BODY to represent the resolved values of the bind
 ;;;###autoload
 (defun concur-promise-delayed (secs)
   "Return a promise that resolves after SECS seconds."
-
   (let ((p (concur-promise-new)))
     (run-at-time secs nil (lambda () (concur-promise-resolve p t)))
     p))
@@ -795,7 +775,6 @@ Example:
 
 Each binding must be a (var expr) pair.
 The `<>` symbol can be used in BODY to refer to the resolved value of the current promise."
-
   (declare (indent 1))
   (if (null bindings)
       `(concur-promise-resolve (progn ,@body))
@@ -829,9 +808,8 @@ Example:
 This example iterates over the list `(1 2 3)`, binding each element to `x`. 
 After each iteration, `do-something-async` is executed asynchronously, 
 and errors are caught in `:catch`."
-
-  (let* ((var (car args))                   ;; Extract VAR
-         (list-form (cadr args))             ;; Extract LIST-FORM
+  (let* ((var (car args))  
+         (list-form (cadr args))
          (items (gensym "items"))
          (result (gensym "result"))
          (catch-fn nil)
@@ -874,7 +852,6 @@ Otherwise, the task is run immediately. The task should return a promise or a va
 the returned promise.
 
 Returns a promise resolving to the result of the task."
-
   (let ((promise (concur-promise-new))) 
     (let ((runner (lambda ()
                     (let ((result (funcall task)))
@@ -907,7 +884,6 @@ Example:
   
 This example runs the `ls -l /` command asynchronously and returns a promise that resolves
 with the exit code and the output of stdout and stderr."
-  
   (let ((stdout-buf (or buffer (generate-new-buffer "*concur-promise-stdout*")))
         (stderr-buf (generate-new-buffer "*concur-promise-stderr*"))
         (p (concur-promise-new)))
@@ -940,7 +916,6 @@ KEYS are passed to `concur-proc`, and should include:
 
 Returns a promise that resolves with trimmed stdout (a string),
 or rejects with a plist containing :error, :exit, :stdout, :stderr."
-  
   (let* ((params keys)
          (promise (concur-promise-new))
          (callback
@@ -974,7 +949,6 @@ or rejects with a plist containing :error, :exit, :stdout, :stderr."
 ;;;###autoload
 (defun concur-promise->future (promise)
   "Wrap PROMISE in a future that forces the promise when evaluated."
-  
   (concur-future-wrap (lambda () (concur-promise-resolve promise))))
 
 ;;; Aliases

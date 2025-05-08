@@ -42,7 +42,6 @@ FIELDS:
 THUNK should be a function that accepts a promise and eventually
 resolves or rejects it. It won't be executed until forced via
 `concur-future-evaluate`."
-
   (concur-future-create
    :promise (concur-promise-new)  ;; Create an empty promise
    :thunk thunk                   ;; The thunk to resolve/reject the promise
@@ -51,7 +50,6 @@ resolves or rejects it. It won't be executed until forced via
 (defmacro concur-future-once! (future &rest body)
   "Evaluate BODY only once per FUTURE. Safe to call multiple times.
 Does not return the promise directly — use `concur-future-force`."
-
   (declare (indent 1))
   `(once-do! (concur-future-evaluated? ,future)
      (:else
@@ -71,7 +69,6 @@ Does not return the promise directly — use `concur-future-force`."
 (defun concur-future-force (future)
   "Force FUTURE's thunk to run if not already. Returns the internal promise.
 Returns nil if FUTURE is nil or not a valid concur-future object."
-
   (cond
    ((null future)
     (concur--log "[future-force] FUTURE is nil. Nothing to evaluate.")
@@ -94,7 +91,6 @@ Returns nil if FUTURE is nil or not a valid concur-future object."
   "Wrap a no-arg function FN into a `future`.
 The returned future will call FN and resolve or reject based on
 its result. If FN throws an error, it is caught and causes rejection."
-
   (concur-future-new
    (lambda (promise)  ; This lambda is executed when the future is forced
      (condition-case ex
@@ -109,7 +105,6 @@ its result. If FN throws an error, it is caught and causes rejection."
 
 If EVALUATE is non-nil (default), the future will be forced.
 If nil, it is assumed the caller will evaluate the future later."
-
   (let ((existing-promise (concur-future-promise future)))
     (unless (concur-promise-p existing-promise)
       (error "Cannot attach a future that does not have a valid promise"))
@@ -136,7 +131,6 @@ INPUT is a string to send to stdin.
 
 The future resolves with trimmed STDOUT or rejects with a plist
 containing :error, :exit, :stdout, and :stderr."
-
   (concur-future-wrap
    (lambda ()
      (concur-promise-run
@@ -154,7 +148,6 @@ containing :error, :exit, :stdout, and :stderr."
 Optional DELAY throttles task launching. ORDER can be 'ordered or 'unordered.
 
 Returns a promise that resolves to a hash table of results or errors, keyed by index."
-
   (let* ((total (length futures))
          (results (ht-create))
          (queue (-map-indexed (lambda (i fut)

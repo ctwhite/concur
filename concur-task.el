@@ -76,7 +76,6 @@ when the Emacs event loop is idle.
 Side Effects:
 - Starts an idle timer to periodically run the promise scheduler.
 - Logs the action using `concur--log!`."
-
   (unless (and concur--scheduler-idle-timer
                (memq concur--scheduler-idle-timer timer-idle-list))
     (setq concur--scheduler-idle-timer
@@ -95,7 +94,6 @@ executing scheduled tasks.
 Side Effects:
 - Cancels the idle timer used to run the promise scheduler.
 - Logs the action using `concur--log!`."
-
   (when (timerp concur--scheduler-idle-timer)
     (cancel-timer concur--scheduler-idle-timer)
     (setq concur--scheduler-idle-timer nil)
@@ -119,7 +117,6 @@ Side Effects:
 Error Handling:
 - Any errors during task execution are caught by `condition-case`, and the error
   is passed to a hook (`concur-scheduler-error-hook`) for further handling."
-
   (if (duque-empty-p concur--task-queue)
       (concur-scheduler-stop)
     (let ((task (duque-pop! concur--task-queue))
@@ -147,7 +144,6 @@ Side Effects:
 
 Precondition:
 - The TASK argument must be a function (`functionp`). An assertion is made to ensure this."
-
   (cl-assert (functionp task))
   (duque-push! concur--task-queue task)
   (concur-scheduler-start))
@@ -163,7 +159,6 @@ with a maximum length defined by `concur-scheduler-max-queue-length`.
 Side Effects:
 - Resets the task queue to an empty state using `duque-make`.
 - The maximum length of the queue is determined by `concur-scheduler-max-queue-length`."
-
   (setq concur--task-queue
         (duque-make :max concur-scheduler-max-queue-length)))
 
@@ -176,7 +171,6 @@ queue of any tasks that are pending.
 
 Side Effects:
 - Calls `concur-scheduler-reset-queue` to clear the task queue."
-
   (concur-scheduler-reset-queue))
 
 ;;;###autoload
@@ -188,7 +182,6 @@ the number of tasks that are currently queued for execution.
 
 Return Value:
 - The number of pending tasks in the task queue as an integer."
-
   (duque-length concur--task-queue))
 
 ;;; Cooperative tasking
@@ -206,7 +199,6 @@ Arguments:
 Side Effects:
 - If TEST returns nil, the task is requeued via ENQUEUE and the function
   yields cooperatively using `throw`."
-  
   (unless (funcall test)
     (funcall enqueue)
     (throw 'concur-yield nil)))
@@ -220,7 +212,6 @@ allowing the event loop to handle other pending tasks.
 
 Side Effects:
 - Causes the current task to yield control back to the async scheduler using `throw`."
-
   `(throw 'concur-yield nil))
 
 ;;; Locking
@@ -246,7 +237,6 @@ Side Effects:
 
 Example:
   (concur-once-do! my-variable '(:else (message \"Already done!\")) (message \"Doing it!\"))"
-  
   (declare (indent 2))
   `(if ,place
        ,(if (and (consp fallback) (eq (car fallback) :else))
@@ -279,7 +269,6 @@ Side Effects:
 
 Example:
   (concur-with-lock! my-lock (:else (message \"Already locked!\")) (do-something))"
-
   (declare (indent 2))
   (let ((lock-held (make-symbol "lock-held")))
     `(if ,place
@@ -320,7 +309,6 @@ Side Effects:
 
 Example:
   (concur-with-mutex! my-mutex (:permanent my-lock) (do-something))"
-
   (declare (indent 2))
   (let ((real-place (make-symbol "real-place"))
         (permanent (make-symbol "perm")))
@@ -354,8 +342,7 @@ Arguments:
 Returns:
   - A semaphore object, represented as a struct with a `:count` field for
     the number of available slots and a `:queue` for tasks waiting to acquire
-    the semaphore.
-"
+    the semaphore."
   (make-concur-semaphore :count n :queue '()))
 
 (defun concur-semaphore-acquire (sem task)
@@ -371,8 +358,7 @@ Arguments:
   - task: The task to be queued if the semaphore is unavailable.
 
 Returns:
-  - Nothing, but logs the state of the semaphore.
-"
+  - Nothing, but logs the state of the semaphore."
   (concur-with-mutex! (concur-semaphore-lock sem)
     (:else nil)
     ;; Block until there is an available slot in the semaphore
@@ -400,8 +386,7 @@ Arguments:
   - task: The task attempting to acquire the semaphore.
 
 Returns:
-  - t if the semaphore was successfully acquired, nil otherwise.
-"
+  - t if the semaphore was successfully acquired, nil otherwise."
   (concur-with-mutex! (concur-semaphore-lock sem)
     (:else nil)
     ;; Attempt non-blocking acquire
@@ -421,8 +406,7 @@ Arguments:
   - sem: The semaphore to release.
   
 Returns:
-  - Nothing, but logs the state of the semaphore and the task being woken up.
-"
+  - Nothing, but logs the state of the semaphore and the task being woken up."
   (concur-with-mutex! (concur-semaphore-lock sem)
     (:else nil)
     ;; Increment the available slots in the semaphore
@@ -444,8 +428,7 @@ Arguments:
   - new-count: The new number of available slots in the semaphore.
 
 Returns:
-  - Nothing, but the semaphore's count and queue are reset.
-"
+  - Nothing, but the semaphore's count and queue are reset."
   (setf (concur-semaphore-count sem) new-count)
   (setf (concur-semaphore-queue sem) '()))
 
@@ -462,8 +445,7 @@ Arguments:
 
 Returns:
   - A plist containing the semaphore's name, available slot count, the number
-    of tasks waiting, and any additional data associated with the semaphore.
-"
+    of tasks waiting, and any additional data associated with the semaphore."
   `(:name ,(concur--semaphore-name sem)
     :count ,(concur-semaphore-count sem)
     :waiting ,(length (concur-semaphore-queue sem))
@@ -479,8 +461,7 @@ Arguments:
   - sem: The semaphore whose name is being requested.
 
 Returns:
-  - A string representing the semaphore's name.
-"
+  - A string representing the semaphore's name."
   (let ((data (concur-semaphore-data sem)))
     (or (plist-get data :name)
         (symbol-name (gensym "sem")))))  ;; Fallback identifier if no name is provided
@@ -502,8 +483,7 @@ Keyword support:
 
 Returns:
   - Nothing. If the semaphore is successfully acquired, BODY is executed
-    in a critical section. If not, fallback forms are executed if :else is provided.
-"
+    in a critical section. If not, fallback forms are executed if :else is provided."
   (declare (indent defun))
   (-let* (((keys body-forms) (--split-with (lambda (x) (keywordp x)) body))
           (&plist :timeout timeout :else else) keys
@@ -560,7 +540,6 @@ Arguments:
 
 Returns:
   A `promise` representing the result of the asynchronous computation."
-
   (declare (indent defun))
   (let* ((args* args)
          (semaphore nil)
@@ -647,7 +626,6 @@ Example:
 
 If the future is completed inside the scheduler, this macro cooperatively yields. Otherwise, it uses 
 a polling loop to wait for the result."
-
   (let ((val (gensym "val"))
         (future (gensym "future")))
     `(let* ((,future ,form)
@@ -698,7 +676,6 @@ Arguments:
 
 Returns:
   A `concur-future` that represents the result of the task."
-
   (if (functionp fn-or-val)
       (if schedule
           ;; If `schedule` is non-nil, bypass the task pool and run the task immediately
@@ -731,7 +708,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the result of the last function in the pipeline."
-
   (let ((pipeline-fn
          (lambda (acc fn)
            (concur-promise-then acc
@@ -758,7 +734,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the result of all tasks in parallel."
-
   (let ((wrapped (--map (lambda (task)
                           (concur-async-task-wrap task
                                                  :semaphore semaphore
@@ -782,7 +757,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the results of applying FN to each item."
-
   (let ((wrap-item
          (lambda (item)
            (let ((task (lambda () (funcall fn item))))
@@ -808,7 +782,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the final result after executing all tasks sequentially."
-
   (concur-promise-let* ((results
                          (--reduce-from
                           (lambda (promise task)
@@ -842,7 +815,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the final result after reducing all items."
-
   (let ((step
          (lambda (acc item)
            (concur-promise-then acc
@@ -867,7 +839,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the result of the task after retries, or an error if it fails."
-
   (concur-promise-catch
    (concur-async-task-wrap task
                            :schedule schedule)
@@ -887,7 +858,6 @@ Arguments:
 
 Returns:
   A `concur-future` that either resolves when the task completes or rejects if it times out."
-
   (concur-promise-race
    (list
     (concur-async-task-wrap task :schedule schedule)
@@ -907,7 +877,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the result of the task, retrying on failure."
-
   (concur-promise-catch
    (concur-async-task-wrap task :schedule schedule)
    (lambda (err)
@@ -927,7 +896,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the result of the loop, or nil if the loop ends."
-
   (concur-promise-then (concur-async-task-wrap fn :schedule schedule)
     (lambda (res)
       (if res
@@ -944,7 +912,6 @@ Arguments:
 
 Returns:
   A debounced version of FN."
-
   (let ((timer nil))
     (lambda (&rest args)
       (when timer (cancel-timer timer))
@@ -963,7 +930,6 @@ Arguments:
 
 Returns:
   A `concur-future` representing the result of TASK after calling ON-PROGRESS."
-  
   (concur-promise-then (concur-async-task-wrap task)
     (lambda (res)
       (funcall on-progress 1.0)
