@@ -24,9 +24,9 @@ Example:
     (:else (message \"Already run!\")) 
     (message \"Running for the first time\"))"
   (declare (indent 2))
-  (unless (and (consp else-form) (eq (car else-form) :else))
-    (error "ELSE-FORM must be a list starting with :else"))
-  (let ((else-body (cdr else-form)))
+  (let ((else-body (if (and (consp fallback) (eq (car fallback) :else))
+                       (cdr fallback)
+                     `(,fallback))))
     `(if ,place
          (progn ,@else-body)
        (progn
@@ -113,6 +113,6 @@ Example:
               `(gv-letplace (getter setter) ,real-place
                  (funcall setter t)))
            ,@body)))))
-           
+
 (provide 'concur-lock)
 ;;; concur-lock.el ends here
