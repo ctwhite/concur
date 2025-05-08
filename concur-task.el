@@ -270,7 +270,7 @@ Side Effects:
 Example:
   (concur-with-lock! my-lock (:else (message \"Already locked!\")) (do-something))"
   (declare (indent 2))
-  (let ((lock-held (make-symbol "lock-held")))
+  (let ((lock-held (gensym "lock-held")))
     `(if ,place
          ,(if (and (consp fallback) (eq (car fallback) :else))
               `(progn ,@(cdr fallback))
@@ -310,8 +310,8 @@ Side Effects:
 Example:
   (concur-with-mutex! my-mutex (:permanent my-lock) (do-something))"
   (declare (indent 2))
-  (let ((real-place (make-symbol "real-place"))
-        (permanent (make-symbol "perm")))
+  (let ((real-place (gensym "real-place"))
+        (permanent (gensym "perm")))
     `(let* ((,permanent (and (consp ,place) (eq (car ,place) :permanent)))
             (,real-place (if ,permanent (cadr ,place) ,place)))
        (if ,real-place
