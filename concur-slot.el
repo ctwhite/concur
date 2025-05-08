@@ -384,7 +384,6 @@ CALLBACK is passed to the FN-BODY if used interactively or eagerly."
         ;; Return a forceable thunk if auto-fetch is off
         (lambda () (concur-future-force future)))))
 
-;;;###autoload
 (defun lazy--await-slot! (obj slot opts fn-body callback)
   "Synchronously fetch or return cached value of OBJ's SLOT via FN-BODY and CALLBACK.
 
