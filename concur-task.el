@@ -115,8 +115,10 @@ Error Handling:
   is passed to a hook (`concur-scheduler-error-hook`) for further handling."
   (if (ring-empty-p concur--task-queue)
       (concur-scheduler-stop)
-    (let ((task (ring-remove concur--task-queue)))  ;; Remove the task from the front
-      (let ((concur--inside-scheduler t))  ;; Dynamically bind concur--inside-scheduler
+    ;; Remove the task from the front
+    (let ((task (ring-remove concur--task-queue)))  
+      ;; Dynamically bind concur--inside-scheduler
+      (let ((concur--inside-scheduler t))  
         (condition-case err
             (funcall task)
           (error
@@ -141,15 +143,19 @@ Side Effects:
 Precondition:
 - The TASK argument must be a function (`functionp`). An assertion is made to ensure this."
   (cl-assert (functionp task))
-  (if (ring-full-p concur--task-queue)
-      (ring-remove concur--task-queue)  ;; Remove the oldest item if the ring is full
-    (ring-insert concur--task-queue task))  ;; Insert the new task at the end of the ring
-  (concur-scheduler-start))  ;; Ensure the scheduler starts if not already running
+  ;; Check if the ring is full
+  (if (= (ring-length concur--task-queue) (ring-size concur--task-queue))
+      ;; If the ring is full, remove the oldest task
+      (ring-remove concur--task-queue)  
+    ;; Insert the new task at the end of the ring
+    (ring-insert concur--task-queue task))  
+  (concur-scheduler-start))
 
 ;;;###autoload
-(defsubst concur-scheduler-clear-queue ()
+(defun concur-scheduler-clear-queue ()
   "Clear all pending asynchronous tasks in the task queue."
-  (ring-clear concur--task-queue))  ;; Clear the ring buffer
+  (while (not (ring-empty-p concur--task-queue))
+    (ring-remove concur--task-queue)))
 
 ;;;###autoload
 (defsubst concur-scheduler-pending-count ()
@@ -229,7 +235,8 @@ Returns:
     (:else nil)
     ;; Block until there is an available slot in the semaphore
     (concur-block-until
-     (lambda () (> (concur-semaphore-count sem) 0))  ;; Test for available slot
+     ;; Test for available slot
+     (lambda () (> (concur-semaphore-count sem) 0))  
      (lambda () 
        ;; Requeue the task if the semaphore is unavailable
        (concur--log! "Task queued for semaphore: %s" (concur--semaphore-name sem))
@@ -385,6 +392,28 @@ Returns:
          (when ,acquired
            (concur-semaphore-release ,sem))))))
 
+;;;###autoload
+(defun concur-async-task (task &optional delay)
+  "Run TASK (a function returning a promise or value) asynchronously.
+
+If DELAY is non-nil, the task will be scheduled after that many seconds.
+If DELAY is nil, the task is scheduled to run as soon as possible
+using `run-at-time` with zero delay (i.e., defer until after current command).
+
+Returns a concur-promise resolving to the task result."
+  (let ((promise (concur-promise-new))
+        (runner (lambda ()
+                  (let ((result (funcall task)))
+                    (if (concur-promise-p result)
+                        (concur-promise-then result
+                                             (lambda (res err)
+                                               (if err
+                                                   (concur-promise-reject promise err)
+                                                 (concur-promise-resolve promise res))))
+                      (concur-promise-resolve promise result))))))
+    (run-at-time (or delay 0) nil runner)
+    promise))
+
 (defmacro concur-async! (&rest args)
   "Run BODY asynchronously, optionally under a SEMAPHORE or bypassing the task pool.
 
@@ -458,11 +487,11 @@ Returns:
            ,(if schedule
                 ;; Use the task pool
                 `(concur-scheduler-queue-task
-                  (lambda () (concur-promise-task ,promise)))
+                  (lambda () (concur-future-force ,promise)))
               ;; Bypass the pool and run immediately
               `(progn
                  (concur--log! "Bypassing task pool with :schedule nil")
-                 (concur-promise-task ,promise)))
+                 (concur-async-task ,promise)))
            ,promise)))))
            
 (defmacro concur-await! (form)
@@ -748,7 +777,7 @@ Returns:
    (concur-async-task-wrap task :schedule schedule)
    (lambda (err)
      (if (funcall pred err)
-         (concur-promise-then (concur-promised-delayed delay)
+         (concur-promise-then (concur-promise-delayed delay)
            (lambda () (concur-async-task-retry-while task pred :delay delay :schedule schedule)))
        (concur-promise-reject err)))))
 
@@ -804,14 +833,14 @@ Returns:
 
 ;;; Aliases
 
-(defalias 'cc-task-pipe 'concur-async-task-pipe)
-(defalias 'cc-task-parallel 'concur-async-task-parallel)
-(defalias 'cc-task-map 'concur-async-task-map)
-(defalias 'cc-task-chain 'concur-async-task-chain)
-(defalias 'cc-task-reduce 'concur-async-task-reduce)
-(defalias 'cc-task-with-retries 'concur-async-task-with-retries)
-(defalias 'cc-task-timeout 'concur-async-task-timeout)
-(defalias 'cc-task-retry-while 'concur-async-retry-while)
+(defalias 'concur-task-pipe 'concur-async-task-pipe)
+(defalias 'concur-task-parallel 'concur-async-task-parallel)
+(defalias 'concur-task-map 'concur-async-task-map)
+(defalias 'concur-task-chain 'concur-async-task-chain)
+(defalias 'concur-task-reduce 'concur-async-task-reduce)
+(defalias 'concur-task-with-retries 'concur-async-task-with-retries)
+(defalias 'concur-task-timeout 'concur-async-task-timeout)
+(defalias 'concur-task-retry-while 'concur-async-retry-while)
 
 (provide 'concur-task)
 ;;; concur.el ends here               

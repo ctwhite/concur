@@ -47,6 +47,13 @@
 (require 'ht)
 
 ;;;###autoload
+(defcustom concur-throw-on-promise-rejection t
+  "If non-nil, rejected promises will throw an error for debugging purposes.
+This is useful when debugging logic that results in unhandled promise rejections."
+  :type 'boolean
+  :group 'concur)
+
+;;;###autoload
 (cl-defstruct
     (concur-promise
      (:constructor nil)
@@ -176,7 +183,9 @@ Once rejected, the promise is immutable. Does nothing if already settled."
           (concur-promise-resolved? promise) t)
     (let ((callbacks (concur-promise-callbacks promise)))
       (setf (concur-promise-callbacks promise) nil)
-      (message "[concur-promise] Rejected: %S with error: %S" promise err)
+      (concur--log! "[concur-promise] Rejected: %S with error: %S" promise err)
+      (when concur-throw-on-promise-rejection
+        (error "[concur] Promise rejected with error: %S" err))
       (--each callbacks
         (funcall it nil err)))))
         
@@ -234,10 +243,10 @@ Example:
     (concur-promise-rejected? p)) ; => t"
   (let ((proc (concur-promise-proc promise)))
     (when (and proc (process-live-p proc))
-      (message "[concur-promise] Cancelling promise: %S and killing process: %S" promise proc)
+      (concur--log! "[concur-promise] Cancelling promise: %S and killing process: %S" promise proc)
       (kill-process proc)))
   (unless (concur-promise-resolved? promise)
-    (message "[concur-promise] Promise cancelled: %S, reason: %S" promise reason)
+    (concur--log! "[concur-promise] Promise cancelled: %S, reason: %S" promise reason)
     (concur-promise-reject promise (or reason '(:error "Promise cancelled")))))
 
 ;;;###autoload
@@ -258,8 +267,8 @@ Example:
     ;; Log for debugging
     (if (or (equal err '(:error "Promise cancelled"))
             (equal (plist-get err :error) "Promise cancelled"))
-        (message "[concur-promise] Promise was cancelled: %S" promise)
-      (message "[concur-promise] Promise was not cancelled: %S" promise))
+        (concur--log! "[concur-promise] Promise was cancelled: %S" promise)
+      (concur--log! "[concur-promise] Promise was not cancelled: %S" promise))
     ;; Return cancellation status
     (or (equal err '(:error "Promise cancelled"))
         (equal (plist-get err :error) "Promise cancelled")
@@ -717,8 +726,8 @@ successful command or rejects after the retries are exhausted."
                           (progn
                             (cl-incf attempt)
                             (run-at-time interval nil #'try))
-                        (concur-promise-reject p err))))))
-      (try)
+                        (concur-promise-reject p err)))))
+      (try))
       p))
 
 (defmacro concur-promise-lambda! (&rest body)
@@ -845,34 +854,6 @@ and errors are caught in `:catch`."
        ,result)))
 
 ;;;###autoload
-(defun concur-promise-task (task &optional delay)
-  "Run TASK (a function returning a promise or value) asynchronously.
-  
-If DELAY is non-nil, the task will be scheduled using `run-at-time` to run after the specified delay.
-Otherwise, the task is run immediately. The task should return a promise or a value that will resolve 
-the returned promise.
-
-Returns a promise resolving to the result of the task."
-  (let ((promise (concur-promise-new))) 
-    (let ((runner (lambda ()
-                    (let ((result (funcall task)))
-                      ;; If the result is a promise, chain it with concur-promise-then
-                      (if (concur-promise-p result)
-                          (concur-promise-then result
-                                               (lambda (res err)
-                                                 (if err
-                                                     (concur-promise-reject promise err)
-                                                   (concur-promise-resolve promise res))))
-                        ;; If it's not a promise, resolve it immediately
-                        (concur-promise-resolve promise result))))))
-
-      (if delay
-          (run-at-time delay nil runner)
-        (funcall runner))
-        
-      promise)))
-
-;;;###autoload
 (defun concur-promise-spawn (program args &optional buffer)
   "Start PROGRAM with ARGS asynchronously using `start-process`.
 Returns a promise resolving to (:exit :stdout :stderr).
@@ -914,24 +895,45 @@ with the exit code and the output of stdout and stderr."
 KEYS are passed to `concur-proc`, and should include:
   :command, :args, and optionally :cwd, :env, :trace, :discard-ansi, etc.
   If :die-on-error is non-nil, the promise will reject if the command exits with a non-zero code.
+  Optionally, include :log-max-len (default 80) to control stdout/stderr truncation in logs.
 
 Returns a promise that resolves with trimmed stdout (a string),
-or rejects with a plist containing :error, :exit, :stdout, :stderr."
+or rejects with a plist containing :error, :exit, :stdout, :stderr, :cmd, and :args."
   (let* ((params keys)
+         (log-max-len (or (plist-get keys :log-max-len) 80))
          (promise (concur-promise-new))
          (callback
           (lambda (res)
-            (message "[concur-exec] Callback received: %S" res)
             (let* ((exit   (plist-get res :exit))
                    (stdout (s-trim (or (plist-get res :stdout) "")))
-                   (stderr (plist-get res :stderr))
+                   (stderr (or (plist-get res :stderr) ""))
+                   (cmd    (plist-get res :cmd))
+                   (args   (plist-get res :args))
                    (die-on-error (plist-get params :die-on-error)))
+              (concur--log!
+               "[concur-exec] %s %s | exit=%d | stdout=%s | stderr=%s"
+               cmd
+               (s-join " " args)
+               exit
+               (if (> (length stdout) log-max-len)
+                   (format "%s..." (substring stdout 0 log-max-len))
+                 stdout)
+               (if (> (length stderr) log-max-len)
+                   (format "%s..." (substring stderr 0 log-max-len))
+                 stderr))
               (if (and die-on-error (not (zerop exit)))
-                  (concur-promise-reject promise
-                                         (list :error (format "Process exited with %d" exit)
-                                               :exit exit
-                                               :stdout stdout
-                                               :stderr stderr))
+                  (concur-promise-reject
+                   promise
+                   (list
+                    :error (format "Command failed: %s %s (exit %d)"
+                                   cmd
+                                   (s-join " " args)
+                                   exit)
+                    :exit exit
+                    :stdout stdout
+                    :stderr stderr
+                    :cmd cmd
+                    :args args))
                 (concur-promise-resolve promise stdout))))))
 
     ;; Run the async command and apply the callback
@@ -939,45 +941,39 @@ or rejects with a plist containing :error, :exit, :stdout, :stderr."
           (apply #'concur-proc
                  (append params (list :callback callback))))
 
-    ;; Return the promise directly, and use concur-promise-then to handle the result.
+    ;; Register post-run resolution handler
     (concur-promise-then promise
                          (lambda (res err)
                            (if err
                                (concur-promise-reject promise err)
                              (concur-promise-resolve promise res))))
     promise))
-
-;;;###autoload
-(defun concur-promise->future (promise)
-  "Wrap PROMISE in a future that forces the promise when evaluated."
-  (concur-future-wrap (lambda () (concur-promise-resolve promise))))
-
+    
 ;;; Aliases
 
-(defalias 'cc-> 'concur-promise->)
-(defalias 'cc-then 'concur-promise-then)
-(defalias 'cc-catch 'concur-promise-catch)
-(defalias 'cc-finally 'concur-promise-finally)
-(defalias 'cc-await 'concur-promise-await)
-(defalias 'cc-resolve 'concur-promise-resolve)
-(defalias 'cc-resolved? 'concur-promise-resolved?)
-(defalias 'cc-resolved? 'concur-promise-resolved?)
-(defalias 'cc-cancel 'concur-promise-cancel)
-(defalias 'cc-canceled? 'concur-promise-canceled?)
-(defalias 'cc-reject 'concur-promise-reject)
-(defalias 'cc-chain 'concur-promise-chain)
-(defalias 'cc-all 'concur-promise-all)
-(defalias 'cc-race 'concur-promise-race)
-(defalias 'cc-delay 'concur-promise-delay)
-(defalias 'cc-timeout 'concur-promise-timeout)
-(defalias 'cc-retry 'concur-promise-retry)
-(defalias 'cc-let 'concur-promise-let)
-(defalias 'cc-let* 'concur-promise-let*)
-(defalias 'cc-loop 'concur-promise-loop)
-(defalias 'cc-run 'concur-promise-run)
-(defalias 'cc-task 'concur-promise-task)
-(defalias 'cc-spawn 'concur-promise-spawn)
-(defalias 'cc-promise-new 'concur-promise-new)
+(defalias 'concur-> 'concur-promise->)
+(defalias 'concur-then 'concur-promise-then)
+(defalias 'concur-catch 'concur-promise-catch)
+(defalias 'concur-finally 'concur-promise-finally)
+(defalias 'concur-await 'concur-promise-await)
+(defalias 'concur-resolve 'concur-promise-resolve)
+(defalias 'concur-resolved? 'concur-promise-resolved?)
+(defalias 'concur-resolved? 'concur-promise-resolved?)
+(defalias 'concur-cancel 'concur-promise-cancel)
+(defalias 'concur-canceled? 'concur-promise-canceled?)
+(defalias 'concur-reject 'concur-promise-reject)
+(defalias 'concur-chain 'concur-promise-chain)
+(defalias 'concur-all 'concur-promise-all)
+(defalias 'concur-race 'concur-promise-race)
+(defalias 'concur-delay 'concur-promise-delay)
+(defalias 'concur-timeout 'concur-promise-timeout)
+(defalias 'concur-retry 'concur-promise-retry)
+(defalias 'concur-let 'concur-promise-let)
+(defalias 'concur-let* 'concur-promise-let*)
+(defalias 'concur-loop 'concur-promise-loop)
+(defalias 'concur-run 'concur-promise-run)
+(defalias 'concur-spawn 'concur-promise-spawn)
+(defalias 'concur-promise-new 'concur-promise-new)
 
 (provide 'concur-promise)
 ;;; concur-promise.el ends here

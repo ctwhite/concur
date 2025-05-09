@@ -99,7 +99,8 @@ Returns nil if FUTURE is nil or not a valid concur-future object."
 The returned future will call FN and resolve or reject based on
 its result. If FN throws an error, it is caught and causes rejection."
   (concur-future-new
-   (lambda (promise)  ; This lambda is executed when the future is forced
+   ;; This lambda is executed when the future is forced
+   (lambda (promise)  
      (condition-case ex
          (progn
            (let ((result (funcall fn)))
@@ -130,6 +131,11 @@ If nil, it is assumed the caller will evaluate the future later."
       (concur-future-force future)))
   promise)
 
+;;;###autoload
+(defun concur-promise->future (promise)
+  "Wrap PROMISE in a future that forces the promise when evaluated."
+  (concur-future-wrap (lambda () (concur-promise-resolve promise))))
+  
 ;;;###autoload
 (defun concur-future-from-process (command &optional args cwd env input)
   "Return a `future` that runs COMMAND asynchronously with ARGS.

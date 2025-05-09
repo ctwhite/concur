@@ -1,4 +1,5 @@
 ;;; concur-var.el --- Concurrent programming primitives for Emacs ---
+(require 'scribe)
 
 (defvar concur--debug t
   "Whether to enable debug logging for concur.")

@@ -6,13 +6,13 @@
 (require 'dash)
 (require 's)
 
-(defun concur--exec-process-output (output discard-ansi die-on-error exit-code &optional stderr)
+(defun concur--exec-process-output (cmd args output discard-ansi die-on-error exit-code &optional stderr)
   "Process OUTPUT from an async command.
 
 If DISCARD-ANSI is non-nil, strip ANSI codes using `ansi-color-apply`.
 If DIE-ON-ERROR is non-nil and EXIT-CODE is non-zero, signal an error.
 Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
-  (message "[concur-exec] Processing output (exit: %d)" exit-code)
+  (concur--log! "[concur-exec] Processing output (exit: %d)" exit-code)
   (let* ((safe-output (or output ""))
          (clean-output (if discard-ansi
                            (ansi-color-apply safe-output)
@@ -21,7 +21,9 @@ Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
       ;; Avoid hard error if inside a sentinel — let the caller decide how to reject
       (let ((msg (if (stringp die-on-error) die-on-error "Command failed")))
         (signal 'error (list (format "%s (exit code: %d)\n\n%s" msg exit-code clean-output)))))
-    (list :exit exit-code
+    (list :cmd cmd
+          :args args
+          :exit exit-code
           :stdout clean-output
           :stderr (or stderr ""))))
 
@@ -42,7 +44,7 @@ Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
          (stderr-buf (unless merge-stderr
                        (generate-new-buffer (or stderr-buffer-name "*exec-stderr*")))))
     (when trace
-      (message "%s:\n  %s"
+      (concur--log! "%s:\n  %s"
                (or trace "Running async:")
                (s-join " " (cons exe args))))
     (let ((proc (make-process
@@ -62,7 +64,7 @@ Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
         (set-process-sentinel
          proc
          (lambda (_proc _event)
-           (message "[concur-exec] Process sentinel: %S" _proc)
+           (concur--log! "[concur-exec] Process sentinel: %S" _proc)
            (when (memq (process-status _proc) '(exit signal))
              (let ((stdout nil) (stderr nil) (exit-status nil))
                (condition-case err
@@ -80,13 +82,13 @@ Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
                  (error (message "Error killing buffers: %s" err)))
 
                (setq exit-status (process-exit-status _proc))
-               (message "[concur-exec] Processing output (exit: %d)" exit-status)
+               (concur--log! "[concur-exec] Processing output (exit: %d)" exit-status)
 
                ;; Wrap the callback in condition-case to avoid silent hangs
                (condition-case err
                    (funcall cb
                             (concur--exec-process-output
-                             stdout discard-ansi die-on-error
+                             exe args stdout discard-ansi die-on-error
                              exit-status stderr))
                  (error
                   (message "[concur-exec] Error in callback: %s"
@@ -94,5 +96,4 @@ Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
       proc)))
 
 (provide 'concur-proc)
-
 ;;; concur-proc.el ends here
