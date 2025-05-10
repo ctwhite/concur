@@ -53,7 +53,6 @@ This is useful when debugging logic that results in unhandled promise rejections
   :type 'boolean
   :group 'concur)
 
-;;;###autoload
 (cl-defstruct
     (concur-promise
      (:constructor nil)
@@ -225,7 +224,6 @@ Example:
                   (funcall reject error)))) 
     promise))
 
-;;;###autoload
 (defun concur-promise-cancel (promise &optional reason)
   "Cancel PROMISE by killing its process and rejecting it with REASON.
 
@@ -245,7 +243,10 @@ Example:
     (when (and proc (process-live-p proc))
       (concur--log! "[concur-promise] Cancelling promise: %S and killing process: %S" promise proc)
       (kill-process proc)))
-  (unless (concur-promise-resolved? promise)
+  
+  ;; Ensure we reject the promise only if it is unresolved or already not cancelled.
+  (unless (or (concur-promise-resolved? promise)
+              (concur-promise-cancelled? promise))
     (concur--log! "[concur-promise] Promise cancelled: %S, reason: %S" promise reason)
     (concur-promise-reject promise (or reason '(:error "Promise cancelled")))))
 
@@ -263,16 +264,8 @@ Example:
   (let ((p (concur-promise-new)))
     (concur-promise-cancel p)
     (concur-promise-cancelled? p)) ; => t"
-  (let ((err (concur-promise-error promise)))
-    ;; Log for debugging
-    (if (or (equal err '(:error "Promise cancelled"))
-            (equal (plist-get err :error) "Promise cancelled"))
-        (concur--log! "[concur-promise] Promise was cancelled: %S" promise)
-      (concur--log! "[concur-promise] Promise was not cancelled: %S" promise))
-    ;; Return cancellation status
-    (or (equal err '(:error "Promise cancelled"))
-        (equal (plist-get err :error) "Promise cancelled")
-        (and (plistp err) (equal (plist-get err :error) "Promise cancelled")))))
+  (and (not (concur-promise-resolved? promise))
+       (concur-promise-error? promise)))
 
 ;;;###autoload
 (defun concur-promise-await (promise &optional timeout throw-on-error proc-time)
@@ -566,42 +559,45 @@ Example:
 
 ;;;###autoload
 (defun concur-promise-all (promises)
-  "Resolve all PROMISES in parallel and return a promise for their results.
+  "Return a promise that resolves when all PROMISES are fulfilled, or rejects on the first error.
 
-Arguments:
-  PROMISES -- A list of promises to resolve in parallel.
-
-Return:
-  A new promise that:
-    - Resolves with a list of results, in the same order.
-    - Rejects immediately if any individual promise fails.
+PROMISES is a list of promise objects. This function executes them in parallel
+and returns a new promise that:
+  - Resolves to a list of results in the same order as PROMISES if all succeed.
+  - Rejects immediately if any individual promise fails.
+  - Resolves to an empty list immediately if PROMISES is nil.
 
 Example:
   (let ((p1 (exec-promise! :command \"echo 1\"))
         (p2 (exec-promise! :command \"echo 2\")))
-    (concur-promise-all (list p1 p2)
-      (lambda (results)
-        (message \"Results: %s\" results))))"
+    (concur-promise-then
+     (concur-promise-all (list p1 p2))
+     (lambda (results _err)
+       (message \"Results: %s\" results))))"
+  (unless (listp promises)
+    (signal 'wrong-type-argument (list 'listp promises)))
+
   (if (null promises)
-      (concur-promise-resolve (concur-promise-new) '())
+      (concur-promise-resolve '())
     (let* ((total (length promises))
            (results (make-vector total nil))
            (done (concur-promise-new))
            (resolved-count 0))
       (--each-indexed promises
-        (let ((i it-index)
-              (p it))
-          (concur-promise-then p
-            (lambda (res)
-              (unless (concur-promise-resolved? done)
-                (aset results i res)
-                (cl-incf resolved-count)
-                (when (= resolved-count total)
-                  (concur-promise-resolve done (append results nil)))))
-            (lambda (err)
-              (unless (concur-promise-resolved? done)
-                (concur-promise-reject done err))))))
-      done)))
+        (let ((index it-index)
+              (promise it))
+          (concur-promise-then
+           promise
+           (lambda (res err)
+             (unless (concur-promise-resolved? done)
+               (if err
+                   (concur-promise-reject done err)
+                 (progn
+                   (aset results index res)
+                   (setq resolved-count (1+ resolved-count))
+                   (when (= resolved-count total)
+                     (concur-promise-resolve done (cl-coerce results 'list)))))))))
+      done))))
 
 ;;;###autoload
 (defun concur-promise-race (promises)
@@ -625,12 +621,11 @@ Example:
     (let ((winner (concur-promise-new)))
       (--each promises
         (concur-promise-then it
-          (lambda (val)
+          (lambda (res err)
             (unless (concur-promise-resolved? winner)
-              (concur-promise-resolve winner val)))
-          (lambda (err)
-            (unless (concur-promise-resolved? winner)
-              (concur-promise-reject winner err)))))
+              (if err
+                  (concur-promise-reject winner err)
+                (concur-promise-resolve winner res))))))
       winner)))
 
 ;;;###autoload
@@ -667,28 +662,13 @@ Arguments:
 Return:
   A new promise that:
     - Resolves/rejects with INNER-PROMISE if it settles before the timeout.
-    - Rejects with `'timeout` if the timeout elapses first.
-
-Example:
-  (let ((p (exec-promise! :command \"sleep 3\")))
-    (concur-promise-timeout p 2
-      (lambda (_)
-        (message \"Resolved\"))
-      (lambda (err)
-        (message \"Failed: %s\" err))))"
-  (let ((wrapper (concur-promise-new)))
+    - Rejects with `'timeout` if the timeout elapses first."
+  (let ((timeout-promise (concur-promise-new)))
     (run-at-time timeout-seconds nil
                  (lambda ()
-                   (unless (concur-promise-resolved? wrapper)
-                     (concur-promise-reject wrapper 'timeout))))
-    (concur-promise-then inner-promise
-      (lambda (val)
-        (unless (concur-promise-resolved? wrapper)
-          (concur-promise-resolve wrapper val)))
-      (lambda (err)
-        (unless (concur-promise-resolved? wrapper)
-          (concur-promise-reject wrapper err))))
-    wrapper))
+                   (unless (concur-promise-resolved? timeout-promise)
+                     (concur-promise-reject timeout-promise 'timeout))))
+    (concur-promise-race (list inner-promise timeout-promise))))
 
 ;;;###autoload
 (cl-defun concur-promise-retry (fn &key (interval 1) (limit 5) (test #'identity))
@@ -701,34 +681,35 @@ will be passed to TEST, and the promise resolves when TEST returns a truthy valu
 
 Example:
   (let ((retry-promise (concur-promise-retry
-                        (lambda () (concur-promise-run :command \"curl http://example.com\"))))
+                        (lambda () (concur-promise-run :command \"curl http://example.com\")))))
     (concur-promise-then retry-promise
-                 (lambda (res) (message \"Successfully retrieved: %s\" res))
-                 (lambda (err) (message \"Failed with error: %s\" err))))
+                         (lambda (res _err) (message \"Successfully retrieved: %s\" res)))
+    (concur-promise-catch retry-promise
+                         (lambda (_ err) (message \"Failed with error: %s\" err)))))
     
 In this example, `concur-promise-retry` retries a command (such as a `curl` request) until it
 either succeeds or reaches the retry limit. The promise resolves with the result of the
 successful command or rejects after the retries are exhausted."
   (let ((p (concur-promise-new))
-        (attempt 1)) 
+        (attempt 1))
     (cl-labels ((try ()
                   (concur-promise-then (funcall fn)
-                    (lambda (val)
-                      (if (funcall test val)
-                          (concur-promise-resolve p val)
-                        (if (< attempt limit)
-                            (progn
-                              (cl-incf attempt)
-                              (run-at-time interval nil #'try))
-                          (concur-promise-reject p 'retry-limit)))))
-                    (lambda (err)
-                      (if (< attempt limit)
-                          (progn
-                            (cl-incf attempt)
-                            (run-at-time interval nil #'try))
-                        (concur-promise-reject p err)))))
+                    (lambda (res err)
+                      (if err
+                          (if (< attempt limit)
+                              (progn
+                                (cl-incf attempt)
+                                (run-at-time interval nil #'try))
+                            (concur-promise-reject p err))
+                        (if (funcall test res)
+                            (concur-promise-resolve p res)
+                          (if (< attempt limit)
+                              (progn
+                                (cl-incf attempt)
+                                (run-at-time interval nil #'try))
+                            (concur-promise-reject p 'retry-limit))))))))
       (try))
-      p))
+    p))
 
 (defmacro concur-promise-lambda! (&rest body)
   "Create a lambda that returns a promise, wrapping BODY in `concur-promise-new`.
@@ -748,23 +729,20 @@ Example usage:
     (error "Body cannot be empty")))
 
 (defmacro concur-promise-let (bindings &rest body)
-  "Like `let`, but for asynchronous promises. Each binding is resolved in parallel.
+  "Asynchronously bind values using promises in parallel. Supports destructuring.
 
-Example:
-  (concur-promise-let ((x (fetch-data))
-                (y (process-data x)))
-    (message \"Processed data: %s\" y))
+Each binding is of the form (VAR FORM) or ((PATTERN...) FORM), where FORM returns a promise.
 
-In this example, both `x` and `y` are resolved in parallel. `x` is the result of
-`fetch-data`, and `y` is processed after `x` completes.
-
-The `<>` symbol can be used in BODY to represent the resolved values of the bindings."
-  (let ((vars (--map #'car bindings))
-        (forms (--map #'cadr bindings)))
+BODY can use `<>` to refer to the list of all resolved values (in order)."
+  (let* ((forms (--map (cadr it) bindings))
+         (patterns (--map (car it) bindings)))
     `(concur-promise-then
       (concur-promise-all ,@forms)
       (lambda (<>)
-        (let ,(--map-indexed (lambda (i var) (list var `(nth ,i <>))) vars)
+        (let ,(--map-indexed
+               (lambda (i pat)
+                 `(,pat (nth ,i <>)))
+               patterns)
           ,@body)))))
 
 ;;;###autoload
@@ -958,10 +936,12 @@ or rejects with a plist containing :error, :exit, :stdout, :stderr, :cmd, and :a
 (defalias 'concur-await 'concur-promise-await)
 (defalias 'concur-resolve 'concur-promise-resolve)
 (defalias 'concur-resolved? 'concur-promise-resolved?)
-(defalias 'concur-resolved? 'concur-promise-resolved?)
+(defalias 'concur-resolved! 'concur-promise-resolved!)
 (defalias 'concur-cancel 'concur-promise-cancel)
-(defalias 'concur-canceled? 'concur-promise-canceled?)
+(defalias 'concur-cancelled? 'concur-promise-cancelled?)
 (defalias 'concur-reject 'concur-promise-reject)
+(defalias 'concur-rejected? 'concur-promise-rejected?)
+(defalias 'concur-rejected! 'concur-promise-rejected!)
 (defalias 'concur-chain 'concur-promise-chain)
 (defalias 'concur-all 'concur-promise-all)
 (defalias 'concur-race 'concur-promise-race)
@@ -973,7 +953,6 @@ or rejects with a plist containing :error, :exit, :stdout, :stderr, :cmd, and :a
 (defalias 'concur-loop 'concur-promise-loop)
 (defalias 'concur-run 'concur-promise-run)
 (defalias 'concur-spawn 'concur-promise-spawn)
-(defalias 'concur-promise-new 'concur-promise-new)
 
 (provide 'concur-promise)
 ;;; concur-promise.el ends here

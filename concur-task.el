@@ -25,6 +25,10 @@
   lock          ;; Mutex to protect the state.
   data)         ;; Arbitrary user-defined metadata (opaque)
 
+(cl-defstruct concur-cancel-token
+  "A structure representing a cancel token."
+  active)
+
 ;;;###autoload
 (defcustom concur-scheduler-max-queue-length 100
   "Maximum number of tasks allowed in the scheduler queue."
@@ -184,8 +188,12 @@ Side Effects:
 - If TEST returns nil, the task is requeued via ENQUEUE and the function
   yields cooperatively using `throw`."
   (unless (funcall test)
+    ;; Requeue the task for later execution
     (funcall enqueue)
-    (throw 'concur-yield nil)))
+    ;; Yield cooperatively to allow other tasks to run
+    (throw 'concur-yield nil))
+  ;; Continue execution if TEST returns non-nil
+  t)
 
 (defmacro concur-yield! ()
   "Yield cooperatively to the asynchronous scheduler.
@@ -392,6 +400,34 @@ Returns:
          (when ,acquired
            (concur-semaphore-release ,sem))))))
 
+;;; Cancel Token
+
+;;;###autoload
+(defun concur-cancel-token ()
+  "Create and return a new cancel token."
+  (make-concur-cancel-token :active t))
+
+;;;###autoload
+(defun concur-cancel-token-cancel (token)
+  "Cancel the given TOKEN, marking it as inactive."
+  (setf (concur-cancel-token-active token) nil))
+
+;;;###autoload
+(defun concur-cancel-token-active-p (token)
+  "Check if the cancel TOKEN is still active (i.e., not canceled)."
+  (and token (concur-cancel-token-active token)))
+
+;;;###autoload
+(defun concur-cancel-token-check (token)
+  "Check if the task should be canceled by evaluating the cancel TOKEN."
+  (if (not (concur-cancel-token-active-p token))
+      (progn
+        (log! "Task has been canceled.")
+        t)  ;; Return t to indicate cancellation
+    nil))  ;; Return nil if the task is still active
+
+;;; Async
+
 ;;;###autoload
 (defun concur-async-task (task &optional delay)
   "Run TASK (a function returning a promise or value) asynchronously.
@@ -415,31 +451,33 @@ Returns a concur-promise resolving to the task result."
     promise))
 
 (defmacro concur-async! (&rest args)
-  "Run BODY asynchronously, optionally under a SEMAPHORE or bypassing the task pool.
+  "Run BODY asynchronously, with optional SEMAPHORE, :schedule nil, and :cancel TOKEN.
 
 Usage:
   (concur-async!
     (do-something))
 
-  (concur-async! some-semaphore
+  (concur-async! my-semaphore
     (do-limited-work))
 
   (concur-async! :schedule nil
-    (do-immediate-async-work))
+    (do-immediate-work))
 
-  (concur-async! some-semaphore :schedule nil
-    (run-immediate-with-limited-concurrency))
+  (concur-async! my-semaphore :cancel cancel-token :schedule nil
+    (cancel-aware-work))
 
 Arguments:
-  - SEMAPHORE (optional): A semaphore object for limiting concurrency.
-  - :schedule nil: If present, bypasses the concur scheduler task pool.
+  - SEMAPHORE (optional): Limits concurrency if provided.
+  - :schedule nil: Run immediately instead of using the task pool.
+  - :cancel TOKEN: Symbol or function to test for cancellation.
 
 Returns:
-  A `promise` representing the result of the asynchronous computation."
+  A `promise` representing the async computation."
   (declare (indent defun))
   (let* ((args* args)
          (semaphore nil)
          (schedule t)
+         (cancel-token nil)
          (body nil))
 
     ;; Extract keyword arguments
@@ -449,6 +487,7 @@ Returns:
         (setq args* (butlast args* 2))
         (pcase kw
           (:schedule (setq schedule val))
+          (:cancel (setq cancel-token val))
           (_ (error "Unknown keyword %S in concur-async!" kw)))))
 
     ;; Detect positional SEMAPHORE if present
@@ -458,42 +497,47 @@ Returns:
       (setq body args*))
 
     ;; Generate symbols
-    (let ((done     (gensym "done-"))
-          (result   (gensym "result-"))
-          (promise  (gensym "promise-"))
-          (self     (gensym "self-")))
+    (let ((done    (gensym "done-"))
+          (result  (gensym "result-"))
+          (promise (gensym "promise-"))
+          (self    (gensym "self-")))
 
       `(let* ((,done nil)
               (,result nil)
               (,promise (concur-promise-new)))
          (cl-labels ((,self ()
                       (catch 'concur-yield
-                        (setq ,result
-                              ,(if semaphore  ;; Corrected conditional here
-                                   `(concur-with-semaphore! ,semaphore ,@body)
-                                 `(progn ,@body)))
-                        (setq ,done t))))
+                        ;; Cancellation check using API
+                        (when ,(if cancel-token
+                                   `(concur-cancel-token-active-p ,cancel-token)
+                                 t)
+                          (setq ,result
+                                ,(if semaphore
+                                     `(concur-with-semaphore! ,semaphore ,@body)
+                                   `(progn ,@body)))
+                          (setq ,done t)))))
            (concur-future-wrap
             (lambda ()
               (condition-case err
                   (progn
                     (,self)
-                    (setq ,done t)
                     (when ,done
-                      (concur-promise-resolve ,promise ,result)))
+                      ;; Double-check cancellation before resolving the promise
+                      (when ,(if cancel-token
+                                 `(concur-cancel-token-active-p ,cancel-token)
+                               t)
+                        (concur-promise-resolve ,promise ,result))))
                 (error
                  (concur-promise-reject ,promise err)
                  (concur--log! "concur-async! task error: %S" err)))))
            ,(if schedule
-                ;; Use the task pool
                 `(concur-scheduler-queue-task
                   (lambda () (concur-future-force ,promise)))
-              ;; Bypass the pool and run immediately
               `(progn
                  (concur--log! "Bypassing task pool with :schedule nil")
                  (concur-async-task ,promise)))
            ,promise)))))
-           
+
 (defmacro concur-await! (form)
   "Await the result of FORM, which must evaluate to a `concur-future`.
 
@@ -557,11 +601,12 @@ a polling loop to wait for the result."
        ,val)))
 
 ;;;###autoload
-(cl-defun concur-async-task-wrap (fn-or-val &key catch finally semaphore schedule)
-  "Wrap FN-OR-VAL in an async task using `concur-async!`, with optional CATCH, FINALLY, SEMAPHORE, and SCHEDULE.
+(cl-defun concur-async-task-wrap (fn-or-val &key catch finally semaphore schedule cancel-token)
+  "Wrap FN-OR-VAL in an async task using `concur-async!`, with optional CATCH, FINALLY, SEMAPHORE, 
+  SCHEDULE, and CANCEL-TOKEN.
 
-If FN-OR-VAL is a function, it is invoked asynchronously. If FN-OR-VAL is a value, it is resolved immediately 
-using `concur-promise-resolve`.
+If FN-OR-VAL is a function, it is invoked asynchronously. If FN-OR-VAL is a value, it is 
+resolved immediately using `concur-promise-resolve`.
 
 Arguments:
   - FN-OR-VAL: Either a function to execute asynchronously or a value to resolve immediately.
@@ -569,6 +614,8 @@ Arguments:
   - FINALLY (optional): A function to be invoked when the task finishes, regardless of success or failure.
   - SEMAPHORE (optional): A semaphore to limit concurrency.
   - SCHEDULE (optional): If non-nil, bypass the task pool and run the task immediately without scheduling.
+  - CANCEL-TOKEN (optional): A symbol or function to check for cancelation. If provided, task execution may 
+  be short-circuited based on the token.
 
 Returns:
   A `concur-future` that represents the result of the task."
@@ -579,18 +626,22 @@ Returns:
            :catch catch
            :finally finally
            :semaphore semaphore
-           :schedule nil  ;; Ensure the task is run without the scheduler
+           :cancel cancel-token  
+           ;; Ensure the task is run without the scheduler
+           :schedule nil  
            (funcall fn-or-val))
         ;; Otherwise, schedule the task within the task pool
         (concur-async!
          :catch catch
          :finally finally
          :semaphore semaphore
+         :cancel cancel-token  
          (funcall fn-or-val)))
-    (concur-promise-resolve fn-or-val)))  ;; If FN-OR-VAL is already a value, resolve immediately
+    ;; If FN-OR-VAL is already a value, resolve immediately
+    (concur-promise-resolved! fn-or-val)))
 
 ;;;###autoload
-(cl-defun concur-async-task-pipe (initial &rest fns &key semaphore schedule)
+(cl-defun concur-async-task-pipe (initial &rest fns &key semaphore schedule cancel-token)
   "Pipe INITIAL through FNS. Each function receives the result of the previous function.
 
 This function executes each function in the sequence `fns` asynchronously, passing the result
@@ -601,6 +652,8 @@ Arguments:
   - FNS: A list of functions to apply in sequence to the result of the previous function.
   - SEMAPHORE (optional): A semaphore to control concurrency during the pipeline execution.
   - SCHEDULE (optional): If non-nil, bypasses task pool and runs the task immediately.
+  - CANCEL-TOKEN (optional): A symbol or function to check for cancelation. If provided, task execution 
+  may be short-circuited based on the token.
 
 Returns:
   A `concur-future` representing the result of the last function in the pipeline."
@@ -610,14 +663,15 @@ Returns:
              (lambda (res)
                (concur-async-task-wrap (funcall fn res)
                                        :semaphore semaphore
-                                       :schedule schedule))))))
+                                       :schedule schedule
+                                       :cancel cancel-token))))))
     ;; Apply each function in FNS to the result of the previous function in the pipeline
     (--reduce-from pipeline-fn
-                   (concur-async-task-wrap initial :semaphore semaphore :schedule schedule)
+                   (concur-async-task-wrap initial :semaphore semaphore :schedule schedule :cancel cancel-token)
                    fns)))
 
 ;;;###autoload
-(cl-defun concur-async-task-parallel (&rest tasks &key semaphore schedule)
+(cl-defun concur-async-task-parallel (&rest tasks &key semaphore schedule cancel-token)
   "Run TASKS concurrently, with optional SEMAPHORE to limit concurrency.
 
 Each task in TASKS is executed asynchronously. Optionally, a SEMAPHORE can be passed to
@@ -627,43 +681,85 @@ Arguments:
   - TASKS: A list of functions or values to execute asynchronously.
   - SEMAPHORE (optional): A semaphore to limit concurrent task execution.
   - SCHEDULE (optional): If non-nil, bypasses task pool and runs tasks immediately.
+  - CANCEL-TOKEN (optional): A symbol or function to check for cancelation. If provided, task execution 
+  may be short-circuited based on the token.
 
 Returns:
   A `concur-future` representing the result of all tasks in parallel."
   (let ((wrapped (--map (lambda (task)
                           (concur-async-task-wrap task
                                                  :semaphore semaphore
-                                                 :schedule schedule))
+                                                 :schedule schedule
+                                                 :cancel cancel-token))
                         tasks)))
     ;; Wait for all tasks to complete and return their results
     (concur-promise-all wrapped)))
 
 ;;;###autoload
-(cl-defun concur-async-task-map (fn items &key semaphore catch finally schedule)
-  "Apply FN to each ITEM in ITEMS concurrently.
-Each item in ITEMS is processed asynchronously, and the results are returned together.
+(cl-defun concur-async-task-map (task-fn tasks &key (semaphore 1) (cancel nil))
+  "Map a function (TASK-FN) across a sequence of TASKS asynchronously.
+TASK-FN should be a function that returns a thunk (a function to execute).
+If CANCEL is provided and the cancellation condition is met, remaining tasks will be cancelled.
 
-Arguments:
-  - FN: A function to apply to each item in ITEMS.
-  - ITEMS: A list of items to apply FN to.
-  - SEMAPHORE (optional): A semaphore to control concurrency.
-  - CATCH (optional): A function to handle errors in the asynchronous task.
-  - FINALLY (optional): A function to be invoked when the task finishes, regardless of success or failure.
-  - SCHEDULE (optional): If non-nil, bypasses task pool and runs the task immediately.
+TASK-FN will be called asynchronously with each task in the TASKS list.
 
-Returns:
-  A `concur-future` representing the results of applying FN to each item."
-  (let ((wrap-item
-         (lambda (item)
-           (let ((task (lambda () (funcall fn item))))
-             (concur-async-task-wrap task
-                                    :semaphore semaphore
-                                    :catch catch
-                                    :finally finally
-                                    :schedule schedule)))))
-    ;; Apply FN to each item concurrently
-    (concur-promise-all (--map wrap-item items))))
+If no semaphore is provided, no concurrency limit will be enforced.
+If no cancel token is provided, cancellation will not be handled."
 
+  (let ((tasks-done 0)          ;; Counter to track completed tasks
+        (called? nil)            ;; Flag to ensure callback is called once
+        (total-tasks (length tasks))  ;; Total tasks to track
+        (controller (make-symbol "concur-async-task-map-cancel-token"))
+        (fallback-callback (lambda () (when (and (not called?) (>= tasks-done total-tasks))
+                                        (funcall cancel nil)))))
+    
+    (cl-labels
+        ((should-cancel-p ()
+           (or (and cancel (funcall cancel))
+               (symbol-value controller))))
+      
+      ;; Wrap the task function to increment the task counter and check cancellation
+      (let ((wrapped-task-fn
+             (lambda (task)
+               (lambda ()
+                 (unless (should-cancel-p)
+                   (funcall task)  ;; Run the actual task
+                   (setq tasks-done (1+ tasks-done))
+                   ;; If no match, check if we need to call fallback
+                   (when (and (not called?) (>= tasks-done total-tasks))
+                     (funcall fallback-callback)))))))
+        
+        ;; Map over tasks and apply the wrapped function
+        (mapc (lambda (task)
+                (funcall (wrapped-task-fn task)))
+              tasks)
+
+        ;; At this point, we return a function to cancel any remaining tasks if necessary
+        (lambda ()
+          (setf (symbol-value controller) t))))))
+
+;;;###autoload
+(cl-defun concur-async-task-race (task-fn tasks &key (semaphore 1) (cancel nil) (timeout-seconds nil))
+  "Race across a sequence of tasks asynchronously, invoking the callback with the first successful result.
+
+TASK-FN should be a function that takes a task and returns a thunk (a function to execute).
+Each task is wrapped via `concur-async-task-wrap` and raced via `concur-promise-race`.
+
+If CANCEL is provided (a cancel token), remaining tasks will be cancelled when the token becomes inactive.
+If TIMEOUT-SECONDS is provided, each task will be subject to a timeout."
+  (let* ((cancel-token (or cancel (concur-cancel-token-create)))
+         (promises
+          (--map (let* ((thunk (funcall task-fn it))
+                        (wrapped (concur-async-task-wrap
+                                  thunk
+                                  :semaphore semaphore
+                                  :cancel-token cancel-token)))
+                   (if timeout-seconds
+                       (concur-promise-timeout wrapped timeout-seconds)
+                     wrapped))
+                 tasks)))
+    (concur-promise-race promises)))
+    
 ;;;###autoload
 (cl-defun concur-async-task-chain (&rest tasks &key semaphore catch finally schedule)
   "Run TASKS sequentially, each depending on the result of the previous.
@@ -831,11 +927,271 @@ Returns:
       (funcall on-progress 1.0)
       res)))
 
+(defmacro concur-do-with-yield! (&rest forms)
+  "Execute a sequence of forms, yielding control after each form.
+
+This macro allows multiple forms to be executed in sequence, yielding control to
+the asynchronous scheduler after each form. This ensures cooperative multitasking
+and allows other tasks to be processed in between forms.
+
+Arguments:
+  - FORMS: A sequence of forms to be executed.
+
+Returns:
+  - The result of the last form executed."
+  (let ((result (gensym "result-")))
+    `(let ((,result nil))
+       (catch 'concur-yield
+         ,@(mapcar (lambda (form)
+                    `(setq ,result (progn ,form))
+                    (concur-yield!))
+                  forms)
+         ,result))))
+
+(defmacro concur-do-with-conditional-yield! (condition &rest forms)
+  "Execute a sequence of forms, yielding control after each form based on CONDITION.
+
+Each form is executed in sequence, and after each form, the task yields control
+to the scheduler if CONDITION is met.
+
+Arguments:
+  - CONDITION: The condition under which to yield.
+  - FORMS: A sequence of forms to be executed.
+
+Returns:
+  - The result of the last form executed if no yields occurred."
+  (let ((result (gensym "result-")))
+    `(let ((,result nil))
+       (catch 'concur-yield
+         ,@(mapcar (lambda (form)
+                    `(setq ,result (progn ,form))
+                    `(when ,condition
+                       (concur-yield!)))
+                  forms)
+         ,result))))
+
+;; (defmacro concur-do-with-retry! (task &optional (max-retries 3) (delay 1))
+;;   "Retry TASK up to MAX-RETRIES times, yielding between retries if necessary.
+
+;; Arguments:
+;;   - TASK: A task to retry.
+;;   - MAX-RETRIES: The maximum number of retry attempts (default: 3).
+;;   - DELAY: The delay in seconds between retries (default: 1).
+
+;; Returns:
+;;   - The result of TASK after retries or `nil` if it fails."
+;;   (let ((attempts (gensym "attempts"))
+;;         (result (gensym "result")))
+;;     `(let ((,attempts 0)
+;;            (,result nil))
+;;        (catch 'concur-yield
+;;          (while (< ,attempts ,max-retries)
+;;            (setq ,result (funcall ,task))
+;;            (if ,result
+;;                (throw 'concur-yield ,result)
+;;              (progn
+;;                (setq ,attempts (1+ ,attempts))
+;;                (concur-yield!)))
+;;          ,result)))))
+
+;; (defmacro concur-do-with-conditional-retry! (task condition &optional (max-retries 3) (delay 1))
+;;   "Retry TASK if CONDITION is met, yielding control between retries."
+;;   (let ((attempts (gensym "attempts"))
+;;         (result (gensym "result")))
+;;     `(let ((,attempts 0)
+;;            (,result nil))
+;;        (catch 'concur-yield
+;;          (while (< ,attempts ,max-retries)
+;;            (setq ,result (funcall ,task))
+;;            (if (and ,result ,condition)
+;;                (throw 'concur-yield ,result)
+;;              (progn
+;;                (setq ,attempts (1+ ,attempts))
+;;                (concur-yield!)))
+;;          ,result))))         
+
+;; (defmacro concur-do-with-timeout! (task &optional (timeout 10))
+;;   "Execute TASK with a timeout, yielding control periodically.
+
+;; Arguments:
+;;   - TASK: The task to execute.
+;;   - TIMEOUT: The maximum time in seconds to allow for execution (default: 10).
+
+;; Returns:
+;;   - The result of TASK if it completes within the timeout, otherwise throws an error."
+;;   (let ((start-time (gensym "start-time"))
+;;         (elapsed-time (gensym "elapsed-time"))
+;;         (result (gensym "result")))
+;;     `(let ((,start-time (current-time))
+;;            (,elapsed-time 0)
+;;            (,result nil))
+;;        (catch 'concur-yield
+;;          (while (< ,elapsed-time ,timeout)
+;;            (setq ,result (funcall ,task))
+;;            (if ,result
+;;                (throw 'concur-yield ,result)
+;;              (progn
+;;                (setq ,elapsed-time (float-time (time-subtract (current-time) ,start-time)))
+;;                (concur-yield!)))
+;;          (error "Timeout exceeded for task."))))))
+
+;; (defmacro concur-do-with-exponential-backoff! (task &optional (max-retries 5) (initial-delay 1))
+;;   "Retry TASK with exponential backoff, yielding between retries.
+
+;; Arguments:
+;;   - TASK: A task to retry.
+;;   - MAX-RETRIES: The maximum number of retry attempts (default: 5).
+;;   - INITIAL-DELAY: The initial delay in seconds between retries (default: 1).
+
+;; Returns:
+;;   - The result of TASK after retries or `nil` if it fails."
+;;   (let ((attempts (gensym "attempts"))
+;;         (delay (gensym "delay"))
+;;         (result (gensym "result")))
+;;     `(let ((,attempts 0)
+;;            (,delay ,initial-delay)
+;;            (,result nil))
+;;        (catch 'concur-yield
+;;          (while (< ,attempts ,max-retries)
+;;            (setq ,result (funcall ,task))
+;;            (if ,result
+;;                (throw 'concur-yield ,result)
+;;              (progn
+;;                (setq ,attempts (1+ ,attempts))
+;;                (setq ,delay (* 2 ,delay))  ;; Exponential backoff
+;;                (concur-yield!)))
+;;          ,result)))))
+
+;; (defmacro concur-async-with-progress! (tasks &optional (progress-fn 'message))
+;;   "Execute TASKS, yielding periodically and updating progress via PROGRESS-FN.
+
+;; Arguments:
+;;   - TASKS: A list of tasks to execute.
+;;   - PROGRESS-FN: A function to report progress (default: `message`).
+
+;; Returns:
+;;   - The result of the last task executed, or `nil` if no tasks complete."
+;;   (let ((task (gensym "task"))
+;;         (total (gensym "total"))
+;;         (current (gensym "current"))
+;;         (result (gensym "result")))
+;;     `(let ((,total (length ,tasks))
+;;            (,current 0)
+;;            (,result nil))
+;;        (catch 'concur-yield
+;;          (dolist (,task ,tasks)
+;;            (setq ,result (funcall ,task))
+;;            (if ,result
+;;                (throw 'concur-yield ,result)
+;;              (progn
+;;                (funcall ,progress-fn (format "Progress: %d/%d" ,current ,total))
+;;                (setq ,current (1+ ,current))
+;;                (concur-yield!)))
+;;          ,result))))
+
+;; (defmacro concur-do-with-dependency! (tasks)
+;;   "Execute TASKS with dependencies, yielding between each step.
+
+;; Each task in TASKS is executed in order, and the task yields after each step.
+
+;; Arguments:
+;;   - TASKS: A list of tasks to execute.
+
+;; Returns:
+;;   - The result of the last task executed, or `nil` if no tasks complete."
+;;   (let ((task (gensym "task"))
+;;         (result (gensym "result")))
+;;     `(let ((,result nil))
+;;        (catch 'concur-yield
+;;          (dolist (,task ,tasks)
+;;            (setq ,result (funcall ,task))
+;;            (if ,result
+;;                (throw 'concur-yield ,result)
+;;              (concur-yield!)))
+;;          ,result))))
+
+;; (defmacro concur-do-with-pause! (tasks &optional (pause-time 1))
+;;   "Execute TASKS with a pause of PAUSE-TIME seconds between each, yielding control.
+
+;; Arguments:
+;;   - TASKS: A list of tasks to execute.
+;;   - PAUSE-TIME: The time in seconds to pause between tasks (default: 1).
+
+;; Returns:
+;;   - The result of the last task executed, or `nil` if no tasks complete."
+;;   (let ((task (gensym "task"))
+;;         (result (gensym "result")))
+;;     `(let ((,result nil))
+;;        (catch 'concur-yield
+;;          (dolist (,task ,tasks)
+;;            (setq ,result (funcall ,task))
+;;            (if ,result
+;;                (throw 'concur-yield ,result)
+;;              (sleep-for ,pause-time)
+;;              (concur-yield!)))
+;;          ,result))))
+
+;; (defmacro concur-do-with-batch! (tasks)
+;;   "Execute a batch of TASKS, yielding control after each one."
+;;   (let ((task (gensym "task"))
+;;         (result (gensym "result")))
+;;     `(let ((,result nil))
+;;        (catch 'concur-yield
+;;          (dolist (,task ,tasks)
+;;            (setq ,result (funcall ,task))
+;;            (if ,result
+;;                (throw 'concur-yield ,result)
+;;              (concur-yield!)))
+;;          ,result))))
+
+;; (defmacro concur-do-with-async-map! (func items)
+;;   "Apply FUNC to each item in ITEMS asynchronously, yielding control after each."
+;;   `(concur-do-with-yield!
+;;      (-each ,items
+;;             (lambda (,item)
+;;               (funcall ,func ,item)))))
+
+;; (defmacro concur-do-with-async-chain! (tasks)
+;;   "Chain a series of asynchronous TASKS, yielding after each task."
+;;   `(concur-do-with-yield!
+;;      (-reduce-from
+;;       (lambda (,accumulated ,task)
+;;         (let ((result (funcall ,task ,accumulated)))
+;;           ;; Process the result of the task
+;;           (message "Result: %s" result)
+;;           (concur-yield!)
+;;           result)
+;;       nil
+;;       ,tasks)))
+
+;; (defmacro concur-do-with-periodic-task! (task &optional (interval 1))
+;;   "Execute TASK periodically with a delay of INTERVAL seconds, yielding after each execution."
+;;   `(concur-do-with-yield!
+;;      (while t
+;;        (funcall ,task)
+;;        (sleep-for ,interval)
+;;        (concur-yield!))))
+
+;; (defmacro concur-schedule-task! (task)
+;;   "Schedule TASK to run asynchronously, yielding control after each step."
+;;   `(concur-do-with-yield! 
+;;     (funcall ,task)))
+
+;; (defmacro concur-process-queue! (queue)
+;;   "Process items in the QUEUE asynchronously, yielding after each item."
+;;   `(concur-do-with-yield!
+;;      (while (not (queue-empty-p ,queue))
+;;        (let ((item (queue-dequeue ,queue)))
+;;          ;; Process the item here
+;;          (message "Processing item: %s" item)
+;;          (concur-yield!))))
+
 ;;; Aliases
 
 (defalias 'concur-task-pipe 'concur-async-task-pipe)
 (defalias 'concur-task-parallel 'concur-async-task-parallel)
 (defalias 'concur-task-map 'concur-async-task-map)
+(defalias 'concur-task-race 'concur-async-task-race)
 (defalias 'concur-task-chain 'concur-async-task-chain)
 (defalias 'concur-task-reduce 'concur-async-task-reduce)
 (defalias 'concur-task-with-retries 'concur-async-task-with-retries)
@@ -844,3 +1200,4 @@ Returns:
 
 (provide 'concur-task)
 ;;; concur.el ends here               
+

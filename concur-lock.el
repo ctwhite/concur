@@ -36,6 +36,13 @@ Example:
                (funcall setter t)))
          ,@body))))
 
+(defmacro concur-once-callback! (flag callback &rest fallback)
+  "Invoke CALLBACK once if FLAG is nil. Otherwise, run FALLBACK."
+  `(concur-once-do! ,flag
+     (:else ,@fallback)
+     (when ,callback
+       (funcall ,callback))))
+       
 (defmacro concur-with-lock! (place fallback &rest body)
   "Acquire a lock on PLACE temporarily during the execution of BODY.
 
