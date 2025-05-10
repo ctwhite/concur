@@ -46,7 +46,6 @@
 (require 'dash)
 (require 'ht)
 
-;;;###autoload
 (defcustom concur-throw-on-promise-rejection t
   "If non-nil, rejected promises will throw an error for debugging purposes.
 This is useful when debugging logic that results in unhandled promise rejections."
@@ -953,6 +952,7 @@ or rejects with a plist containing :error, :exit, :stdout, :stderr, :cmd, and :a
 (defalias 'concur-loop 'concur-promise-loop)
 (defalias 'concur-run 'concur-promise-run)
 (defalias 'concur-spawn 'concur-promise-spawn)
+(defalias 'concur-p 'concur-promise-p)
 
 (provide 'concur-promise)
 ;;; concur-promise.el ends here
