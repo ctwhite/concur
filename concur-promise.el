@@ -1,7 +1,7 @@
 ;;; concur-promise.el --- Lightweight Promises for async chaining in Emacs -*- lexical-binding: t; -*-
-
+;;
 ;;; Commentary:
-
+;;
 ;; This module provides a lightweight Promise implementation for Emacs,
 ;; designed to support asynchronous workflows similar to JavaScript promises,
 ;; with explicit support for chaining, error handling, and finalization.
@@ -37,12 +37,12 @@
 ;; This module is foundational and intended to be extensible,
 ;; but it avoids heavyweight constructs (like `cl-promise`)
 ;; for performance and debuggability in Emacs.
-
+;;
 ;;; Code:
 
 (require 'cl-lib)
 (require 'concur-proc)
-(require 'concur-var)
+(require 'concur-util)
 (require 'dash)
 (require 'ht)
 
@@ -248,6 +248,17 @@ Example:
               (concur-promise-cancelled? promise))
     (concur--log! "[concur-promise] Promise cancelled: %S, reason: %S" promise reason)
     (concur-promise-reject promise (or reason '(:error "Promise cancelled")))))
+
+;;;###autoload
+(defun concur-promise-error? (promise)
+  "Return non-nil if PROMISE is in an error state.
+
+Arguments:
+  PROMISE -- A `concur-promise` instance.
+
+Return:
+  Non-nil if the PROMISE has an error associated with it (i.e., resolved with an error)."
+  (not (null (concur-promise-error promise))))
 
 ;;;###autoload
 (defun concur-promise-cancelled? (promise)

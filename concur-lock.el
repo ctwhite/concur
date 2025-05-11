@@ -1,4 +1,23 @@
 ;;; concur-lock.el --- Concur lock macros for Emacs -*- lexical-binding: t; -*-
+;;
+;;; Commentary:
+;;
+;; Provides lock-related macros to manage concurrency and synchronization
+;; in Emacs, including:
+;;
+;; - `concur-once-do!`: Ensures a block of code is executed only once,
+;;   based on the state of a flag.
+;; - `concur-once-callback!`: Executes a callback only once, and uses
+;;   fallback if a flag is set.
+;; - `concur-with-lock!`: Acquires a lock temporarily and executes a body
+;;   of code, releasing the lock afterward.
+;; - `concur-with-mutex!`: A more flexible lock, which can persist across
+;;   multiple executions if specified.
+;;
+;; These macros help ensure safe concurrent execution by preventing race
+;; conditions, and by allowing persistent and temporary locking mechanisms.
+;;
+;;; Code:
 
 (defmacro concur-once-do! (place fallback &rest body)
   "Run BODY once if PLACE is nil. Otherwise, run FALLBACK.

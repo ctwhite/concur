@@ -1,15 +1,16 @@
 ;;; concur-slot.el --- Async slot resolution via promises and futures -*- lexical-binding: t; -*-
-
+;;
 ;;; Commentary:
 ;; Provides lazy async slot initialization for EIEIO objects using concur's
 ;; promise and future system. This is a reusable layer for lazy-loading slot
 ;; values on demand.
-
+;;
 ;;; Code:
 
 (require 'cl-lib)
+(require 'concur-future)
 (require 'concur-promise)
-(require 'concur-var)
+(require 'concur-util)
 (require 'dash)
 (require 'eieio)
 (require 'ht)

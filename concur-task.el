@@ -1,33 +1,80 @@
 ;;; concur-task.el --- Cooperative async primitives for Emacs -*- lexical-binding: t; -*-
-
+;;
 ;;; Commentary:
-
+;;
 ;; `concur-task.el` provides lightweight cooperative concurrency for Emacs.
 ;; It introduces the `concur-async!` macro to run coroutines, with
 ;; `concur-await!` for async result waiting and `concur-with-semaphore!` for
 ;; cooperative critical sections. A task scheduler runs via idle timers
 ;; and requeues coroutines using `ring`.
-
+;;
 ;;; Code:
 
 (require 'cl-lib)
 (require 'concur-future)
 (require 'concur-lock)
 (require 'concur-promise)
-(require 'concur-var)
+(require 'concur-util)
 (require 'dash)
 (require 'ring)
 
+(cl-defstruct (concur-task (:constructor make-concur-task))
+  "A structure representing an asynchronous task to be scheduled and executed.
+
+Fields:
+  - semaphore: A semaphore object used to control concurrent access to shared resources (optional).
+  - cancel-token: A cancel token that can be used to cancel this task (optional).
+  - future: The future object that represents the result of the asynchronous computation.
+  - schedule: Specifies when the task should run. Possible values are:
+      - 'immediate: Run the task immediately.
+      - 'async: Run the task asynchronously.
+      - 'event-loop: Run the task within the current event loop (after the current task finishes).
+  - meta: Arbitrary metadata associated with the task. Can store extra information about the task.
+  - name: A human-readable name for the task (optional).
+  - created-at: A timestamp representing when the task was created.
+
+The `concur-task` struct is used to define tasks that are scheduled and executed by the concur scheduler.
+It encapsulates all the necessary information for task execution, cancellation, and resource management."
+  semaphore
+  cancel-token
+  future
+  schedule 
+  meta
+  name
+  created-at)
+
 (cl-defstruct concur-semaphore
-  "A semaphore to limit concurrent access to shared resources."
-  count         ;; Number of available slots.
-  queue         ;; Queue of waiting tasks (not promises!).
-  lock          ;; Mutex to protect the state.
-  data)         ;; Arbitrary user-defined metadata (opaque)
+  "A semaphore to limit concurrent access to shared resources.
+
+Fields:
+  - count: The number of available slots or resources. When `count` is greater than 0, 
+      tasks can proceed.
+  - queue: A queue of tasks waiting for access to the semaphore. These are tasks that are 
+      blocked because there are no available resources.
+  - lock: A mutex or lock used to protect the semaphore's state and prevent race conditions.
+  - data: Arbitrary user-defined metadata that can be associated with the semaphore. This allows
+      the user to store additional context (opaque data) relevant to the semaphore's usage.
+
+The `concur-semaphore` struct is used to manage resource access in a concurrent environment, 
+ensuring that a certain number of tasks can run concurrently while others wait in a queue."
+  count        
+  queue        
+  lock         
+  data)        
 
 (cl-defstruct concur-cancel-token
-  "A structure representing a cancel token."
-  active)
+  "A structure representing a cancel token that can be used to cancel asynchronous tasks.
+
+Fields:
+  - active: A boolean value indicating whether the cancel token is active. If `active` is 
+      non-nil, tasks associated with this token can be canceled.
+  - name: An optional human-readable name for the cancel token, which can be useful for 
+      debugging or logging purposes.
+
+The `concur-cancel-token` struct is used to signal cancellation for tasks. If a task checks 
+for cancellation and finds that its associated cancel token is active, it can halt execution early."
+  active
+  name)
 
 ;;;###autoload
 (defcustom concur-scheduler-max-queue-length 100
@@ -129,6 +176,77 @@ Error Handling:
            (run-hook-with-args 'concur-scheduler-error-hook err)
            (concur--log! "Task error: %S" err)))))))
 
+(defun concur-scheduler-run ()
+  "Run the next task in the async queue, or stop if the queue is empty.
+
+This function is responsible for executing the next task in the async task queue.
+It checks the scheduling preferences of the task and runs it accordingly. If the
+task queue is empty, the scheduler will stop. Otherwise, it dequeues the next task 
+and processes it.
+
+The scheduling behavior depends on the `:schedule` value associated with each task:
+  - t: Runs the task immediately using `run-at-time` with a delay of 0 (essentially scheduling it for immediate execution).
+  - nil: Runs the task immediately in the current context.
+  - 'async: Schedules the task for asynchronous execution using `async-start`.
+  - 'deferred: Schedules the task to run after the current event loop using `run-at-time`.
+
+Error handling is done with `condition-case`, and any errors that occur during task
+execution are passed to `concur-promise-reject` and logged using `concur--log!`.
+
+This function interacts with:
+  - `concur--task-queue`: A ring buffer that holds the tasks waiting to be executed.
+  - `concur-task-future`: Accesses the future object associated with the task.
+  - `concur-future-promise`: Resolves the promise once the task has finished executing.
+  - `concur-task-schedule`: Fetches the task's scheduling preference.
+
+Example of scheduling behavior:
+  - If `:schedule` is `t`, the task is scheduled for immediate execution.
+  - If `:schedule` is `nil`, the task is run immediately in the current context.
+  - If `:schedule` is `'async`, the task will run asynchronously, allowing other operations to continue.
+  - If `:schedule` is `'deferred`, the task will be deferred until after the current event loop.
+
+Note:
+  - If the queue is empty, the scheduler will stop.
+  - Errors are handled gracefully and logged for debugging."
+  (if (ring-empty-p concur--task-queue)
+      (concur-scheduler-stop)  ;; Stop if the task queue is empty
+    (let ((task (ring-remove concur--task-queue))        ;; Remove the task from the queue
+          (future (concur-task-future task))            ;; Get the future associated with the task
+          (promise (concur-future-promise future))      ;; Get the promise from the future
+          (task-fn (concur-future-fn future))           ;; Get the function to run for the task
+          (schedule (concur-task-schedule task)))       ;; Get the scheduling preference for the task
+
+      (let ((concur--inside-scheduler t))  ;; Mark that we're inside the scheduler
+        (condition-case err
+            (cond
+               ;; Defer the task execution until the current event loop finishes
+             ((or (eq schedule t) (eq schedule 'deferred))
+              (run-at-time 0 nil
+                           (lambda ()
+                             (funcall task-fn)  
+                             (concur-promise-resolve promise result)))) 
+
+             ;; Run the task immediately
+             ((eq schedule nil)
+              (funcall task-fn)  
+              (concur-promise-resolve promise result))  
+
+             ;; Run the task asynchronously
+             ((eq schedule 'async)
+              (async-start
+               (lambda () (funcall task-fn)) 
+               (lambda (result)  
+                 (concur-promise-resolve promise result))))
+             
+             (t
+              (error "Unknown :schedule value %S" schedule)))
+
+          (error
+           ;; Handle errors during task execution
+           (concur-promise-reject promise err)  
+           (run-hook-with-args 'concur-scheduler-error-hook err)  
+           (concur--log! "Task error: %S" err)))))))
+
 ;;;###autoload
 (defun concur-scheduler-queue-task (task)
   "Queue TASK into the asynchronous scheduler. If the queue is full, the oldest task will be dropped.
@@ -145,14 +263,17 @@ Side Effects:
 - Starts the promise scheduler if it is not already running.
 
 Precondition:
-- The TASK argument must be a function (`functionp`). An assertion is made to ensure this."
-  (cl-assert (functionp task))
-  ;; Check if the ring is full
+- The TASK argument must be a valid task object of type `concur-task`."
+  (cl-assert (concur-task-p task))  
+  
+  ;; Add the task to the ring buffer (queue) for future processing
   (if (= (ring-length concur--task-queue) (ring-size concur--task-queue))
       ;; If the ring is full, remove the oldest task
       (ring-remove concur--task-queue)  
     ;; Insert the new task at the end of the ring
-    (ring-insert concur--task-queue task))  
+    (ring-insert concur--task-queue task))
+
+  ;; Ensure the scheduler starts if it's not already running
   (concur-scheduler-start))
 
 ;;;###autoload
@@ -403,28 +524,72 @@ Returns:
 ;;; Cancel Token
 
 ;;;###autoload
-(defun concur-cancel-token ()
-  "Create and return a new cancel token."
+(defun concur-cancel-token-create ()
+  "Create and return a new cancel token.
+This function creates a new cancel token and marks it as active by default.
+
+Returns:
+  A cancel token struct, initialized with an `:active` field set to t."
   (make-concur-cancel-token :active t))
 
 ;;;###autoload
 (defun concur-cancel-token-cancel (token)
-  "Cancel the given TOKEN, marking it as inactive."
-  (setf (concur-cancel-token-active token) nil))
+  "Cancel the given TOKEN, marking it as inactive.
+This function sets the cancel token's `:active` field to nil to indicate the task
+associated with this token should be canceled.
+
+Arguments:
+  - token: The cancel token to cancel. Should be a valid cancel token object.
+  
+Side Effects:
+  - Sets the `:active` field of the token to nil, marking it as canceled.
+  
+Error Handling:
+  - Signals an error if the token is not a valid cancel token."
+  (if (not (concur-cancel-token-active-p token))
+      (error "The token is either nil or already canceled. Cannot cancel again."))
+  (setf (concur-cancel-token-active token) nil)
+  (concur--log! "Cancel token %s: Marked as canceled" (concur-cancel-token-name token)))
 
 ;;;###autoload
 (defun concur-cancel-token-active-p (token)
-  "Check if the cancel TOKEN is still active (i.e., not canceled)."
-  (and token (concur-cancel-token-active token)))
+  "Check if the cancel TOKEN is still active (i.e., not canceled).
+This function checks the `:active` field of the token to determine if the task
+associated with this token should still be active.
+
+Arguments:
+  - token: The cancel token to check. Should be a valid cancel token object.
+  
+Returns:
+  - t if the token is active (not canceled).
+  - nil if the token is canceled or invalid."
+  (if (not token)
+      (error "Invalid token: nil"))
+  (concur-cancel-token-active token))
 
 ;;;###autoload
 (defun concur-cancel-token-check (token)
-  "Check if the task should be canceled by evaluating the cancel TOKEN."
+  "Check if the task should be canceled by evaluating the cancel TOKEN.
+If the token is canceled, this function logs the cancellation and returns `t` to
+indicate that the task should be canceled. If the token is still active, it returns `nil`.
+
+Arguments:
+  - token: The cancel token to check.
+  
+Returns:
+  - t if the token is canceled (task should be canceled).
+  - nil if the token is active (task should continue)."
   (if (not (concur-cancel-token-active-p token))
       (progn
-        (log! "Task has been canceled.")
+        (concur--log! "Task canceled due to token %s." (concur-cancel-token-name token))
         t)  ;; Return t to indicate cancellation
     nil))  ;; Return nil if the task is still active
+
+(defun concur-cancel-token-name (token)
+  "Return a human-readable name for the cancel TOKEN.
+If the token contains a `:name` field, return that; otherwise, generate a unique name."
+  (or (plist-get (concur-cancel-token-data token) :name)
+      (symbol-name (gensym "cancel-token-"))))
 
 ;;; Async
 
@@ -432,172 +597,223 @@ Returns:
 (defun concur-async-task (task &optional delay)
   "Run TASK (a function returning a promise or value) asynchronously.
 
-If DELAY is non-nil, the task will be scheduled after that many seconds.
-If DELAY is nil, the task is scheduled to run as soon as possible
-using `run-at-time` with zero delay (i.e., defer until after current command).
+If DELAY is non-nil, the task will be scheduled after that many seconds
+using `run-at-time`. If DELAY is nil, the task is scheduled to run using
+`async-start` for a truly asynchronous, non-blocking execution.
 
 Returns a concur-promise resolving to the task result."
   (let ((promise (concur-promise-new))
-        (runner (lambda ()
-                  (let ((result (funcall task)))
-                    (if (concur-promise-p result)
-                        (concur-promise-then result
-                                             (lambda (res err)
-                                               (if err
-                                                   (concur-promise-reject promise err)
-                                                 (concur-promise-resolve promise res))))
-                      (concur-promise-resolve promise result))))))
-    (run-at-time (or delay 0) nil runner)
+        (wrapped-task (concur-future-wrap (lambda () (funcall task)))))
+    (if delay
+        (run-at-time (or delay 0) nil
+                     (lambda () (concur-future-force wrapped-task)))  ;; Force the wrapped task after delay
+      (async-start
+       `(lambda () (concur-future-force ,wrapped-task))  ;; Force the wrapped task when async starts
+       (lambda (result) 
+         (concur-promise-resolve promise result))))
     promise))
 
+;;;###autoload
 (defmacro concur-async! (&rest args)
-  "Run BODY asynchronously, with optional SEMAPHORE, :schedule nil, and :cancel TOKEN.
+  "Run BODY asynchronously with optional SEMAPHORE, :schedule nil, :cancel TOKEN, and :meta METADATA.
 
-Usage:
-  (concur-async!
-    (do-something))
-
-  (concur-async! my-semaphore
-    (do-limited-work))
-
-  (concur-async! :schedule nil
-    (do-immediate-work))
-
-  (concur-async! my-semaphore :cancel cancel-token :schedule nil
-    (cancel-aware-work))
+This macro wraps a body of code and runs it asynchronously, supporting optional
+parameters for concurrency control, task scheduling, cancellation, and metadata.
 
 Arguments:
-  - SEMAPHORE (optional): Limits concurrency if provided.
-  - :schedule nil: Run immediately instead of using the task pool.
-  - :cancel TOKEN: Symbol or function to test for cancellation.
+  - BODY: The code to be executed asynchronously.
+  - :semaphore (optional): A semaphore object to limit the number of concurrent tasks.
+  - :schedule (optional): A boolean that determines if the task should be scheduled 
+    immediately or queued for later execution (defaults to t).
+  - :cancel (optional): A cancellation token, which can be used to cancel the task.
+  - :meta (optional): Metadata associated with the task, such as identifiers or tags.
 
 Returns:
-  A `promise` representing the async computation."
-  (declare (indent defun))
-  (let* ((args* args)
-         (semaphore nil)
-         (schedule t)
-         (cancel-token nil)
-         (body nil))
+  - A `concur-future` representing the result of the task, which can be awaited with
+    `concur-await!`.
 
-    ;; Extract keyword arguments
+Behavior:
+  - The macro creates a new task, wraps it in a `concur-future`, and schedules it for 
+    execution in the background.
+  - If a semaphore is provided, the body of the task will be executed with the semaphore
+    to limit concurrent executions.
+  - If a cancel token is provided, the task checks for cancellation and may short-circuit
+    if the cancellation token is active.
+  - The task is then added to the scheduler, where it will be executed asynchronously.
+
+Example:
+  (concur-async! 
+    :semaphore some-semaphore
+    :schedule nil
+    :cancel cancel-token
+    :meta '("task1")
+    (do-some-work))
+
+  ;; This example runs the `(do-some-work)` body asynchronously with a semaphore
+  ;; and cancellation token. It will be scheduled immediately as the `:schedule`
+  ;; argument is `nil`.
+
+Error Handling:
+  - If an error occurs during the execution of the task, it will be propagated and
+    logged with `concur-promise-reject`."
+  (declare (indent defun))  
+  (let* ((args* args)       
+         (semaphore nil)    
+         (schedule t)       
+         (cancel-token nil) 
+         (meta nil)         
+         (body nil))        
+
+    ;; Extract keyword arguments (e.g. :schedule, :cancel, :meta)
     (while (keywordp (car (last args*)))
       (let ((kw (car (last args*)))
             (val (car (last (butlast args*)))))
-        (setq args* (butlast args* 2))
+        (setq args* (butlast args* 2))  
         (pcase kw
-          (:schedule (setq schedule val))
-          (:cancel (setq cancel-token val))
-          (_ (error "Unknown keyword %S in concur-async!" kw)))))
+          (:schedule (setq schedule val))   
+          (:cancel   (setq cancel-token val)) 
+          (:meta     (setq meta val))         
+          (_ (error "Unknown keyword %S in concur-async!" kw))))) 
 
-    ;; Detect positional SEMAPHORE if present
+    ;; Detect optional semaphore: if it's not a keyword, assume it's the semaphore
     (if (and args* (not (keywordp (car args*))))
-        (setq semaphore (car args*)
-              body (cdr args*))
-      (setq body args*))
+        (setq semaphore (car args*)      
+              body (cdr args*))          
+      (setq body args*))                 
 
-    ;; Generate symbols
-    (let ((done    (gensym "done-"))
-          (result  (gensym "result-"))
-          (promise (gensym "promise-"))
-          (self    (gensym "self-")))
+    ;; Generate symbols to avoid conflicts
+    (let ((done   (gensym "done-"))      
+          (result (gensym "result-"))    
+          (self   (gensym "self-"))      
+          (future (gensym "future-"))    
+          (promise (gensym "promise-"))) 
 
-      `(let* ((,done nil)
-              (,result nil)
-              (,promise (concur-promise-new)))
+      `(let* ((,done nil)         
+              (,result nil))      
+
          (cl-labels ((,self ()
-                      (catch 'concur-yield
-                        ;; Cancellation check using API
-                        (when ,(if cancel-token
-                                   `(concur-cancel-token-active-p ,cancel-token)
-                                 t)
-                          (setq ,result
-                                ,(if semaphore
-                                     `(concur-with-semaphore! ,semaphore ,@body)
-                                   `(progn ,@body)))
-                          (setq ,done t)))))
-           (concur-future-wrap
-            (lambda ()
-              (condition-case err
-                  (progn
-                    (,self)
-                    (when ,done
-                      ;; Double-check cancellation before resolving the promise
-                      (when ,(if cancel-token
-                                 `(concur-cancel-token-active-p ,cancel-token)
-                               t)
-                        (concur-promise-resolve ,promise ,result))))
-                (error
-                 (concur-promise-reject ,promise err)
-                 (concur--log! "concur-async! task error: %S" err)))))
-           ,(if schedule
-                `(concur-scheduler-queue-task
-                  (lambda () (concur-future-force ,promise)))
-              `(progn
-                 (concur--log! "Bypassing task pool with :schedule nil")
-                 (concur-async-task ,promise)))
-           ,promise)))))
+                         ;; This catch block is used to allow the asynchronous task
+                         ;; to "yield" control back to the scheduler at certain points.
+                         ;; If the task needs to pause (e.g., waiting for a semaphore or
+                         ;; a cancellation check), it will throw the control to the 'concur-yield
+                         ;; label, allowing the scheduler to take over.
+                         ;;
+                         ;; This makes the task cooperative, meaning that it can voluntarily
+                         ;; give up control back to the scheduler at appropriate points.
+                         ;;
+                         ;; The catch will not end the task, it just allows for cooperative
+                         ;; multitasking where the task can resume later after the yield point.
 
+                         ;; Cancellation-aware logic:
+                       (catch 'concur-yield
+                         ;; Cancellation-aware logic:
+                         (when ,(if cancel-token
+                                    `(concur-cancel-token-active-p ,cancel-token)
+                                  t)  
+                           ;; Execute the task with semaphore or without
+                           (setq ,result
+                                 ,(if semaphore
+                                      `(concur-with-semaphore! ,semaphore ,@body)
+                                    `(progn ,@body))) 
+                           (setq ,done t)))))  
+
+           ;; Create the future task and wrap it in the scheduler
+           (let* ((,future
+                   (concur-future-wrap
+                    (lambda ()
+                      (setq ,promise (concur-future-promise ,future))
+                      (condition-case err
+                          (progn
+                            ;; Start the task body asynchronously
+                            (,self)  
+                            (when ,done
+                              (when ,(if cancel-token
+                                         `(concur-cancel-token-active-p ,cancel-token)
+                                       t)
+                                (concur-promise-resolve ,promise ,result))))
+                        (error
+                         ;; Handle errors in the task body
+                         (concur-promise-reject ,promise err)
+                         (concur--log! "concur-async! task error: %S" err)))))))
+
+              (task
+               (make-concur-task
+                :future ,future        
+                :promise ,promise      
+                :schedule ,schedule    
+                :cancel ,cancel-token  
+                :meta ,meta))          
+
+             ;; Add the task to the scheduler for execution
+             (concur-scheduler-queue-task task)
+             ,promise))))     
+
+;;;###autoload
 (defmacro concur-await! (form)
-  "Await the result of FORM, which must evaluate to a `concur-future`.
+  "Await the result of FORM, which must evaluate to a `concur-future` or `concur-promise`.
 
-This macro blocks execution until the `concur-future` represented by FORM has completed. It ensures 
-that the result is available before proceeding. The future can be created either inside the scheduler 
-or outside of it (e.g., using `:schedule nil` in `concur-async!`).
+This macro blocks execution until the result of FORM is available, whether it's a
+`concur-future` or a `concur-promise`. The future or promise can be created either
+inside the scheduler or outside of it.
 
 Behavior:
-  - If called **inside the scheduler**, it yields cooperatively by re-queuing the task to the scheduler 
-  until the future is completed.
-  - If called **outside the scheduler**, it performs a polling loop, periodically checking the status of the 
-  future with `sleep-for` to avoid blocking the Emacs event loop.
+  - If called **inside the scheduler**, it yields cooperatively by re-queuing the
+    task to the scheduler until the task is completed.
+  - If called **outside the scheduler**, it uses a polling loop, periodically
+    checking the status of the task with `sleep-for` to avoid blocking the Emacs
+    event loop.
 
 Arguments:
-  - FORM: The expression that should evaluate to a `concur-future` (i.e., an asynchronous operation's result).
+  - FORM: The expression that should evaluate to a `concur-future` or `concur-promise`.
 
 Returns:
-  - The value stored in the future if successful, or signals an error if the future has encountered an error.
+  - The value stored in the future or promise if successful, or signals an error if
+    encountered.
 
 Error Handling:
-  - If the future has encountered an error, it will be raised as a Lisp error using `signal`.
-  
+  - If the future or promise has encountered an error, it will be raised as a Lisp
+    error using `signal`.
+
 Example:
   (concur-await! (concur-async! (some-task)))
-  ;; Wait until the asynchronous task completes, then continue execution.
-
-If the future is completed inside the scheduler, this macro cooperatively yields. Otherwise, it uses 
-a polling loop to wait for the result."
+  ;; Wait until the asynchronous task completes, then continue execution."
   (let ((val (gensym "val"))
-        (future (gensym "future")))
-    `(let* ((,future ,form)
+        (task (gensym "task"))
+        (result (gensym "result")))
+    `(let* ((,task ,form)
             (,val nil))
-       ;; Ensure FORM evaluates to a valid concur-future
-       (cl-assert (concur-future-p ,future)
-                  nil "Expected a concur-future, but got: %S" ,future)
-       
+       ;; Check if FORM evaluates to a future or a promise
+       (cl-assert (or (concur-future-p ,task) (concur-promise-p ,task))
+                  nil "Expected a concur-future or concur-promise, but got: %S" ,task)
+
        (if (boundp 'concur--inside-scheduler)
            ;; If inside scheduler: yield cooperatively by re-queuing the task
-           (cl-labels
-               ((self ()
-                      (unless (concur-future-done-p ,future)
-                        (concur-scheduler-queue-task #'self))))
-             ;; Block until the future is done, using cooperative scheduling
+           (cl-labels ((self ()
+                          (unless (or (concur-future-done-p ,task)
+                                      (concur-promise-done-p ,task))
+                            (concur-scheduler-queue-task #'self))))
+             ;; Block until the future or promise is done, using cooperative scheduling
              (concur-block-until
-              (lambda () (concur-future-done-p ,future))
+              (lambda () (or (concur-future-done-p ,task)
+                             (concur-promise-done-p ,task)))
               #'self))
-         
+
          ;; If outside scheduler: use polling loop with sleep to avoid blocking
-         (while (not (concur-future-done-p ,future))
+         (while (not (or (concur-future-done-p ,task) (concur-promise-done-p ,task)))
            (sleep-for concur-await-poll-interval)))
 
-       ;; Check if the future has an error, signal it if so
-       (if (concur-future-error-p ,future)
-           (signal (car (concur-future-error ,future))
-                   (cdr (concur-future-error ,future)))
-         
-         ;; Otherwise, return the resolved value
-         (setq ,val (concur-future-value ,future)))
+       ;; Handle the result depending on whether it's a future or a promise
+       (if (concur-future-error-p ,task)
+           (signal (car (concur-future-error ,task))
+                   (cdr (concur-future-error ,task)))
 
-       ;; Return the value of the future
+         ;; If it's a promise, resolve it using `concur-promise-value`
+         (if (concur-promise-p ,task)
+             (setq ,val (concur-promise-value ,task))
+           ;; Otherwise, resolve the future
+           (setq ,val (concur-future-value ,task))))
+
+       ;; Return the value of the future or promise
        ,val)))
 
 ;;;###autoload
@@ -614,29 +830,20 @@ Arguments:
   - FINALLY (optional): A function to be invoked when the task finishes, regardless of success or failure.
   - SEMAPHORE (optional): A semaphore to limit concurrency.
   - SCHEDULE (optional): If non-nil, bypass the task pool and run the task immediately without scheduling.
-  - CANCEL-TOKEN (optional): A symbol or function to check for cancelation. If provided, task execution may 
+  - CANCEL-TOKEN (optional): A symbol or function to check for cancellation. If provided, task execution may 
   be short-circuited based on the token.
 
 Returns:
   A `concur-future` that represents the result of the task."
   (if (functionp fn-or-val)
-      (if schedule
-          ;; If `schedule` is non-nil, bypass the task pool and run the task immediately
-          (concur-async!
-           :catch catch
-           :finally finally
-           :semaphore semaphore
-           :cancel cancel-token  
-           ;; Ensure the task is run without the scheduler
-           :schedule nil  
-           (funcall fn-or-val))
-        ;; Otherwise, schedule the task within the task pool
-        (concur-async!
-         :catch catch
-         :finally finally
-         :semaphore semaphore
-         :cancel cancel-token  
-         (funcall fn-or-val)))
+      ;; Forward the schedule symbol directly to concur-async!
+      (concur-async!
+       :catch catch
+       :finally finally
+       :semaphore semaphore
+       :cancel cancel-token  
+       :schedule schedule ;; Forward the schedule symbol here
+       (funcall fn-or-val))
     ;; If FN-OR-VAL is already a value, resolve immediately
     (concur-promise-resolved! fn-or-val)))
 
@@ -706,37 +913,35 @@ TASK-FN will be called asynchronously with each task in the TASKS list.
 If no semaphore is provided, no concurrency limit will be enforced.
 If no cancel token is provided, cancellation will not be handled."
 
-  (let ((tasks-done 0)          ;; Counter to track completed tasks
-        (called? nil)            ;; Flag to ensure callback is called once
+  (let ((tasks-done 0)                 ;; Counter to track completed tasks
+        (called? nil)                  ;; Flag to ensure callback is called once
         (total-tasks (length tasks))  ;; Total tasks to track
         (controller (make-symbol "concur-async-task-map-cancel-token"))
-        (fallback-callback (lambda () (when (and (not called?) (>= tasks-done total-tasks))
-                                        (funcall cancel nil)))))
+        (fallback-callback (lambda ()
+                              (when (and (not called?) (>= tasks-done total-tasks))
+                                (funcall cancel nil)))))
     
     (cl-labels
         ((should-cancel-p ()
            (or (and cancel (funcall cancel))
-               (symbol-value controller))))
-      
-      ;; Wrap the task function to increment the task counter and check cancellation
-      (let ((wrapped-task-fn
-             (lambda (task)
-               (lambda ()
-                 (unless (should-cancel-p)
-                   (funcall task)  ;; Run the actual task
-                   (setq tasks-done (1+ tasks-done))
-                   ;; If no match, check if we need to call fallback
-                   (when (and (not called?) (>= tasks-done total-tasks))
-                     (funcall fallback-callback)))))))
-        
-        ;; Map over tasks and apply the wrapped function
-        (mapc (lambda (task)
-                (funcall (wrapped-task-fn task)))
-              tasks)
+               (symbol-value controller)))
 
-        ;; At this point, we return a function to cancel any remaining tasks if necessary
-        (lambda ()
-          (setf (symbol-value controller) t))))))
+         (wrapped-task-fn (task)
+           (lambda ()
+             (unless (should-cancel-p)
+               (funcall task)
+               (setq tasks-done (1+ tasks-done))
+               (when (and (not called?) (>= tasks-done total-tasks))
+                 (funcall fallback-callback))))))
+      
+      ;; Apply wrapped task function to each task
+      (mapc (lambda (task)
+              (funcall (wrapped-task-fn task)))
+            tasks)
+
+      ;; Return a cancellation function
+      (lambda ()
+        (setf (symbol-value controller) t)))))
 
 ;;;###autoload
 (cl-defun concur-async-task-race (task-fn tasks &key (semaphore 1) (cancel nil) (timeout-seconds nil))
@@ -969,6 +1174,7 @@ Returns:
                        (concur-yield!)))
                   forms)
          ,result))))
+
 
 ;; (defmacro concur-do-with-retry! (task &optional (max-retries 3) (delay 1))
 ;;   "Retry TASK up to MAX-RETRIES times, yielding between retries if necessary.

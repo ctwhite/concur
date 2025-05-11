@@ -1,5 +1,5 @@
 ;;; concur-future.el --- Concurrency primitives for asynchronous tasks ---
-
+;;
 ;;; Commentary:
 ;;
 ;; This library provides concurrency primitives for handling asynchronous
@@ -12,14 +12,14 @@
 ;; the main Emacs event loop. Futures provide a way to work with the result of
 ;; asynchronous tasks without directly using callbacks.
 ;;
-
+;;
 ;;; Code:
 
 (require 'cl-lib)   
 (require 'dash)
 (require 'concur-lock)
 (require 'concur-promise)
-(require 'concur-var)
+(require 'concur-util)
 (require 'ht)
 
 (cl-defstruct

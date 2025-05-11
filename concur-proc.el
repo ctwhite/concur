@@ -1,8 +1,26 @@
-;;; concur-proc.el --- Run commandline process asynchronously -*- lexical-binding: t; -*-
+;;; concur-proc.el --- Run command-line processes asynchronously -*- lexical-binding: t; -*-
+;;
+;;; Commentary:
+;;
+;; Provides `concur-proc`, a utility to launch external command-line processes
+;; asynchronously from Emacs, with structured output handling and customizable
+;; execution context (e.g., working directory, environment, stdin/stderr control).
+;;
+;; The callback receives a plist containing:
+;;   :cmd     — command name
+;;   :args    — list of arguments
+;;   :exit    — exit status code
+;;   :stdout  — cleaned standard output (optionally stripped of ANSI codes)
+;;   :stderr  — captured standard error output
+;;
+;; ANSI color codes can be removed, stderr can be merged or separated, and
+;; callbacks are safely wrapped to prevent errors from hanging Emacs.
+;;
+;;; Code:
 
 (require 'ansi-color)
 (require 'cl-lib)
-(require 'concur-var)
+(require 'concur-util)
 (require 'dash)
 (require 's)
 
