@@ -48,7 +48,18 @@ resolves or rejects it. It won't be executed until forced via
    :promise (concur-promise-new)  ;; Create an empty promise
    :thunk thunk                   ;; The thunk to resolve/reject the promise
    :evaluated? nil))              ;; Flag indicating the future hasn't been evaluated yet
-         
+
+;;;###autoload
+(defun concur-promise-error? (future)
+  "Return non-nil if FUTURE is in an error state.
+
+Arguments:
+  PROMISE -- A `concur-future` instance.
+
+Return:
+  Non-nil if the FUTURE has an error associated with it (i.e., evaluated with an error)."
+  (concur-promise-error? (concur-future-promise future)))
+
 (defmacro concur-future-once! (future &rest body)
   "Evaluate BODY only once per FUTURE. Safe to call multiple times.
 
@@ -195,9 +206,7 @@ Returns a promise that resolves to a hash table of results or errors, keyed by i
                   (if (= done total)
                       (concur-promise-resolve promise results)
                     (run-next))))))))
-
       (run-next))
-
     (concur-promise->future promise)))
 
 (provide 'concur-future)

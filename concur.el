@@ -24,13 +24,15 @@
 ;;
 ;;; Code:
 
+(require 'concur-async)
+(require 'concur-cancel)
 (require 'concur-future)
-(require 'concur-lock)
+(require 'concur-primitives)
 (require 'concur-proc)
 (require 'concur-promise)
+(require 'concur-scheduler)
 (require 'concur-slot)
 (require 'concur-task)
 
 (provide 'concur)
-
 ;;; concur.el ends here
