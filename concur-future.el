@@ -1,4 +1,4 @@
-;;; concur-future.el --- Concurrency primitives for asynchronous tasks ---
+;;; concur-future.el --- Concurrency primitives for asynchronous tasks --- -*- lexical-binding: t; -*-
 ;;
 ;;; Commentary:
 ;;
@@ -17,10 +17,10 @@
 
 (require 'cl-lib)   
 (require 'dash)
-(require 'concur-lock)
+(require 'concur-primitives)
 (require 'concur-promise)
-(require 'concur-util)
 (require 'ht)
+(require 'scribe)
 
 (cl-defstruct
     (concur-future
@@ -40,17 +40,26 @@ FIELDS:
 
 ;;;###autoload
 (defun concur-future-new (thunk)
-  "Create a `future` from a THUNK of one argument (the promise).
-THUNK should be a function that accepts a promise and eventually
-resolves or rejects it. It won't be executed until forced via
-`concur-future-evaluate`."
-  (concur-future-create
-   :promise (concur-promise-new)  ;; Create an empty promise
-   :thunk thunk                   ;; The thunk to resolve/reject the promise
-   :evaluated? nil))              ;; Flag indicating the future hasn't been evaluated yet
+  "Wrap a no-arg function FN into a `future`.
+The returned future will call FN and resolve or reject based on
+its result. If FN throws an error, it is caught and causes rejection."
+  (let ((promise (concur-promise-new)))  ;; Create a new promise
+    (let ((future (concur-future-create
+                   :thunk (lambda ()
+                     (condition-case ex
+                         (let ((result (funcall thunk)))
+                           ;; Resolve the promise when the function succeeds
+                           (concur-promise-resolve promise result))
+                       (error
+                        ;; Reject the promise when the function fails
+                        (concur-promise-reject promise ex))))
+                   :promise promise
+                   :evaluated? nil)))
+      ;; Return the future object
+      future)))
 
 ;;;###autoload
-(defun concur-promise-error? (future)
+(defun concur-future-error? (future)
   "Return non-nil if FUTURE is in an error state.
 
 Arguments:
@@ -71,17 +80,16 @@ Does not return the promise directly — use `concur-future-force` for that."
   (declare (indent 1))
   `(concur-once-do! (concur-future-evaluated? ,future)
      (:else
-      (concur--log! "[future] Already evaluated: %S" ,future)
+      (log! "Already evaluated: %S" ,future :level 'warn)
       (if (concur-future-promise ,future)
-          (concur--log! "[future] Promise is already resolved: %S" ,future)
-        (concur--log! "[future] Promise is not resolved, but future was marked evaluated.")))
+          (log! "Promise is already resolved: %S" ,future :level 'warn)
+        (log! "Promise is not resolved, but future was marked evaluated." :level 'warn)))
 
-     (concur--log! "[future] Evaluating thunk for: %S" ,future)
-     (let ((thunk (concur-future-thunk ,future))
-           (promise (concur-future-promise ,future)))
-       (if (and thunk promise)
-           (funcall thunk promise)
-         (concur--log! "[future] Missing thunk or promise in FUTURE: %S" ,future)))))
+     (log! "Evaluating thunk for: %S" ,future)
+     (let ((thunk (concur-future-thunk ,future)))           
+       (if thunk
+           (funcall thunk)
+         (log! "Missing thunk or promise in FUTURE: %S" ,future :level 'warn)))))
          
 ;;;###autoload
 (defun concur-future-force (future)
@@ -89,34 +97,20 @@ Does not return the promise directly — use `concur-future-force` for that."
 Returns nil if FUTURE is nil or not a valid concur-future object."
   (cond
    ((null future)
-    (concur--log! "[future-force] FUTURE is nil. Nothing to evaluate.")
+    (log! "FUTURE is nil. Nothing to evaluate." :level 'warn)
     nil)
 
    ((not (concur-future-p future))
-    (concur--log! "[future-force] Invalid FUTURE object: %S" future)
+    (log! "Invalid FUTURE object: %S" future :level 'warn)
     nil)
 
    (t
     (concur-future-once! future)
     (let ((promise (concur-future-promise future)))
-      (concur--log! "[future-force] Returning promise from FUTURE: %S" promise)
+      (log! "Returning promise from FUTURE: %S" promise)
       promise))))
 
 (defalias 'concur-future-evaluate #'concur-future-force)
-
-;;;###autoload
-(defun concur-future-wrap (fn)
-  "Wrap a no-arg function FN into a `future`.
-The returned future will call FN and resolve or reject based on
-its result. If FN throws an error, it is caught and causes rejection."
-  (concur-future-new
-   ;; This lambda is executed when the future is forced
-   (lambda (promise)  
-     (condition-case ex
-         (progn
-           (let ((result (funcall fn)))
-             (concur-promise-resolve promise result)))  
-       (error (concur-promise-reject promise ex))))))
 
 ;;;###autoload
 (defun concur-future-attach (future promise &optional evaluate)
@@ -145,7 +139,9 @@ If nil, it is assumed the caller will evaluate the future later."
 ;;;###autoload
 (defun concur-promise->future (promise)
   "Wrap PROMISE in a future that forces the promise when evaluated."
-  (concur-future-wrap (lambda () (concur-promise-resolve promise))))
+  (let (future (concur-future-wrap (lambda () (concur-promise-resolve promise))))
+    (setf (concur-future-promise future) promise)
+    future))
   
 ;;;###autoload
 (defun concur-future-from-process (command &optional args cwd env input)
@@ -155,7 +151,7 @@ INPUT is a string to send to stdin.
 
 The future resolves with trimmed STDOUT or rejects with a plist
 containing :error, :exit, :stdout, and :stderr."
-  (concur-future-wrap
+  (concur-future-new
    (lambda ()
      (concur-promise-run
       :command command
@@ -178,7 +174,7 @@ Returns a promise that resolves to a hash table of results or errors, keyed by i
                                 (list :index i
                                       :future (if (concur-future-p fut)
                                                   fut
-                                                (concur-future-wrap fut))))
+                                                (concur-future-new fut))))
                               futures))
          (active 0)
          (done 0)
@@ -191,7 +187,7 @@ Returns a promise that resolves to a hash table of results or errors, keyed by i
                (setq active (1+ active))
                (when delay (sit-for delay))
                (concur-promise-then
-                (concur-future-evaluate fut)
+                (concur-future-force fut)
                 (lambda (result)
                   (ht-set! results i result)
                   (setq done (1+ done)

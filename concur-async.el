@@ -10,6 +10,7 @@
 ;;
 ;;; Code:
 
+(require 'async)
 (require 'cl-lib)
 (require 'concur-primitives)
 (require 'concur-scheduler)
@@ -17,6 +18,7 @@
 (require 'concur-future)
 (require 'concur-task)
 (require 'dash)
+(require 'scribe)
   
 (defcustom concur-await-poll-interval 0.005
   "Polling interval in seconds used by `concur-await!` when blocking outside the scheduler.
@@ -25,25 +27,34 @@ A small value (e.g. 0.005 = 5ms) gives more responsiveness, but may use more CPU
   :group 'concur)
 
 ;;;###autoload
-(defun concur-async-run (fn &optional delay)
-  "Run TASK (a function returning a promise or value) asynchronously.
+(defun concur-async-run (fn &optional mode)
+  "Run FN (a function returning a promise or value) asynchronously.
 
-If DELAY is non-nil, the task will be scheduled after that many seconds
-using `run-at-time`. If DELAY is nil, the task is scheduled to run using
-`async-start` for a truly asynchronous, non-blocking execution.
+MODE determines how the function is executed:
+  - If MODE is 'deferred, use `run-at-time` with 0 delay.
+  - If MODE is a number, use `run-at-time` with MODE as the delay.
+  - If MODE is 'async or nil, use `async-start` for non-blocking behavior.
 
 Returns a concur-promise resolving to the task result."
-  (let ((promise (concur-promise-new))
-        (future (concur-future-wrap (lambda () (funcall fn)))))
-    (if delay
-        (run-at-time (or delay 0) nil
-                     ;; Force the wrapped task after delay
-                     (lambda () (concur-future-force future)))  
+  (let ((future (concur-future-new (lambda () (funcall fn))))
+        (promise (concur-future-promise future)))
+    (cond
+     ((eq mode 'deferred)
+      (run-at-time 0 nil
+                   (lambda ()
+                     (concur-future-force future))))
+     ((numberp mode)
+      (run-at-time mode nil
+                   (lambda ()
+                     (concur-future-force future))))
+     (t
       (async-start
-        ;; Force the wrapped task when async starts
-       `(lambda () (concur-future-force ,future))  
-       (lambda (result) 
-         (concur-promise-resolve promise result))))
+       `(lambda () 
+          (require 'concur-future)
+          (require 'concur-promise)
+          (concur-future-force ,future))
+       (lambda (result)
+         (concur-promise-resolve promise result)))))
     promise))
 
 ;;;###autoload
@@ -89,7 +100,7 @@ Example:
 Error Handling:
   - If an error occurs during the execution of the task, it will be propagated and
     logged with `concur-promise-reject`."
-  (declare (indent defun))
+  (declare (indent defun) (debug (form &rest (sexp body))))
   (let* ((args* args)
          (semaphore nil)
          (schedule t)
@@ -120,7 +131,6 @@ Error Handling:
           (step     (gensym "step-"))
           (self     (gensym "self-"))
           (future   (gensym "future-"))
-          (promise  (gensym "promise-"))
           (task     (gensym "task-")))
 
       `(let* ((,done nil)
@@ -141,7 +151,7 @@ Error Handling:
                ;; multitasking where the task can resume later after the yield point.
                (catch 'concur-yield
                  (when ,(if cancel-token
-                            `(concur-cancel-token-active-p ,cancel-token)
+                            `(not (concur-cancel-token-active-p ,cancel-token))
                           t)
 
                    ;; Yield before execution if scheduling type is 'thread'                                                    
@@ -163,47 +173,45 @@ Error Handling:
                               (throw 'concur-yield nil))))
                         ',body))
                    (setq ,done t)))))
-          
+
            ;; Create the future task
-           (let* ((,promise (concur-promise-create))
-                  (,task nil)
+           (let* ((,task nil)
                   (,future
-                   (concur-future-wrap
+                   (concur-future-new
                     (lambda ()
-                      ;; Bind task now that it's initialized
-                      (concur-task-mark-started ,task)
-                      (unwind-protect
-                          (condition-case err
-                              (progn
-                                ;; Start the task body asynchronously
-                                (,self)
-                                (when ,done
-                                  (when ,(if cancel-token
-                                             `(concur-cancel-token-active-p ,cancel-token)
-                                           t)
-                                    (concur-promise-resolve ,promise ,result))))
-                            (error
-                             ;; Handle errors thrown in the task body
-                             (concur-promise-reject ,promise err)
-                             (concur--log! "concur-async! task error: %S" err)))
-                        ;; Clean up - mark task as ended                             
-                        (concur-task-mark-ended ,task))))))
+                      (let ((started nil))
+                        (unwind-protect
+                            (progn
+                              ;; Bind task now that it's initialized
+                              (concur-task-mark-started ,task)
+                              (setq started t)
+
+                              (run-hook-with-args 'concur-task-started-hook ,task)
+                              (,self)
+                              (when ,done
+                                (when ,(if cancel-token
+                                           `(not (concur-cancel-token-active-p ,cancel-token))
+                                         t)
+                                  ,result)))
+                          ;; Clean up - mark task as ended
+                          (when started
+                            (run-hook-with-args 'concur-task-ended-hook ,task)
+                            (concur-task-mark-ended ,task))))))))
 
              ;; Create the task
              (setq ,task
-                   (concur-task-create
+                   (concur-task-new
                     :future ,future
-                    :promise ,promise
                     :schedule ,schedule
-                    :cancel ,cancel-token
-                    :meta ,meta))
+                    :cancel-token ,cancel-token
+                    :data ,meta))
 
              ;; Schedule the task
-             (concur-scheduler-queue-task ,task)
-             ,promise))))))
+             (concur-scheduler-enqueue-task ,task)
+             (concur-future-promise ,future)))))))
 
 ;;;###autoload
-(defmacro concur-await! (form)
+(defmacro concur-await! (form &rest args)
   "Await the result of FORM, which must evaluate to a `concur-future` or `concur-promise`.
 
 This macro blocks execution until the result of FORM is available, whether it's a
@@ -231,52 +239,46 @@ Error Handling:
 Example:
   (concur-await! (concur-async! (some-task)))
   ;; Wait until the asynchronous task completes, then continue execution."
-  (declare (indent 1))
-  (let ((val (gensym "val"))
-        (task (gensym "task"))
-        (start (gensym "start"))
-        (timeout (gensym "timeout")))
+  (declare (indent defun) (debug (form &rest (sexp args))))
+  (let ((task (gensym "task"))
+        (promise (gensym "promise"))
+        (timeout (gensym "timeout"))
+        (start (gensym "start")))
     `(let* ((,task ,form)
-            (,val nil)
             (,timeout (plist-get (list ,@args) :timeout))
-            (,start (and ,timeout (float-time))))
-       (cl-assert (or (concur-future-p ,task) (concur-promise-p ,task))
-                  nil "Expected a concur-future or concur-promise, but got: %S" ,task)
+            (,start (and ,timeout (float-time)))
+            (,promise
+             (cond
+              ((concur-future-p ,task)
+               (concur-future-force ,task)
+               (concur-future-promise ,task))
+              ((concur-promise-p ,task) ,task)
+              (t (error "Expected a concur-future or concur-promise, got: %S" ,task)))))
 
-       (if (boundp 'concur--inside-scheduler)
-           ;; Inside scheduler: cooperative blocking
+       (if concur--scheduler-running
+           ;; Inside scheduler: cooperative wait with manual timeout
            (cl-labels ((self ()
-                          (when (and ,timeout
-                                     (> (- (float-time) ,start) ,timeout))
-                            (signal 'concur-timeout (list ,task)))
-                          (unless (or (concur-future-evaluated? ,task)
-                                      (concur-promise-resolved? ,task))
-                            (concur-scheduler-enqueue-task #'self))))
+                              (when (and ,timeout
+                                         (> (- (float-time) ,start) ,timeout))
+                                (signal 'concur-timeout (list ,task)))
+                              (unless (concur-promise-resolved? ,promise)
+                                (concur-scheduler-enqueue-task #'self))))
              (concur-block-until
               (lambda ()
-                (or (concur-future-evaluated? ,task)
-                    (concur-promise-resolved? ,task)
+                (or (concur-promise-resolved? ,promise)
                     (and ,timeout
                          (> (- (float-time) ,start) ,timeout))))
               #'self))
-         ;; Outside scheduler: polling loop
-         (while (not (or (concur-future-evaluated? ,task)
-                         (concur-promise-resolved? ,task)))
-           (when (and ,timeout
-                      (> (- (float-time) ,start) ,timeout))
-             (signal 'concur-timeout (list ,task)))
-           (sleep-for concur-await-poll-interval)))
+         ;; Outside scheduler: delegate to promise await (which handles timeout internally)
+         nil)
 
        ;; Final result or error
-       (cond
-        ((concur-future-p ,task)
-         (if (concur-future-error? ,task)
-             (signal (car (concur-future-error ,task))
-                     (cdr (concur-future-error ,task)))
-           (setq ,val (concur-future-force ,task))))
-        ((concur-promise-p ,task)
-         (setq ,val (concur-promise-await ,task))))
-       ,val)))
+       (concur-promise-await ,promise ,timeout))))
+
+(defmacro concur-fire-and-forget! (&rest body)
+  "Run BODY asynchronously without tracking result or cancellation.
+Intended for side-effecting tasks where result is not needed."
+  `(ignore (concur-async! ,@body)))
 
 ;;;###autoload
 (cl-defun concur-async-task-wrap (fn-or-val &key catch finally semaphore schedule cancel-token)
@@ -596,3 +598,40 @@ Returns:
 
 (provide 'concur-async)
 ;;; concur-async.el ends here
+
+
+
+;; (defun concur-stream-results (tasks callback &optional schedule)
+;;   "Run a list of TASKS asynchronously and stream results to CALLBACK as they complete.
+;; If SCHEDULE is 'thread, ensure thread safety using a mutex. Otherwise, rely on
+;; consult-async! to handle task scheduling."
+;;   (let ((results (make-ring (length tasks)))  ; Shared ring buffer to collect results
+;;         (completed 0)                        ; Track number of completed tasks
+;;         (mutex (if (eq schedule 'thread) (make-thread-mutex) nil))) ; Mutex for threading
+  
+;;     (cl-labels
+;;         ((task-execution (task)
+;;            "Execute the task and handle result streaming."
+;;            (let ((result (funcall task)))      ;; Execute the task
+;;              (ring-insert results result)      ;; Insert the result into the ring
+;;              (funcall callback result)         ;; Stream the result
+;;              (setq completed (1+ completed))   ;; Increment completed tasks
+;;              (when (= completed (length tasks))
+;;                (message "All tasks completed."))))
+
+;;       ;; Prepare task functions to pass to consult-async!
+;;       (dolist (task tasks)
+;;         (cl-labels
+;;             ((task-wrapper ()
+;;                "Wrap the task lambda with thread safety if needed."
+;;                (if (eq schedule 'thread)
+;;                    (with-mutex mutex
+;;                      (task-execution task))  ;; Ensure thread safety here
+;;                  (task-execution task))))   ;; No mutex for non-threaded
+
+;;           (consult-async!
+;;            task-wrapper  ;; Pass the wrapper (which includes mutex logic if needed)
+;;            :schedule schedule)))
+
+;;     ;; Return the ring of results (could be processed concurrently)
+;;     results))

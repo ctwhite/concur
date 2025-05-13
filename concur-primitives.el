@@ -39,6 +39,7 @@
 
 (require 'cl-lib)
 (require 'dash)
+(require 'scribe)
 
 ;;; Atomicity / Locking Macros
 
@@ -187,7 +188,7 @@ Returns t if TEST eventually returns non-nil, or nil if timeout occurs."
         (while (not (funcall test))
           (when (should-timeout)
             (when meta
-              (concur--log! "Timeout while waiting: %S" meta))
+              (log! "Timeout while waiting: %S" meta :level 'warn))
             (cl-return-from concur-block-until nil))
 
           ;; Clamp the interval to avoid scheduling immediate timers
@@ -273,13 +274,13 @@ Returns:
      (lambda () (> (concur-semaphore-count sem) 0))  
      (lambda () 
        ;; Requeue the task if the semaphore is unavailable
-       (concur--log! "Task queued for semaphore: %s" (concur--semaphore-name sem))
+       (log! "Task queued for semaphore: %s" (concur--semaphore-name sem))
        (setf (concur-semaphore-queue sem)
           (append (concur-semaphore-queue sem) (list task)))))  ;; FIFO Queue
 
     ;; Decrement available slots in semaphore
     (cl-decf (concur-semaphore-count sem))
-    (concur--log! "Semaphore acquired: %s" sem)))
+    (log! "Semaphore acquired: %s" sem)))
 
 ;;;###autoload
 (defun concur-semaphore-try-acquire (sem task)
@@ -300,7 +301,7 @@ Returns:
     ;; Attempt non-blocking acquire
     (when (> (concur-semaphore-count sem) 0)
       (cl-decf (concur-semaphore-count sem))
-      (concur--log! "Semaphore try-acquire successful: %s" sem)
+      (log! "Semaphore try-acquire successful: %s" sem)
       t)))
 
 ;;;###autoload
@@ -321,13 +322,13 @@ Returns:
     
     ;; Increment the available slots in the semaphore
     (cl-incf (concur-semaphore-count sem))
-    (concur--log! "Semaphore released: %s" (concur--semaphore-name sem))
+    (log! "Semaphore released: %s" (concur--semaphore-name sem))
 
     ;; Wake up the next entry in the queue, if any
     (when-let ((next (car (concur-semaphore-queue sem))))
       (setf (concur-semaphore-queue sem)
             (cdr (concur-semaphore-queue sem)))
-      (concur--log! "Waking up task for semaphore: %s" (concur--semaphore-name sem))
+      (log! "Waking up task for semaphore: %s" (concur--semaphore-name sem))
       (funcall wake-fn next))))
 
 ;;;###autoload
@@ -401,26 +402,32 @@ Returns:
   - Nothing. If the semaphore is successfully acquired, BODY is executed
     in a critical section. If not, fallback forms are executed if :else is provided."
   (declare (indent defun))
-  (-let* (((keys body-forms) (--split-with (lambda (x) (keywordp x)) body))
-          (&plist :else else) keys
-          (acquired (gensym "acquired")))
-    `(let ((,acquired nil))
-       (unwind-protect
-           (progn
-             ;; Attempt non-blocking acquire if :else is present
-             (if ,(if else t nil)
-                 (setq ,acquired (concur-semaphore-try-acquire ,sem nil))
-               (progn
-                 (concur-semaphore-acquire ,sem nil)
-                 (setq ,acquired t)))
-
-             (if ,acquired
+  (let* ((reversed (reverse body))
+         (plist '())
+         (body-forms '()))
+    ;; Walk backwards and collect plist-like pairs
+    (while (and reversed (keywordp (car reversed)))
+      (let ((key (pop reversed))
+            (val (pop reversed)))
+        (setq plist (plist-put plist key val))))
+    (setq body-forms (reverse reversed))
+    (let* ((else (plist-get plist :else))
+           (acquired (gensym "acquired")))
+      `(let ((,acquired nil))
+         (unwind-protect
+             (progn
+               ;; Try non-blocking acquire if :else is present
+               (if ,(if else t nil)
+                   (setq ,acquired (concur-semaphore-try-acquire ,sem nil))
                  (progn
-                   ,@body-forms)
-               ,@(when else
-                   `((progn ,@else)))))
-         (when ,acquired
-           (concur-semaphore-release ,sem ,wake-fn))))))
+                   (concur-semaphore-acquire ,sem nil)
+                   (setq ,acquired t)))
+
+               (if ,acquired
+                   (progn ,@body-forms)
+                 ,@(when else `((progn ,@else)))))
+           (when ,acquired
+             (concur-semaphore-release ,sem ,wake-fn)))))))
 
 (provide 'concur-primitives)
 ;;; concur-primitives.el ends here

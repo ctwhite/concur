@@ -1,4 +1,4 @@
-;;; concur-cancel.el --- Concurrency primitives for cancellation ---
+;;; concur-cancel.el --- Concurrency primitives for cancellation --- -*- lexical-binding: t; -*-
 ;;
 ;;; Commentary:
 ;;
@@ -33,6 +33,7 @@
 
 (require 'cl-lib)
 (require 'ht)
+(require 'scribe)
 
 (cl-defstruct concur-cancel-token
   "A structure representing a cancel token that can be used to cancel asynchronous tasks.
@@ -42,11 +43,13 @@ Fields:
       non-nil, tasks associated with this token can be canceled.
   - name: An optional human-readable name for the cancel token, which can be useful for 
       debugging or logging purposes.
-
+  - data: An optional plist containing additional data associated with the cancel token.
+  
 The `concur-cancel-token` struct is used to signal cancellation for tasks. If a task checks 
 for cancellation and finds that its associated cancel token is active, it can halt execution early."
   active
-  name)
+  name
+  data)
 
 (defvar concur--cancel-token-table (ht)
   "Registry mapping cancel tokens to their associated tasks.")
@@ -93,13 +96,13 @@ Error Handling:
     (mapc (lambda (fn)
             (condition-case err
                 (funcall fn)
-              (error (log! "Cancel callback error: %S" err :level :error))))
+              (error (log! "Cancel callback error: %S" err :level 'error))))
           callbacks)
     ;; Optionally remove hooks to avoid leaks
     (ht-remove! concur--cancel-token-hooks token)))
 
 ;;;###autoload
-(defun concur-cancel-token-active-p (token)
+(defun concur-cancel-token-active? (token)
   "Check if the cancel TOKEN is still active (i.e., not canceled).
 This function checks the `:active` field of the token to determine if the task
 associated with this token should still be active.
@@ -126,7 +129,7 @@ Arguments:
 Returns:
   - t if the token is canceled (task should be canceled).
   - nil if the token is active (task should continue)."
-  (if (not (concur-cancel-token-active-p token))
+  (if (not (concur-cancel-token-active? token))
       (progn
         (log! "Task canceled due to token %s." (concur-cancel-token-name token))
         t)  ;; Return t to indicate cancellation
