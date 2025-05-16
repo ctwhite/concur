@@ -26,12 +26,15 @@
 
 (require 'concur-async)
 (require 'concur-cancel)
+(require 'concur-coroutine)
+(require 'concur-fsm)
 (require 'concur-future)
+(require 'concur-generator)
+(require 'concur-lazy)
 (require 'concur-primitives)
 (require 'concur-proc)
 (require 'concur-promise)
 (require 'concur-scheduler)
-(require 'concur-slot)
 (require 'concur-task)
 
 (provide 'concur)

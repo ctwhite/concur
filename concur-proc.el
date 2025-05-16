@@ -24,13 +24,13 @@
 (require 's)
 (require 'scribe)
 
-(defun concur--exec-process-output (cmd args output discard-ansi die-on-error exit-code &optional stderr)
+(defun concur-proc--process-output (cmd args output discard-ansi die-on-error exit-code &optional stderr)
   "Process OUTPUT from an async command.
 
 If DISCARD-ANSI is non-nil, strip ANSI codes using `ansi-color-apply`.
 If DIE-ON-ERROR is non-nil and EXIT-CODE is non-zero, signal an error.
 Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
-  (log! "[concur-exec] Processing output (exit: %d)" exit-code)
+  (log! "Processing output (exit: %d)" exit-code)
   (let* ((safe-output (or output ""))
          (clean-output (if discard-ansi
                            (ansi-color-apply safe-output)
@@ -88,29 +88,29 @@ Return a plist: (:exit CODE :stdout STRING :stderr STRING)."
                (condition-case err
                    (setq stdout (when (buffer-live-p out)
                                   (with-current-buffer out (buffer-string))))
-                 (error (log! "Error reading stdout: %s" err :level 'error)))
+                 (error (log! "Error reading stdout: %s" err :level 'error :trace)))
                (condition-case err
                    (setq stderr (when (and err (buffer-live-p err))
                                   (with-current-buffer err (buffer-string))))
-                 (error (log! "Error reading stderr: %s" err :level 'error)))
+                 (error (log! "Error reading stderr: %s" err :level 'error :trace)))
                (condition-case err
                    (progn
                      (when (buffer-live-p out) (kill-buffer out))
                      (when (and err (buffer-live-p err)) (kill-buffer err)))
-                 (error (log! "Error killing buffers: %s" err :level 'error)))
+                 (error (log! "Error killing buffers: %s" err :level 'error :trace)))
 
                (setq exit-status (process-exit-status _proc))
-               (log! "[concur-exec] Processing output (exit: %d)" exit-status)
+               (log! "Processing output (exit: %d)" exit-status)
 
                ;; Wrap the callback in condition-case to avoid silent hangs
                (condition-case err
                    (funcall cb
-                            (concur--exec-process-output
+                            (concur-proc--process-output
                              exe args stdout discard-ansi die-on-error
                              exit-status stderr))
                  (error
-                  (log! "[concur-exec] Error in callback: %s"
-                           (error-message-string err) :level 'error))))))))
+                  (log! "Error in callback: %s"
+                           (error-message-string err) :level 'error :trace))))))))
       proc)))
 
 (provide 'concur-proc)

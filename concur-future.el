@@ -28,22 +28,22 @@
      (:constructor concur-future-create (&key promise thunk evaluated?)))
   "A lazy future represents a deferred computation that returns a promise when forced.
 
-FIELDS:
+Fields:
 
-- PROMISE: The cached promise, evaluated once the thunk is forced. Remains nil until evaluated.
-- THUNK: A zero-argument function representing the computation to run lazily.
-- evaluated?: Non-nil if the thunk has already been evaluated, indicating the promise is cached."
-  promise     ;; Cached promise after evaluation
-  thunk       ;; Zero-argument function returning a promise
-  evaluated? ;; Boolean flag indicating evaluation state
-)
+`promise`    The cached promise, evaluated once the thunk is forced. Remains nil until evaluated.
+`thunk`      A zero-argument function representing the computation to run lazily.
+`evaluated?` Non-nil if the thunk has already been evaluated, indicating the promise is cached."
+
+  promise   
+  thunk     
+  evaluated?)
 
 ;;;###autoload
 (defun concur-future-new (thunk)
   "Wrap a no-arg function FN into a `future`.
 The returned future will call FN and resolve or reject based on
 its result. If FN throws an error, it is caught and causes rejection."
-  (let ((promise (concur-promise-new)))  ;; Create a new promise
+  (let ((promise (concur-promise-new)))  
     (let ((future (concur-future-create
                    :thunk (lambda ()
                      (condition-case ex
@@ -78,7 +78,7 @@ slot, which is set to `t` after the first execution.
 
 Does not return the promise directly — use `concur-future-force` for that."
   (declare (indent 1))
-  `(concur-once-do! (concur-future-evaluated? ,future)
+  `(once-do! (concur-future-evaluated? ,future)
      (:else
       (log! "Already evaluated: %S" ,future :level 'warn)
       (if (concur-future-promise ,future)
@@ -95,6 +95,7 @@ Does not return the promise directly — use `concur-future-force` for that."
 (defun concur-future-force (future)
   "Force FUTURE's thunk to run if not already. Returns the internal promise.
 Returns nil if FUTURE is nil or not a valid concur-future object."
+  (log! "Forcing FUTURE: %S" future)
   (cond
    ((null future)
     (log! "FUTURE is nil. Nothing to evaluate." :level 'warn)
@@ -118,6 +119,7 @@ Returns nil if FUTURE is nil or not a valid concur-future object."
 
 If EVALUATE is non-nil (default), the future will be forced.
 If nil, it is assumed the caller will evaluate the future later."
+  (log! "Attaching promise %S to future %S" promise future)
   (let ((existing-promise (concur-future-promise future)))
     (unless (concur-promise-p existing-promise)
       (error "Cannot attach a future that does not have a valid promise"))
@@ -135,75 +137,6 @@ If nil, it is assumed the caller will evaluate the future later."
                (or (null evaluate) (eq evaluate t))) ; default is to evaluate
       (concur-future-force future)))
   promise)
-
-;;;###autoload
-(defun concur-promise->future (promise)
-  "Wrap PROMISE in a future that forces the promise when evaluated."
-  (let (future (concur-future-wrap (lambda () (concur-promise-resolve promise))))
-    (setf (concur-future-promise future) promise)
-    future))
-  
-;;;###autoload
-(defun concur-future-from-process (command &optional args cwd env input)
-  "Return a `future` that runs COMMAND asynchronously with ARGS.
-CWD sets the working directory, ENV sets environment variables,
-INPUT is a string to send to stdin.
-
-The future resolves with trimmed STDOUT or rejects with a plist
-containing :error, :exit, :stdout, and :stderr."
-  (concur-future-new
-   (lambda ()
-     (concur-promise-run
-      :command command
-      :args args
-      :cwd cwd
-      :env env
-      :stdin input
-      :discard-ansi t
-      :die-on-error t))))
-
-;;;###autoload
-(cl-defun concur-futures (futures &key (max 4) (delay 0) (order 'ordered))
-  "Run FUTURES (list of futures or thunks) with MAX concurrency.
-Optional DELAY throttles task launching. ORDER can be 'ordered or 'unordered.
-
-Returns a promise that resolves to a hash table of results or errors, keyed by index."
-  (let* ((total (length futures))
-         (results (ht-create))
-         (queue (-map-indexed (lambda (i fut)
-                                (list :index i
-                                      :future (if (concur-future-p fut)
-                                                  fut
-                                                (concur-future-new fut))))
-                              futures))
-         (active 0)
-         (done 0)
-         (promise (concur-promise-new)))
-
-    (cl-labels
-        ((run-next ()
-           (while (and queue (< active max))
-             (pcase-let* ((`(:index ,i :future ,fut) (pop queue)))
-               (setq active (1+ active))
-               (when delay (sit-for delay))
-               (concur-promise-then
-                (concur-future-force fut)
-                (lambda (result)
-                  (ht-set! results i result)
-                  (setq done (1+ done)
-                        active (1- active))
-                  (if (= done total)
-                      (concur-promise-resolve promise results)
-                    (run-next)))
-                (lambda (err)
-                  (ht-set! results i err)
-                  (setq done (1+ done)
-                        active (1- active))
-                  (if (= done total)
-                      (concur-promise-resolve promise results)
-                    (run-next))))))))
-      (run-next))
-    (concur-promise->future promise)))
 
 (provide 'concur-future)
 ;;; concur-future.el ends here

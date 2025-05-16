@@ -35,18 +35,22 @@
 (require 'ht)
 (require 'scribe)
 
-(cl-defstruct concur-cancel-token
+(cl-defstruct (concur-cancel-token
+            (:constructor nil) ; disable default constructor
+            (:constructor concur-cancel-token--create (&key active name data)))
   "A structure representing a cancel token that can be used to cancel asynchronous tasks.
 
-Fields:
-  - active: A boolean value indicating whether the cancel token is active. If `active` is 
-      non-nil, tasks associated with this token can be canceled.
-  - name: An optional human-readable name for the cancel token, which can be useful for 
-      debugging or logging purposes.
-  - data: An optional plist containing additional data associated with the cancel token.
-  
 The `concur-cancel-token` struct is used to signal cancellation for tasks. If a task checks 
-for cancellation and finds that its associated cancel token is active, it can halt execution early."
+for cancellation and finds that its associated cancel token is active, it can halt execution early.
+
+Fields:
+
+`active`  A boolean value indicating whether the cancel token is active. If `active` is 
+          non-nil, tasks associated with this token can be canceled.
+`name`    An optional human-readable name for the cancel token, which can be useful for 
+          debugging or logging purposes.
+`data`    An optional plist containing additional data associated with the cancel token."
+  
   active
   name
   data)
@@ -57,10 +61,12 @@ for cancellation and finds that its associated cancel token is active, it can ha
 (defvar concur--cancel-token-hooks (ht)
   "Hash table mapping cancel tokens to a list of cancel callbacks.")
 
+;;;###autoload
 (defun concur-cancel-register-token (token task)
   "Associate TOKEN with TASK in the cancel token registry."
   (ht-set! concur--cancel-token-table token task))
 
+;;;###autoload
 (defun concur-cancel-remove-token (token)
   "Remove TOKEN from the cancel token registry."
   (ht-remove! concur--cancel-token-table token))
@@ -72,7 +78,8 @@ This function creates a new cancel token and marks it as active by default.
 The token is automatically registered for cancellation.
 Returns:
   A cancel token struct, initialized with an `:active` field set to t."
-  (let ((token (make-concur-cancel-token :active t :name name)))
+  (log! "Creating cancel token: %s" name)
+  (let ((token (concur-cancel-token--create :active t :name name)))
     ;; Register the token as soon as it is created
     (concur-cancel-register-token token)
     token))
@@ -91,6 +98,7 @@ Side Effects:
   
 Error Handling:
   - Signals an error if the token is not a valid cancel token."
+  (log! "Canceling token: %s" (concur-cancel-token-name token))
   (setf (concur-cancel-token-active token) nil)
   (let ((callbacks (ht-get concur--cancel-token-hooks token)))
     (mapc (lambda (fn)
@@ -145,6 +153,7 @@ If the token contains a `:name` field, return that; otherwise, generate a unique
 (defun concur-cancel-token-on-cancel (token callback)
   "Register CALLBACK to be run when TOKEN is canceled.
 Deduplicates based on `eq` identity of CALLBACK."
+  (log! "Registering cancel callback for token: %s" (concur-cancel-token-name token))
   (let* ((callbacks (ht-get concur--cancel-token-hooks token))
          (already-registered (member callback callbacks)))
     (unless already-registered

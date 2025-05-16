@@ -5,13 +5,13 @@
 ;; Provides lock-related macros to manage concurrency and synchronization
 ;; in Emacs, including:
 ;;
-;; - `concur-once-do!`: Ensures a block of code is executed only once,
+;; - `once-do!`: Ensures a block of code is executed only once,
 ;;   based on the state of a flag.
-;; - `concur-once-callback!`: Executes a callback only once, and uses
+;; - `once-callback!`: Executes a callback only once, and uses
 ;;   fallback if a flag is set.
-;; - `concur-with-lock!`: Acquires a lock temporarily and executes a body
+;; - `with-lock!`: Acquires a lock temporarily and executes a body
 ;;   of code, releasing the lock afterward.
-;; - `concur-with-mutex!`: A more flexible lock, which can persist across
+;; - `with-mutex!`: A more flexible lock, which can persist across
 ;;   multiple executions if specified.
 ;;
 ;; These macros help ensure safe concurrent execution by preventing race
@@ -41,10 +41,26 @@
 (require 'dash)
 (require 'scribe)
 
-;;; Atomicity / Locking Macros
+(cl-defstruct (concur-semaphore
+            (:constructor nil) ; disable default constructor
+            (:constructor concur-semaphore-create (&key count queue lock data)))
+  "A semaphore to limit concurrent access to shared resources.
+
+Fields:
+  - count: The number of available slots or resources. When `count` is greater than 0, 
+      tasks can proceed.
+  - queue: A queue of tasks waiting for access to the semaphore. These are tasks that are 
+      blocked because there are no available resources.
+  - lock: A mutex or lock used to protect the semaphore's state and prevent race conditions.
+  - data: Arbitrary user-defined metadata that can be associated with the semaphore. This allows
+      the user to store additional context (opaque data) relevant to the semaphore's usage."
+  count
+  queue
+  lock
+  data)
 
 ;;;###autoload
-(defmacro concur-once-do! (place fallback &rest body)
+(defmacro once-do! (place fallback &rest body)
   "Run BODY once if PLACE is nil. Otherwise, run FALLBACK.
 
 This macro ensures that a block of code is executed only once based on the
@@ -81,15 +97,15 @@ Example:
          ,@body))))
 
 ;;;###autoload
-(defmacro concur-once-callback! (flag callback &rest fallback)
+(defmacro once-callback! (flag callback &rest fallback)
   "Invoke CALLBACK once if FLAG is nil. Otherwise, run FALLBACK."
-  `(concur-once-do! ,flag
+  `(once-do! ,flag
      (:else ,@fallback)
      (when ,callback
        (funcall ,callback))))
 
 ;;;###autoload       
-(defmacro concur-with-lock! (place fallback &rest body)
+(defmacro with-lock! (place fallback &rest body)
   "Acquire a lock on PLACE temporarily during the execution of BODY.
 
 This macro ensures that the code in BODY will only execute if PLACE is not
@@ -108,7 +124,7 @@ Side Effects:
 - Releases the lock on PLACE after executing BODY.
 
 Example:
-  (concur-with-lock! my-lock (:else (message \"Already locked!\")) (do-something))"
+  (with-lock! my-lock (:else (message \"Already locked!\")) (do-something))"
   (declare (indent 2))
   (let ((lock-held (gensym "lock-held")))
     `(if ,place
@@ -128,7 +144,7 @@ Example:
                  (funcall setter nil))))))))
 
 ;;;###autoload
-(defmacro concur-with-mutex! (place fallback &rest body)
+(defmacro with-mutex! (place fallback &rest body)
   "Generic lock macro with optional permanent form.
 Acquire a lock on PLACE, and ensure that the lock persists across runs if 
 needed.
@@ -150,7 +166,7 @@ Side Effects:
 - Releases the lock on PLACE after executing BODY.
 
 Example:
-  (concur-with-mutex! my-mutex (:permanent my-lock) (do-something))"
+  (with-mutex! my-mutex (:permanent my-lock) (do-something))"
   (declare (indent 2))
   (let ((real-place (gensym "real-place"))
         (permanent (gensym "permanent")))
@@ -160,12 +176,10 @@ Example:
            ,(if (and (consp fallback) (eq (car fallback) :else))
                 `(progn ,@(cdr fallback))
               fallback)
-         (concur-with-lock! ,real-place
+         (with-lock! ,real-place
            (:else nil)
-           ;; Set lock explicitly (already done by concur-with-lock!)
+           ;; Set lock explicitly (already done by with-lock!)
            ,@body)))))
-
-;;; Cooperative Multitasking Primitives
 
 (defun concur-block-until (test enqueue &rest options)
   "Block cooperatively until TEST returns non-nil, using ENQUEUE to requeue if not.
@@ -176,6 +190,7 @@ OPTIONS is a plist supporting:
   - :step              – controls whether to step through the task
 
 Returns t if TEST eventually returns non-nil, or nil if timeout occurs."
+  (log! "Blocking until: %S" test :level 'debug :trace)
   (let* ((start-time (float-time))
          (timeout (plist-get options :timeout))
          (interval (plist-get options :interval))
@@ -211,28 +226,24 @@ this causes the task to yield after one step. Otherwise, it uses `throw`
 to pause execution entirely and reschedule. This is useful in tasks
 that involve multiple steps (e.g., loops or async workflows), enabling
 resumption from the last yielded position."
-  `(throw 'concur-yield t))
+  `(throw 'concur-yield nil))
 
-;;; Semaphore Primitives
+(defun concur--semaphore-name (sem)
+  "Return a human-readable name for SEM based on its data field.
 
-(cl-defstruct (concur-semaphore
-            (:constructor nil) ; disable default constructor
-            (:constructor make-concur-semaphore (&key count queue lock data)))
-  "A semaphore to limit concurrent access to shared resources.
+This function returns a name for the semaphore, either from the `:name` field
+in the semaphore's data or a generated name if no name is provided.
 
-Fields:
-  - count: The number of available slots or resources. When `count` is greater than 0, 
-      tasks can proceed.
-  - queue: A queue of tasks waiting for access to the semaphore. These are tasks that are 
-      blocked because there are no available resources.
-  - lock: A mutex or lock used to protect the semaphore's state and prevent race conditions.
-  - data: Arbitrary user-defined metadata that can be associated with the semaphore. This allows
-      the user to store additional context (opaque data) relevant to the semaphore's usage."
-  count
-  queue
-  lock
-  data)
+Arguments:
+  - sem: The semaphore whose name is being requested.
 
+Returns:
+  - A string representing the semaphore's name."
+  (let ((data (concur-semaphore-data sem)))
+    (or (plist-get data :name)
+        ;; Fallback identifier if no name is provided
+        (symbol-name (gensym "sem")))))  
+        
 ;;;###autoload
 (defun concur-semaphore-create (n)
   "Create a semaphore with N available slots.
@@ -249,7 +260,7 @@ Returns:
   - A semaphore object, represented as a struct with a `:count` field for
     the number of available slots and a `:queue` for tasks waiting to acquire
     the semaphore."
-  (make-concur-semaphore :count n :queue '()))
+  (concur-semaphore-create :count n :queue '()))
 
 ;;;###autoload
 (defun concur-semaphore-acquire (sem task)
@@ -266,7 +277,8 @@ Arguments:
 
 Returns:
   - Nothing, but logs the state of the semaphore."
-  (concur-with-mutex! (concur-semaphore-lock sem)
+  (log! "Semaphore acquire: %s" sem)
+  (with-mutex! (concur-semaphore-lock sem)
     (:else nil)
     ;; Block until there is an available slot in the semaphore
     (concur-block-until
@@ -296,7 +308,7 @@ Arguments:
 
 Returns:
   - t if the semaphore was successfully acquired, nil otherwise."
-  (concur-with-mutex! (concur-semaphore-lock sem)
+  (with-mutex! (concur-semaphore-lock sem)
     (:else nil)
     ;; Attempt non-blocking acquire
     (when (> (concur-semaphore-count sem) 0)
@@ -317,7 +329,7 @@ Arguments:
   - wake-fn: The function to wake up the next task in the queue.
 Returns:
   - Nothing, but logs the state of the semaphore and the task being woken up."
-  (concur-with-mutex! (concur-semaphore-lock sem)
+  (with-mutex! (concur-semaphore-lock sem)
     (:else nil)
     
     ;; Increment the available slots in the semaphore
@@ -366,24 +378,8 @@ Returns:
     :waiting ,(length (concur-semaphore-queue sem))
     :data ,(concur-semaphore-data sem)))
 
-(defun concur--semaphore-name (sem)
-  "Return a human-readable name for SEM based on its data field.
-
-This function returns a name for the semaphore, either from the `:name` field
-in the semaphore's data or a generated name if no name is provided.
-
-Arguments:
-  - sem: The semaphore whose name is being requested.
-
-Returns:
-  - A string representing the semaphore's name."
-  (let ((data (concur-semaphore-data sem)))
-    (or (plist-get data :name)
-        ;; Fallback identifier if no name is provided
-        (symbol-name (gensym "sem")))))  
-
 ;;;;###autoload
-(defmacro concur-with-semaphore! (sem wake-fn &rest body)
+(defmacro with-semaphore! (sem wake-fn &rest body)
   "Run BODY in a cooperative critical section guarded by SEM.
 
 This macro attempts to acquire the semaphore SEM before executing BODY. If
@@ -417,16 +413,21 @@ Returns:
          (unwind-protect
              (progn
                ;; Try non-blocking acquire if :else is present
+               (log! "Attempting to acquire semaphore %s" ,sem :level 'debug)
                (if ,(if else t nil)
                    (setq ,acquired (concur-semaphore-try-acquire ,sem nil))
                  (progn
                    (concur-semaphore-acquire ,sem nil)
                    (setq ,acquired t)))
-
                (if ,acquired
-                   (progn ,@body-forms)
-                 ,@(when else `((progn ,@else)))))
+                   (progn
+                     (log! "Acquired semaphore %s" ,sem :level 'debug)
+                     ,@body-forms)
+                 (progn
+                   (log! "Could not acquire semaphore %s, running :else clause" ,sem :level 'debug)
+                   ,@(when else `((progn ,@else))))))
            (when ,acquired
+             (log! "Releasing semaphore %s" ,sem :level 'debug)
              (concur-semaphore-release ,sem ,wake-fn)))))))
 
 (provide 'concur-primitives)

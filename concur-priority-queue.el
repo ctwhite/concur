@@ -27,7 +27,9 @@
 (require 'dash)
 (require 'scribe)
 
-(cl-defstruct (concur-priority-queue (:constructor make-concur-priority-queue))
+(cl-defstruct (concur-priority-queue
+            (:constructor nil) ; disable default constructor
+            (:constructor concur-priority-queue--create (&key heap comparator len)))
   "A binary heap-based priority queue.
 
 Fields:
@@ -45,14 +47,32 @@ Fields:
 - COMPARATOR is a function of two arguments A and B, returning non-nil if A
   should be ordered before B. Defaults to `<`.
 - INITIAL-CAPACITY is the initial size of the heap vector. Defaults to 32."
-  (make-concur-priority-queue
+  (concur-priority-queue--create
    :heap (make-vector (or initial-capacity 32) nil)
    :comparator (or comparator #'<)
    :len 0))
 
 ;;;###autoload
+(defsubst concur-priority-queue-length (queue)
+  "Return non-nil if the priority QUEUE is empty."
+  (concur-priority-queue-len queue))
+
+;;;###autoload
+(defsubst concur-priority-queue-empty? (queue)
+  "Return non-nil if the priority QUEUE is empty."
+  (= 0 (concur-priority-queue-len queue)))
+
+;;;###autoload
+(defun concur-priority-queue-clear (queue)
+  "Clear all tasks from the priority QUEUE."
+  (setf (concur-priority-queue-heap queue) 
+    (make-vector (concur-priority-queue-initial-capacity queue) nil))
+  (setf (concur-priority-queue-len queue) 0))
+  
+;;;###autoload
 (defun concur-priority-queue-insert (queue item)
   "Insert ITEM into the priority QUEUE."
+  (log! "Inserting item into priority queue")
   (let* ((old-heap (concur-priority-queue-heap queue))
          (len (concur-priority-queue-len queue))
          (heap (if (>= len (length old-heap))
@@ -71,7 +91,7 @@ Fields:
 ;;;###autoload
 (defun concur-priority-queue-pop (queue)
   "Pop the highest-priority item from QUEUE."
-  (log! "concur-priority-queue-pop")
+  (log! "Popping item from priority queue")
   (let* ((heap (concur-priority-queue-heap queue))
          (len (concur-priority-queue-len queue)))
     (if (zerop len)
@@ -91,6 +111,23 @@ Fields:
            (concur-priority-queue-comparator queue))
         ;; Return previous root
         top))))
+
+;;;###autoload
+(defun concur-priority-queue-pop-n (queue n)
+  "Remove the N least-priority tasks from the priority QUEUE."
+  (let* ((heap (concur-priority-queue-heap queue))
+         (len (concur-priority-queue-len queue))
+         (num-to-remove (min n len)))
+    (when (> num-to-remove 0)
+      ;; Efficiently pop the N least-priority items by adjusting the heap.
+      (dotimes (_ num-to-remove)
+        (let* ((last-item (aref heap (1- len))))
+          ;; Move the last item to the top
+          (aset heap 0 last-item)
+          (aset heap (1- len) nil)
+          (setf (concur-priority-queue-len queue) (1- len))
+          ;; Re-heapify down after moving the last item to the top
+          (concur-priority-queue--heapify-down heap 0 (concur-priority-queue-comparator queue)))))))
 
 ;;;###autoload
 (defun concur-priority-queue-remove (queue item)
@@ -118,6 +155,23 @@ Fields:
           (concur-priority-queue--heapify-down heap index comparator)))))))
 
 ;;;###autoload
+(defun concur-priority-queue-remove-n (queue n)
+  "Remove the N least-priority items from the priority QUEUE."
+  (let* ((heap (concur-priority-queue-heap queue))
+         (len (concur-priority-queue-len queue))
+         (num-to-remove (min n len)))
+    (when (> num-to-remove 0)
+      ;; Directly remove the N least-priority items towards the bottom of the heap.
+      (dotimes (_ num-to-remove)
+        (let* ((idx (- len 1))  ;; Index of the least-priority item
+               (item (aref heap idx)))
+          ;; Swap the item with the last item in the heap and nullify the last position
+          (aset heap idx nil)
+          (setf (concur-priority-queue-len queue) (1- len))
+          ;; Restore the heap property by heapifying down the swapped item
+          (concur-priority-queue--heapify-down heap idx (concur-priority-queue-comparator queue)))))))
+
+;;;###autoload
 (defun concur-priority-queue-update (queue item new-priority)
   "Update the priority of ITEM in the priority QUEUE to NEW-PRIORITY."
   (let* ((heap (concur-priority-queue-heap queue))
@@ -138,44 +192,10 @@ Fields:
          )))))
 
 ;;;###autoload
-(defun concur-priority-queue-pop-n (queue n)
-  "Remove the N least-priority tasks from the priority QUEUE."
-  (let* ((heap (concur-priority-queue-heap queue))
-         (len (concur-priority-queue-len queue))
-         (num-to-remove (min n len)))
-    (when (> num-to-remove 0)
-      ;; Efficiently pop the N least-priority items by adjusting the heap.
-      (dotimes (_ num-to-remove)
-        (let* ((last-item (aref heap (1- len))))
-          ;; Move the last item to the top
-          (aset heap 0 last-item)
-          (aset heap (1- len) nil)
-          (setf (concur-priority-queue-len queue) (1- len))
-          ;; Re-heapify down after moving the last item to the top
-          (concur-priority-queue--heapify-down heap 0 (concur-priority-queue-comparator queue)))))))
-
-;;;###autoload
-(defun concur-priority-queue-remove-n (queue n)
-  "Remove the N least-priority items from the priority QUEUE."
-  (let* ((heap (concur-priority-queue-heap queue))
-         (len (concur-priority-queue-len queue))
-         (num-to-remove (min n len)))
-    (when (> num-to-remove 0)
-      ;; Directly remove the N least-priority items towards the bottom of the heap.
-      (dotimes (_ num-to-remove)
-        (let* ((idx (- len 1))  ;; Index of the least-priority item
-               (item (aref heap idx)))
-          ;; Swap the item with the last item in the heap and nullify the last position
-          (aset heap idx nil)
-          (setf (concur-priority-queue-len queue) (1- len))
-          ;; Restore the heap property by heapifying down the swapped item
-          (concur-priority-queue--heapify-down heap idx (concur-priority-queue-comparator queue)))))))
-
-;;;###autoload
-(defun concur-priority-queue-clear (queue)
-  "Clear all tasks from the priority QUEUE."
-  (setf (concur-priority-queue-heap queue) (make-vector 32 nil))
-  (setf (concur-priority-queue-len queue) 0))
+(defun concur-priority-queue-peek (queue)
+  "Return the highest-priority item from QUEUE without removing it."
+  (unless (concur-priority-queue-empty? queue)
+    (aref (concur-priority-queue-heap queue) 0)))
 
 ;;;###autoload
 (defun concur-priority-queue-peek-n (queue n)
@@ -199,23 +219,6 @@ Fields:
          (len (concur-priority-queue-len queue)))
     (--each heap (funcall func it))))
 
-;;;###autoload
-(defsubst concur-priority-queue-length (queue)
-  "Return non-nil if the priority QUEUE is empty."
-  (concur-priority-queue-len queue))
-
-;;;###autoload
-(defsubst concur-priority-queue-empty? (queue)
-  "Return non-nil if the priority QUEUE is empty."
-  (= 0 (concur-priority-queue-len queue)))
-
-;;;###autoload
-(defun concur-priority-queue-peek (queue)
-  "Return the highest-priority item from QUEUE without removing it."
-  (unless (concur-priority-queue-empty? queue)
-    (aref (concur-priority-queue-heap queue) 0)))
-
-;;;###autoload
 (defun concur-priority-queue--heapify-up (heap idx comparator)
   "Move the element at IDX up in HEAP using COMPARATOR."
   (catch 'done
@@ -230,7 +233,6 @@ Fields:
           ;; Throw 'done to exit the loop when heap property is satisfied
           (throw 'done nil))))))
 
-;;;###autoload
 (defun concur-priority-queue--heapify-down (heap idx len comparator)
   "Move the element at IDX down in HEAP using COMPARATOR. LEN is active heap size."
   (log! "concur-priority-queue--heapify-down")

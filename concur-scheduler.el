@@ -12,10 +12,10 @@
 ;;
 ;; The following structures and variables are defined:
 ;;
-;; - `concur--task-queue`: A priority queue that holds pending tasks, ensuring that tasks 
+;; - `concur-scheduler--task-queue`: A priority queue that holds pending tasks, ensuring that tasks 
 ;;   are executed according to their priority.
 ;; 
-;; - `concur--task-queue-size`: A configurable maximum size for the task queue.
+;; - `concur-scheduler-max-queue-length`: A configurable maximum size for the task queue.
 ;;
 ;; Functions in this file include:
 ;; - `concur-scheduler-enqueue-task`: Adds a task to the scheduler queue, ensuring the queue 
@@ -38,9 +38,10 @@
 (require 'concur-primitives)
 (require 'concur-promise)
 (require 'concur-priority-queue)
-(require 'concur-task)
 (require 'ht)
 (require 'scribe)
+
+(declare-function concur-task-priority "concur-task")
 
 (defcustom concur-scheduler-max-queue-length 100
   "Maximum number of tasks allowed in the scheduler queue."
@@ -55,18 +56,15 @@
 (defvar concur-scheduler-error-hook nil
   "Hook run if a task throws during async scheduler execution.")
 
-(defvar concur--task-queue
+(defvar concur-scheduler--task-queue
   (concur-priority-queue-create :comparator #'concur-scheduler--priority-comparator)
   "Priority queue of pending `concur-task` objects for the async scheduler.")
 
-(defvar concur--scheduler-running nil
+(defvar concur-scheduler--running nil
   "Non-nil when executing within the concur scheduler.")
 
-(defvar concur--scheduler-idle-timer nil
+(defvar concur-scheduler--idle-timer nil
   "Idle timer that processes the async task queue.")
-
-(defvar concur--active-threads (ht)
-  "Hash table tracking active threads keyed by thread object.")
 
 (defun concur-scheduler--priority-comparator (task-a task-b)
   "Compare the priorities of TASK-A and TASK-B, which are `concur-task` objects."
@@ -99,10 +97,10 @@ when the Emacs event loop is idle.
 
 Side Effects:
 - Starts an idle timer to periodically run the promise scheduler.
-- Logs the action using `log!`."
- (unless (and concur--scheduler-idle-timer
-               (memq concur--scheduler-idle-timer timer-idle-list))
-    (setq concur--scheduler-idle-timer
+- Logs the action using `log!`." 
+ (unless (and concur-scheduler--idle-timer
+               (memq concur-scheduler--idle-timer timer-idle-list))
+    (setq concur-scheduler--idle-timer
           (run-with-idle-timer (or concur-scheduler-idle-delay (concur-scheduler-computed-delay)) t
                                #'concur-scheduler-run))
     (log! "Started promise scheduler")))
@@ -117,9 +115,9 @@ executing scheduled tasks.
 Side Effects:
 - Cancels the idle timer used to run the promise scheduler.
 - Logs the action using `log!`."
-  (when (timerp concur--scheduler-idle-timer)
-    (cancel-timer concur--scheduler-idle-timer)
-    (setq concur--scheduler-idle-timer nil)
+  (when (timerp concur-scheduler--idle-timer)
+    (cancel-timer concur-scheduler--idle-timer)
+    (setq concur-scheduler--idle-timer nil)
     (log! "Stopped promise scheduler")))
 
 (defun concur-scheduler-run ()
@@ -141,7 +139,7 @@ Error handling is done with `condition-case`, and any errors that occur during t
 execution are passed to `concur-promise-reject` and logged using `log!`.
 
 This function interacts with:
-  - `concur--task-queue`: A ring buffer that holds the tasks waiting to be executed.
+  - `concur-scheduler--task-queue`: A ring buffer that holds the tasks waiting to be executed.
   - `concur-task-future`: Accesses the future object associated with the task.
   - `concur-future-promise`: Resolves the promise once the task has finished executing.
   - `concur-task-schedule`: Fetches the task's scheduling preference.
@@ -154,155 +152,97 @@ Example of scheduling behavior:
 
 Note:
   - If the queue is empty, the scheduler will stop.
-  - Errors are handled gracefully and logged for debugging."
-  (log! "Running promise scheduler")
-  (if (null concur--scheduler-running)
-    (let ((concur--scheduler-running t))
+  - Errors are handled gracefully and logged for debugging."  
+  (if (null concur-scheduler--running)
+    (let ((concur-scheduler--running t))
       (unwind-protect
           (log! "Checking for tasks to run")
-          (if (concur-priority-queue-empty? concur--task-queue)
+          (if (concur-priority-queue-empty? concur-scheduler--task-queue)
               (concur-scheduler-stop)
             (progn
               (log! "Running next task")
-              (let ((task (concur-priority-queue-pop concur--task-queue)))
+              (let ((task (concur-priority-queue-pop concur-scheduler--task-queue)))
                 (concur--run-task task))))
-        (setq concur--scheduler-running nil)))
+        (setq concur-scheduler--running nil)))
     (log! "Promise scheduler already running")))
 
 (defun concur--run-task (task)
-  "Run TASK according to its schedule strategy with error handling."
-  (log! "Running task: %s" (or (concur-task-name task) "<unnamed>"))
-  (let* ((future (concur-task-future task))
-         (promise (concur-future-promise future))
-         (fn (concur-future-thunk future))
-         (schedule (concur-task-schedule task)))
-    (pcase schedule
-      ;; Deferred/immediate (run-at-time 0)
-      ((or 'deferred t)
-       (run-at-time 0 nil
-                    (lambda ()
-                      (condition-case err
-                          (concur-promise-resolve promise (funcall fn))
-                        (error
-                         (concur-promise-reject promise err)
-                         (run-hook-with-args 'concur-scheduler-error-hook err)
-                         (log! "Task error: %S" err :level 'error))))))
+  "Run TASK according to its schedule strategy with error handling and tracing support."
+  (unless (eq (concur-task-status task) 'success)
+    (let* ((name (or (concur-task-name task) "<unnamed>"))
+           (future (concur-task-future task))
+           (thunk (concur-future-thunk future))
+           (schedule (concur-task-schedule task)))
 
-      ;; Run now in current context
-      ('nil
-       (condition-case err
-           (concur-promise-resolve promise (funcall fn))
-         (error
-          (concur-promise-reject promise err)
-          (run-hook-with-args 'concur-scheduler-error-hook err)
-          (log! "Task error: %S" err :level 'error))))
-      
-      ;; Async execution
-      ('async
-       (async-start
-        fn
-        (lambda (result)
-          (concur-promise-resolve promise result))))
+      (log! "[%s] Starting task execution (schedule: %s)" name schedule :level 'info)
 
-      ;; Threaded execution
-      ('thread
-       (run-at-time 0 nil
-                    (lambda ()
-                      (concur-scheduler-create-thread task))))
-      
-      ;; Unknown schedule
-      (_
-       (concur-promise-reject promise (error "Unknown schedule type: %S" schedule))))))
+      ;; Wrap the thunk in error-handling and tracing logic
+      (let ((wrapped-fn
+             (lambda ()
+               (condition-case err
+                   (progn
+                     (log! "[%s] Invoking task thunk..." name :level 'debug)
+                     (funcall thunk))
+                 (error
+                  (run-hook-with-args 'concur-scheduler-error-hook err)
+                  (log! "[%s] Task error: %S" name err :level 'error :trace)
+                  (signal 'concur-task-error (list err)))))))
 
-(defun concur-scheduler-create-thread (task)
-  "Create a thread to run the function in TASK, and track it using `concur--active-threads`.
+        ;; Run the thunk via `concur-async!`, which handles scheduling strategy
+        (let ((promise (concur-async! wrapped-fn schedule)))
+          (setf (concur-future-promise future) promise)
+          (log! "[%s] Task dispatched (promise: %s)" name promise :level 'debug :trace))))))
 
-If the task has a cancel token and it is inactive, skip running the thread.
-
-Handles task completion, error handling, and scheduling control asynchronously."
-  (let* ((future (concur-task-future task))
-         (cancel-token (concur-task-cancel-token task)))
-    (if (and cancel-token (not (concur-cancel-token-active? cancel-token)))
-        (progn
-          ;; If the cancel token is inactive, skip task execution
-          (log! "Task %s not started: token %s canceled"
-                (or (concur-task-name task) "<unnamed>")
-                (concur-cancel-token-name cancel-token)))
-      (let ((thread
-             (make-thread
-              (lambda ()
-                (condition-case err
-                    (progn
-                      ;; Force the future to resolve (either success or failure)
-                      (concur-future-force future)
-                      ;; Schedule task completion using `run-at-time`
-                      (run-at-time 0 nil
-                                   (lambda ()
-                                     (ht-remove! concur--active-threads thread)
-                                     (log! "Task %s completed successfully."
-                                           (or (concur-task-name task) "<unnamed>"))))
-                  (error
-                   ;; Handle error and schedule error resolution with `run-at-time`
-                   (run-at-time 0 nil
-                                (lambda ()
-                                  (ht-remove! concur--active-threads thread)
-                                  (log! "Task %s failed with error: %s"
-                                        (or (concur-task-name task) "<unnamed>")
-                                        err :level 'error)))))))))
-        ;; Track the thread in the scheduler
-        (ht-set! concur--active-threads thread task)
-
-        ;; Register token cancellation observer for task cleanup
-        (when cancel-token
-          (concur-cancel-token-on-cancel
-           cancel-token
-           (lambda ()
-             (when (ht-contains? concur--active-threads thread)
-               (ht-remove! concur--active-threads thread)
-               (log! "Task %s canceled and thread deregistered (token %s)"
-                     (or (concur-task-name task) "<unnamed>")
-                     (concur-cancel-token-name cancel-token))))))
-
-        ;; Optionally log or take actions related to the thread creation
-        (log! "Thread created for task %s."
-              (or (concur-task-name task) "<unnamed>"))
-
-        thread)))))
-
+;;;###autoload
 (defun concur-scheduler-enqueue-task (task)
   "Queue TASK into the asynchronous scheduler. If the queue is full, the lowest-priority 
-  task will be removed.
+task will be removed.
 
 TASK must be a `concur-task' object. This adds it to the task queue, registers
-any cancel token, and ensures the scheduler is running."
+any cancel token, and ensures the scheduler is running."  
   (cl-assert (concur-task-p task))
+  (log! "Enqueuing task: %s" task)
 
-  ;; Check if the queue is full, and remove the lowest-priority task if necessary
-  (when (>= (concur-scheduler-pending-count) concur-scheduler-max-queue-length)
-    (concur-priority-queue-remove-n concur--task-queue 1))
+  ;; Log current queue size before insertion
+  (let ((pending (concur-scheduler-pending-count)))
+    (log! "Current pending tasks: %d (max allowed: %d)"
+          pending concur-scheduler-max-queue-length)
+    ;; Check if the queue is full, and remove the lowest-priority task if necessary
+    (when (>= pending concur-scheduler-max-queue-length)
+      (log! "Queue full; removing lowest-priority task before enqueue")
+      (concur-priority-queue-remove-n concur-scheduler--task-queue 1)
+      (log! "Lowest-priority task removed")))
 
   ;; Insert the task into the priority queue
-  (concur-priority-queue-insert concur--task-queue task)
+  (concur-priority-queue-insert concur-scheduler--task-queue task)
+  (log! "Task inserted; new pending count: %d" (concur-scheduler-pending-count))
 
   ;; Register cancel token if present
   (when-let ((token (concur-task-cancel-token task)))
+    (log! "Registering cancel token: %s for task: %s" token task)
     (concur-cancel-register-token token task
                                  (lambda () 
+                                   (log! "Cancel token triggered, removing task: %s" task)
                                    ;; Callback to remove the task from the queue when the token is canceled
                                    (concur-scheduler-remove-task task))))
 
   ;; Boost throughput under load
   (when (> (concur-scheduler-pending-count) 10)
+    (log! "Pending tasks > 10, restarting scheduler to boost throughput")
     (concur-scheduler-stop)
-    (concur-scheduler-start))
+    (concur-scheduler-start)
+    (log! "Scheduler restarted"))
 
   ;; Ensure scheduler is running
-  (concur-scheduler-start))
+  (concur-scheduler-start)
+  (log! "Scheduler started (or ensured running)"))
 
+;;;###autoload
 (defsubst concur-scheduler-clear-queue ()
   "Clear all pending asynchronous tasks in the task queue."
-  (concur-priority-queue-clear concur--task-queue))
+  (concur-priority-queue-clear concur-scheduler--task-queue))
 
+;;;###autoload
 (defsubst concur-scheduler-pending-count ()
   "Return the number of pending tasks in the task queue.
 
@@ -311,37 +251,30 @@ the number of tasks that are currently queued for execution.
 
 Return Value:
 - The number of pending tasks in the task queue as an integer."
-  (concur-priority-queue-length concur--task-queue))
+  (concur-priority-queue-length concur-scheduler--task-queue))
 
-(defun concur-scheduler-status ()
-  "Return an alist describing the scheduler state."
-  (let* ((pending (concur-scheduler-pending-count))
-         (capacity concur-scheduler-max-queue-length))
-    `((running . ,(timerp concur--scheduler-idle-timer))
-      (pending . ,pending)
-      (capacity . ,capacity)
-      (saturation . ,(if (zerop capacity) 0 (/ (float pending) capacity)))
-      (delay . ,(concur-scheduler--delay-for-size pending))
-      (idle . ,(zerop pending)))))
-
+;;;###autoload
 (defun concur-scheduler-remove-task (task)
   "Remove TASK from the scheduler priority queue."
   ;; Remove the task from the priority queue
-  (concur-priority-queue-remove concur--task-queue task)
+  (concur-priority-queue-remove concur-scheduler--task-queue task)
 
   ;; Optionally restart the scheduler if needed
   (when (> (concur-scheduler-pending-count) 10)
     (concur-scheduler-stop)
     (concur-scheduler-start)))
 
-(defun concur-list-active-threads ()
-  "Log all active concur threads and associated tasks."
-  (ht-map (lambda (thread task)
-            (message "Thread: %s — Task: %s (created %s)"
-                     thread
-                     (or (concur-task-name task) "<unnamed>")
-                     (concur-task-created-at task)))
-          concur--active-threads))
+;;;###autoload
+(defun concur-scheduler-status ()
+  "Return an alist describing the scheduler state."
+  (let* ((pending (concur-scheduler-pending-count))
+         (capacity concur-scheduler-max-queue-length))
+    `((running . ,(timerp concur-scheduler--idle-timer))
+      (pending . ,pending)
+      (capacity . ,capacity)
+      (saturation . ,(if (zerop capacity) 0 (/ (float pending) capacity)))
+      (delay . ,(concur-scheduler--delay-for-size pending))
+      (idle . ,(zerop pending)))))
 
 (provide 'concur-scheduler)
 ;;; concur-scheduler.el ends here
