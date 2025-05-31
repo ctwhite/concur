@@ -26,16 +26,10 @@
 
 (require 'concur-async)
 (require 'concur-cancel)
-(require 'concur-coroutine)
-(require 'concur-fsm)
+(require 'concur-exec)
 (require 'concur-future)
-(require 'concur-generator)
-(require 'concur-lazy)
 (require 'concur-primitives)
-(require 'concur-proc)
 (require 'concur-promise)
-(require 'concur-scheduler)
-(require 'concur-task)
 
 (provide 'concur)
 ;;; concur.el ends here
