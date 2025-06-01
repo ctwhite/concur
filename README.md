@@ -16,7 +16,7 @@ Key modules include:
     * Integration with `concur-cancel.el` for **cancellation support**.
 
 * **`concur-exec.el`** (formerly `concur-proc.el`): For running external OS commands asynchronously.
-  * `concur-exec-process`: A low-level function to start an external process and get a promise that resolves with detailed results (stdout, stderr, exit code).
+  * `concur:process`: A low-level function to start an external process and get a promise that resolves with detailed results (stdout, stderr, exit code).
   * `concur:command`: A higher-level convenience function that takes a command string (or list), handles argument parsing, and returns a promise typically resolving with the command's stdout.
   * `concur:define-command!`: A macro to easily define new, reusable interactive or non-interactive Emacs commands that execute external programs asynchronously.
   * `concur-pipe!`: A macro to chain multiple asynchronous commands, piping the stdout of one to the stdin of the next, similar to shell pipes.
@@ -203,5 +203,5 @@ These macros are the primary way to build readable asynchronous workflows. They 
 Please refer to the docstrings and commentaries within the individual files for detailed API documentation:
 
 * `concur-promise.el`: For core promise functions and the `concur:chain`/`concur:chain-when` macros.
-* `concur-exec.el`: For `concur-exec-process`, `concur:command`, `concur:define-command!`, and `concur-pipe!`.
+* `concur-exec.el`: For `concur:process`, `concur:command`, `concur:define-command!`, and `concur-pipe!`.
 * `concur-cancel.el`: For cancellation token functionality.
