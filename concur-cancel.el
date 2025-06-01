@@ -1,13 +1,5 @@
 ;;; concur-cancel.el --- Concurrency primitives for cancellation -*- lexical-binding: t; -*-
 ;;
-;; Author: Christian White <christiantwhite@protonmail.com>
-;; Maintainer: Christian White <christiantwhite@protonmail.com>
-;; Created: June 1, 2025
-;; Version: 0.3.2
-;; Package-Requires: ((emacs "27.1") (cl-lib "0.5") (ht "2.3") (scribe "0.3"))
-;; Homepage: https://github.com/ctwhite/concur.el
-;; Keywords: concurrency, async, cancel, token
-;;
 ;;; Commentary:
 ;;
 ;; This library defines concurrency primitives for handling the cancellation

@@ -52,5 +52,4 @@
 (require 'concur-async)
 
 (provide 'concur)
-
 ;;; concur.el ends here

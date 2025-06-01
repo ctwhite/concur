@@ -1,13 +1,5 @@
 ;;; concur-primitives.el --- Concurrency Primitives for Emacs Lisp -*- lexical-binding: t; -*-
 ;;
-;; Author: Christian White <christiantwhite@protonmail.com>
-;; Maintainer: Christian White <christiantwhite@protonmail.com>
-;; Created: June 1, 2025
-;; Version: 0.3.3
-;; Package-Requires: ((emacs "27.1") (cl-lib "0.5") (gv "0.1") (subr-x "1.4") (scribe "0.3"))
-;; Homepage: https://github.com/ctwhite/concur.el
-;; Keywords: concurrency, async, primitives, lock, mutex, semaphore, once
-;;
 ;;; Commentary:
 ;;
 ;; This library provides basic concurrency primitives for Emacs Lisp,
