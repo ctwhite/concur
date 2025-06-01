@@ -64,6 +64,11 @@ LEVEL should be a keyword like :info, :debug, :error.
 FORMAT-STRING and ARGS are as for `format`."
     (apply #'message (concat "CONCUR-PROMISE-LOG [" (if (keywordp level) (symbol-name level) (format "%S" level)) "]: " format-string) args)))
 
+;; Forward declarations to satisfy the byte-compiler.
+(declare-function macro-function "macro" (&rest args))
+(declare-function reject "concur-promise" (&rest args))
+(declare-function resolve "concur-promise" (&rest args))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;                           Constants and Customization                      ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
