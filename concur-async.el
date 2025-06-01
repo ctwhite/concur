@@ -236,10 +236,10 @@ Returns the created thread object or nil if not started."
     (cl-return-from concur-async--thread-run-future nil))
 
   (log! :info "[%s] Spawning thread for future %S" label future)
-  (if (and cancel-token (not (concur-cancel-token-active? cancel-token)))
+  (if (and cancel-token (not (concur:cancel-token-active? cancel-token)))
       (progn
         (log! :warn "[%s] Not started: token %S already canceled"
-               label (concur-cancel-token--get-name cancel-token))
+               label (concur--cancel-token-get-name cancel-token))
         (concur-async--run-hooks :cancelled label future)
         nil)
     (let* ((thread
@@ -270,13 +270,13 @@ Returns the created thread object or nil if not started."
       (setq entry `(:thread ,thread :future ,future :label ,label :cancel-token ,cancel-token))
       (ht-set! concur-async--active-threads thread entry)
       (when cancel-token
-        (concur-cancel-token-on-cancel
+        (concur:cancel-token-on-cancel
          cancel-token
          (lambda ()
            (when (ht-contains? concur-async--active-threads thread)
              (ht-remove! concur-async--active-threads thread)
              (log! :warn "[%s] Cancelled by token %S. Killing thread."
-                    label (concur-cancel-token--get-name cancel-token))
+                    label (concur--cancel-token-get-name cancel-token))
              (kill-thread thread)
              (concur-async--run-hooks :cancelled label future)))))
       (log! :info "[%s] Thread started." label)

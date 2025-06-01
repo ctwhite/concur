@@ -1,15 +1,5 @@
 ;;; concur-exec.el --- Asynchronous Process Execution with Promises -*- lexical-binding: t; -*-
 ;;
-;; Copyright (C) 2023-2024 Your Name or Copyright Holder
-;;
-;; Author: Your Name <your.email@example.com>
-;; Maintainer: Your Name <your.email@example.com>
-;; Created: Date of creation
-;; Version: 0.2.3
-;; Package-Requires: ((emacs "27.1") (cl-lib "0.5") (s "1.12.0") (dash "2.19.1") (concur-promise "0.1.0") (ansi-color "0.1"))
-;; Homepage: https://github.com/your/repository
-;; Keywords: processes, async, promises, concurrency
-;;
 ;;; Commentary:
 ;;
 ;; This library provides functions and macros to run external commands
@@ -197,7 +187,7 @@ This function is the low-level interface for process execution."
                         (funcall resolve result)))))))
 
              (when cancel-token
-               (concur-cancel-token-on-cancel
+               (concur:cancel-token-on-cancel
                 cancel-token
                 (lambda ()
                   (when (process-live-p process)

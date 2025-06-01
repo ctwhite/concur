@@ -82,7 +82,7 @@
 
 (require 'cl-lib)
 (require 'dash)
-(require 'concur-primitives) ; For `once-do!`
+(require 'concur-primitives) ; For `concur:once-do!`
 (require 'concur-promise)    ; For `concur-promise` and related functions
 (require 'ht)                ; For hash table operations
 (require 'scribe nil t)      ; For logging (`log!`)
@@ -169,7 +169,7 @@ Parameters:
   FUTURE: A `concur-future` object.
 "
   (declare (indent 1))
-  `(once-do! (concur-future-evaluated? ,future)
+  `(concur:once-do! (concur-future-evaluated? ,future)
      (:else
       (log! :debug "concur:future-once!: Future %S already evaluated." ,future))
      (log! :debug "concur:future-once!: Evaluating thunk for future: %S" ,future)

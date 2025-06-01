@@ -8,6 +8,12 @@
 ;; concurrent tasks. This library is a foundational component for building
 ;; more complex asynchronous systems in Emacs.
 ;;
+;; Logging:
+;; This library will use the `log!` function from the `scribe` library if it is
+;; available (i.e., if `(require 'scribe)` succeeds and `scribe` defines `log!`).
+;; If `scribe` or its `log!` function is not found, a placeholder `log!` function
+;; using `message` will be defined and used for basic logging.
+;;
 ;; Core Promise Lifecycle:
 ;; - Promises start in a "pending" state.
 ;; - They can be "resolved" with a success value or "rejected" with an error.
@@ -24,33 +30,39 @@
 ;; - Advanced Control Flow & Utilities:
 ;;   - `concur:chain`: A powerful threading macro for building complex promise
 ;;     chains. Supports canonical clauses like `:then`, `:catch`, `:let`, `:if`,
-;;     `:tap`, `:all`, `:race`, `:assert`, and syntactic sugar (see `concur--expand-sugar`
-;;     for keywords like `:map`, `:filter`, `:each`, `:reduce`, `:sleep`, `:log`, `:retry`).
+;;     `:when`, `:guard`, `:assert`, `:tap`, `:all`, `:race`, and syntactic sugar
+;;     keywords like `:map`, `:filter`, `:each`, `:reduce`, `:sleep`, `:log`, `:retry`.
+;;     (See `concur--expand-sugar` for details).
 ;;   - `concur:chain-when`: Similar to `concur:chain`, but short-circuits the
 ;;     processing chain if a step resolves to `nil`.
 ;;   - `concur:map-series`, `concur:map-parallel`, `concur:retry`.
 ;;   - `concur:defer`, `concur:delay`, `concur:timeout`.
 ;; - Cancellation: Integration with `concur-cancel-token`.
-;; - Introspection: Status checking functions like `concur:status`.
+;; - Introspection: Status checking functions like `concur:status`,
+;;   `concur:rejected?`, `concur:value`, `concur:error-value`,
+;;   `concur:error-message`.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'concur-cancel)
-(require 'dash)
-(require 'ht)
-;; (require 'scribe nil t) ; Scribe temporarily disabled for error path diagnostics
-(require 'ts)
-(require 's)
-(require 'subr-x)
+(require 'concur-cancel) ; For `concur-cancel-token` integration
+(require 'dash)          ; For list manipulation (`--each`, `-map`, etc.)
+(require 'ht)            ; For hash table operations (though not directly used in promise struct)
+(require 'ts)            ; For timestamp utilities (`ts-now`, `ts-diff`)
+(require 's)             ; For string formatting (`s-format`)
+(require 'subr-x)        ; For `all-vars` if used by helper functions.
 
-(declare-function 'macro-function "subr" (symbol))
+;; Optionally require scribe. If it's not available, our fallback log! will be used.
+(require 'scribe nil t)
 
-;; Using plain `message` for all logging in this diagnostic version.
-;; For actual use, this should be scribe's log! or a similar structured logger.
-(defun log! (level format-string &rest args)
-  "Diagnostic logging function using `message`."
-  (apply #'message (concat "CONCUR-PROMISE-LOG [" (if (keywordp level) (symbol-name level) (format "%S" level)) "]: " format-string) args))
+;; Define a fallback `log!` function if scribe's `log!` isn't available.
+;; If scribe is loaded and provides `log!`, this definition will be skipped.
+(unless (fboundp 'log!)
+  (defun log! (level format-string &rest args)
+    "Placeholder logging function using `message` if scribe's log! is not available.
+LEVEL should be a keyword like :info, :debug, :error.
+FORMAT-STRING and ARGS are as for `format`."
+    (apply #'message (concat "CONCUR-PROMISE-LOG [" (if (keywordp level) (symbol-name level) (format "%S" level)) "]: " format-string) args)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;                           Constants and Customization                      ;;
@@ -60,7 +72,8 @@
   "Keyword in rejection objects indicating cancellation.")
 
 (defcustom concur-throw-on-promise-rejection t
-  "If non-nil, unhandled rejected promises (not due to cancellation) throw an error."
+  "If non-nil, unhandled rejected promises (not due to cancellation) throw an error.
+This helps in debugging by making unhandled rejections more visible."
   :type 'boolean
   :group 'concur)
 
@@ -69,59 +82,72 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (cl-defstruct (concur-promise-callback-entry
-               (:constructor concur--callback-entry-create (id &key on-resolved on-rejected)))
+               (:constructor concur--callback-entry-create
+                             (id &key on-resolved on-rejected)))
+  "Wrapper for a promise callback with a unique ID for unregistration.
+ID (symbol): A unique symbol generated for this callback instance.
+ON-RESOLVED (function): Called when the promise resolves (receives result).
+ON-REJECTED (function): Called when the promise rejects (receives error)."
   id
   on-resolved
   on-rejected)
 
-(cl-defstruct
-    (concur-promise
-     (:constructor concur--promise-create
-                   (&key result error resolved? callbacks
-                         cancel-token cancelled? proc)))
-  result
-  error
-  resolved?
-  callbacks
-  cancel-token
-  cancelled?
-  proc)
+(cl-defstruct (concur-promise
+               (:constructor concur--promise-create ; Internal constructor
+                             (&key result error resolved? callbacks
+                                   cancel-token cancelled? proc)))
+  "Represents an asynchronous operation that can resolve or reject.
+Use `concur:make-promise` or `concur:with-executor` for creation.
+
+Slots:
+`result` (any): The success value if the promise is resolved.
+`error` (any): The error reason if the promise is rejected.
+`resolved?` (boolean): Non-nil if the promise has settled.
+`callbacks` (list): List of `concur-promise-callback-entry` objects.
+`proc` (process): Associated Emacs process, if any.
+`cancel-token` (concur-cancel-token): Token for cooperative cancellation.
+`cancelled?` (boolean): Non-nil if the promise was explicitly cancelled."
+  result error resolved? callbacks cancel-token cancelled? proc)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;                             Internal Helpers                               ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun concur--run-callbacks (promise)
+  "Invoke registered callbacks on PROMISE after settlement. Clears callbacks.
+Callbacks are run asynchronously via `run-at-time` to avoid deep recursion
+and to allow the current execution context to complete."
   (let ((callbacks (concur-promise-callbacks promise))
         (result (concur-promise-result promise))
         (error (concur-promise-error promise)))
-    (setf (concur-promise-callbacks promise) nil)
+    (setf (concur-promise-callbacks promise) nil) ; Prevent re-running
     (--each callbacks
       (let ((on-resolved-fn (concur-promise-callback-entry-on-resolved it))
             (on-rejected-fn (concur-promise-callback-entry-on-rejected it)))
-        (run-at-time 0 nil
+        (run-at-time 0 nil ; Schedule asynchronously for next event loop iteration
                      (lambda ()
-                       (ignore-errors
+                       (ignore-errors ; Protect individual callback execution
                          (if error
                              (when on-rejected-fn (funcall on-rejected-fn error))
                            (when on-resolved-fn (funcall on-resolved-fn result))))))))))
 
 (defun concur--check-cancel (promise)
-  (let ((cancel-token (concur-promise-cancel-token promise)))
-    (when (and cancel-token
-               (not (concur-cancel-token-active? cancel-token))
-               (not (concur-promise-cancelled? promise))
-               (not (concur-promise-resolved? promise)))
-      (log! :warn "concur--check-cancel: Promise %S is cancelled via token %S."
-            promise cancel-token)
+  "If PROMISE's cancel-token is triggered and promise is pending, cancel it.
+Returns t if cancelled by this check, nil otherwise."
+  (let ((token (concur-promise-cancel-token promise)))
+    (when (and token
+               (not (concur:cancel-token-active? token)) ; Token is cancelled
+               (not (concur-promise-cancelled? promise))      ; Promise not already marked
+               (not (concur-promise-resolved? promise)))      ; Promise is still pending
+      (log! :warn "Promise %S cancelled via token %S." promise token)
       (concur:cancel promise
                      (format "Cancelled via token %s"
-                             (concur-cancel-token-name cancel-token)))
+                             (concur-cancel-token-name token)))
       t)))
 
 (defun concur--has-error? (promise)
-  (and (concur-promise-p promise)
-       (not (null (concur-promise-error promise)))))
+  "Internal: Return non-nil if PROMISE has an error value (was rejected)."
+  (and (concur-promise-p promise) (concur-promise-error promise)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;                             Core Promise API                               ;;
@@ -129,26 +155,45 @@
 
 ;;;###autoload
 (defun concur:make-promise (&rest slots)
+  "Create and return a new unresolved (pending) promise.
+SLOTS is an optional plist of initial values for `concur-promise` struct fields,
+such as :cancel-token or :proc.
+This creates a promise that is typically resolved or rejected externally
+using `concur:resolve` or `concur:reject`.
+For creating a promise with an immediate async operation, see `concur:with-executor`.
+
+Example:
+  (let ((p (concur:make-promise)))
+    (run-at-time 1 nil (lambda () (concur:resolve p \"Hello\")))
+    p)"
   (apply #'concur--promise-create
-         :resolved? nil
-         :cancelled? nil
-         :callbacks nil
-         slots))
+         :resolved? nil :cancelled? nil :callbacks nil slots))
 
 ;;;###autoload
 (defun concur:with-executor (executor-fn &optional cancel-token)
-  "Create a new promise and immediately invoke EXECUTOR-FN `(lambda (resolve reject))`."
+  "Create a new promise and immediately invoke EXECUTOR-FN `(lambda (resolve reject))`.
+EXECUTOR-FN starts the async operation and calls `resolve` or `reject`.
+If EXECUTOR-FN errors synchronously, the promise is rejected.
+CANCEL-TOKEN can be optionally associated with the promise.
+
+Arguments:
+  EXECUTOR-FN (function): A function `(lambda (resolve reject))` to execute.
+  CANCEL-TOKEN (concur-cancel-token, optional): Token for cancellation.
+
+Return:
+  The new `concur-promise`."
+  (unless (functionp executor-fn)
+    (error "Executor must be a function, got %S" executor-fn))
   (let ((promise (concur:make-promise :cancel-token cancel-token)))
     (log! :debug "concur:with-executor: Created promise %S, calling executor." promise)
-    (condition-case err ; This `err` should be bound to the error signaled by executor-fn
+    (condition-case err 
         (funcall executor-fn
                  (lambda (value) (concur:resolve promise value))
                  (lambda (error-reason) (concur:reject promise error-reason)))
-      (error ; This handler is for errors *from* the executor-fn
-       ;; Explicitly bind the error condition to a new variable within the handler's scope
-       (let ((caught-error-condition err))
-         (message "CONCUR:WITH-EXECUTOR: Error in executor. Promise: %S. Caught Condition: %S"
-                  promise caught-error-condition)
+      (error 
+       (let ((caught-error-condition err)) 
+         (log! :error "concur:with-executor: Error in executor for promise %S. Caught: %S"
+               promise caught-error-condition :trace)
          (concur:reject promise
                         (list :error-type 'executor-function-error
                               :message "Error in promise executor function"
@@ -157,6 +202,8 @@
 
 ;;;###autoload
 (defun concur:resolve (promise result)
+  "Resolve PROMISE with RESULT. No-op if already settled/cancelled.
+Invokes registered `on-resolved` callbacks asynchronously."
   (log! :info "concur:resolve: Resolving promise %S with result: %S." promise result)
   (if (or (concur-promise-resolved? promise) (concur-promise-cancelled? promise))
       (log! :warn "concur:resolve: Promise %S already settled/cancelled; skipping." promise)
@@ -168,19 +215,28 @@
 
 ;;;###autoload
 (defun concur:reject (promise error &optional is-cancellation)
-  (message "CONCUR:REJECT: Rejecting promise %S with error: %S (cancel: %S)."
-           promise error is-cancellation)
+  "Reject PROMISE with ERROR. No-op if already settled.
+If IS-CANCELLATION, suppresses `concur-throw-on-promise-rejection`.
+Invokes registered `on-rejected` callbacks asynchronously."
+  (log! :info "concur:reject: Rejecting promise %S with error: %S (cancel: %S)"
+        promise error is-cancellation)
   (unless (concur-promise-resolved? promise)
     (setf (concur-promise-error promise) error
           (concur-promise-resolved? promise) t)
     (when is-cancellation (setf (concur-promise-cancelled? promise) t))
     (concur--run-callbacks promise)
     (when (and (not is-cancellation) concur-throw-on-promise-rejection)
-      (message "CONCUR:REJECT: Promise %S rejected with unhandled error: %S" promise error)
+      (log! :error "[concur] Promise %S rejected with unhandled error: %S" promise error :trace)
       (error "[concur] Promise rejected with error: %S" error))))
 
 ;;;###autoload
 (defun concur:from-callback (fetch-fn)
+  "Wrap a callback-based async FETCH-FN `(lambda (callback))` into a promise.
+FETCH-FN's callback should be `(lambda (result error))`.
+It must call this callback exactly once:
+- On success: `(callback NON-NIL-RESULT nil)`
+- On failure: `(callback nil NON-NIL-ERROR)`
+Returns a promise that resolves or rejects accordingly."
   (log! :debug "concur:from-callback: Wrapping callback function %S." fetch-fn)
   (concur:with-executor
    (lambda (resolve reject)
@@ -190,6 +246,11 @@
 
 ;;;###autoload
 (cl-defun concur:on-resolve (promise &key on-resolved on-rejected)
+  "Register ON-RESOLVED and/or ON-REJECTED callbacks for PROMISE.
+If PROMISE is already settled, the appropriate callback runs asynchronously.
+Otherwise, callbacks are queued.
+Returns a unique ID (symbol) for the registered callback entry, which can be
+used with `concur:unregister-callback`."
   (log! :debug "concur:on-resolve: Registering for %S (res: %S, rej: %S)."
         promise (functionp on-resolved) (functionp on-rejected))
   (concur--check-cancel promise)
@@ -202,8 +263,8 @@
                          (ignore-errors
                            (if-let ((err (concur-promise-error promise)))
                                (when on-rejected (funcall on-rejected err))
-                             (when on-resolved (funcall on-resolved
-                                                        (concur-promise-result promise))))))))
+                             (when on-resolved
+                               (funcall on-resolved (concur-promise-result promise))))))))
       (progn
         (log! :debug "Promise %S pending; queuing cb ID %S." promise callback-id)
         (setf (concur-promise-callbacks promise)
@@ -216,9 +277,11 @@
 
 ;;;###autoload
 (defun concur:unregister-callback (promise callback-id)
+  "Unregister a specific callback entry from PROMISE using its CALLBACK-ID.
+Returns non-nil if the callback was found and removed."
   (log! :debug "concur:unregister-callback: Unregistering ID %S from %S."
         callback-id promise)
-  (unless (concur-promise-resolved? promise)
+  (unless (concur-promise-resolved? promise) ; Callbacks are cleared once resolved
     (let* ((current-cbs (concur-promise-callbacks promise))
            (new-cbs (-remove (lambda (cb) (eq (concur-promise-callback-entry-id cb)
                                               callback-id))
@@ -230,6 +293,7 @@
 
 ;;;###autoload
 (defun concur:resolved! (value)
+  "Return a new promise that is already resolved with VALUE."
   (let ((p (concur:make-promise)))
     (log! :info "concur:resolved!: Created resolved promise %S with %S." p value)
     (setf (concur-promise-result p) value
@@ -238,14 +302,17 @@
 
 ;;;###autoload
 (defun concur:rejected! (err)
+  "Return a new promise that is already rejected with ERR."
   (let ((p (concur:make-promise)))
     (setf (concur-promise-error p) err
           (concur-promise-resolved? p) t)
-    (message "CONCUR:REJECTED!: Created rejected promise %S with %S." p err)
+    (log! :error "concur:rejected!: Created rejected promise %S with %S." p err :trace)
     p))
 
 ;;;###autoload
 (defun concur:cancel (promise &optional reason)
+  "Cancel PROMISE by rejecting it and killing any associated process.
+Marks promise as cancelled. No-op if already settled."
   (if (concur-promise-resolved? promise)
       (log! :warn "concur:cancel: Promise %S already settled; no-op." promise)
     (setf (concur-promise-cancelled? promise) t)
@@ -262,6 +329,8 @@
 
 ;;;###autoload
 (defun concur:await (promise &optional timeout throw-on-error poll-interval)
+  "BLOCKS until PROMISE resolves or TIMEOUT. Use with extreme caution in interactive contexts.
+Returns `(RESULT . ERROR)`. Throws on error if THROW-ON-ERROR is non-nil."
   (log! :info "concur:await: Awaiting %S (timeout: %S, throw: %S)."
         promise timeout throw-on-error)
   (let* ((start (ts-now)) (interval (or poll-interval 0.05))
@@ -276,7 +345,7 @@
         (log! :warn "Timeout (%.2fs) for promise %S." timeout promise)
         (concur:cancel promise '(:timeout "Promise timed out"))))
     (if-let ((err (concur-promise-error promise)))
-        (progn (message "CONCUR:AWAIT: promise %S error: %S." promise err)
+        (progn (log! :error "Await: promise %S error: %S." promise err :trace)
                (when throw-on-error (error "Promise error: %S" err)) (cons nil err))
       (let ((res (concur-promise-result promise)))
         (log! :info "Await: promise %S resolved: %S." promise res) (cons res nil)))))
@@ -287,6 +356,10 @@
 
 ;;;###autoload
 (cl-defun concur:then (promise &rest positional-args &key on-resolved on-rejected)
+  "Return a new promise that chains ON-RESOLVED or ON-REJECTED to PROMISE.
+Positional ARGS can be `(ON-RESOLVED-FN [ON-REJECTED-FN])`.
+Keywords `:on-resolved` and `:on-rejected` can also be used.
+If a handler returns a promise, it's assimilated into the chain."
   (log! :debug "concur:then: Chaining from %S (on-res: %S, on-rej: %S)."
         promise (functionp on-resolved) (functionp on-rejected))
   (let* ((eff-on-res (if (and positional-args (functionp (car positional-args)))
@@ -310,7 +383,7 @@
                                      :on-resolved (lambda (r) (concur:resolve chained r))
                                      :on-rejected (lambda (e) (concur:reject chained e)))
                                   (concur:resolve chained next-val)))
-                            (error (message "CONCUR:THEN:ON-RESOLVED-HANDLER-ERROR: %S. Input res: %S" ex res)
+                            (error (log! :error "concur:then: on-resolved handler failed: %S. Input res: %S" ex res :trace)
                                    (concur:reject chained ex)))
                         (concur:resolve chained res))))
      :on-rejected (lambda (err)
@@ -323,18 +396,25 @@
                                    :on-resolved (lambda (r) (concur:resolve chained r))
                                    :on-rejected (lambda (e) (concur:reject chained e)))
                                 (concur:resolve chained next-val)))
-                          (error (message "CONCUR:THEN:ON-REJECTED-HANDLER-ERROR: %S. Input err: %S" ex err)
+                          (error (log! :error "concur:then: on-rejected handler failed: %S. Input err: %S" ex err :trace)
                                  (concur:reject chained ex)))
                       (concur:reject chained err))))
     chained))
 
 ;;;###autoload
 (defun concur:catch (promise handler)
+  "Attach HANDLER `(lambda (error))` to PROMISE if it's rejected.
+Returns a new promise that resolves with HANDLER’s return value on error,
+or passes through the original resolved value."
   (log! :debug "concur:catch: Attaching catch handler to %S." promise)
   (concur:then promise :on-rejected handler))
 
 ;;;###autoload
 (defun concur:finally (promise callback)
+  "Attach CALLBACK `(lambda ())` to PROMISE to run after it settles.
+The CALLBACK's return value is ignored unless it's a promise that rejects,
+or if CALLBACK itself errors. The returned promise settles with the
+original promise's outcome unless CALLBACK introduces a new rejection."
   (log! :debug "concur:finally: Attaching finally handler to %S." promise)
   (let ((next (concur:make-promise :cancel-token (concur-promise-cancel-token promise))))
     (concur:on-resolve promise
@@ -346,7 +426,7 @@
                                :on-resolved (lambda (_) (concur:resolve next res))
                                :on-rejected (lambda (e) (concur:reject next e)))
                             (concur:resolve next res)))
-                      (error (message "CONCUR:FINALLY:ON-RESOLVED-HANDLER-ERROR: %S" ex)
+                      (error (log! :error "concur:finally: on-resolved handler failed: %S" ex :trace)
                              (concur:reject next ex))))
      :on-rejected (lambda (err)
                     (condition-case ex
@@ -356,12 +436,15 @@
                                :on-resolved (lambda (_) (concur:reject next err))
                                :on-rejected (lambda (e) (concur:reject next e)))
                             (concur:reject next err)))
-                      (error (message "CONCUR:FINALLY:ON-REJECTED-HANDLER-ERROR: %S" ex)
+                      (error (log! :error "concur:finally: on-rejected handler failed: %S" ex :trace)
                              (concur:reject next ex)))))
     next))
 
 ;;;###autoload
 (defun concur:tap (promise callback)
+  "Attach CALLBACK `(lambda (value error))` for side effects. Returns original PROMISE.
+The return value of CALLBACK is ignored. Useful for logging or actions that
+should not alter the promise chain's data flow."
   (log! :debug "concur:tap: Attaching tap callback to %S." promise)
   (concur:on-resolve promise
    :on-resolved (lambda (val) (ignore-errors (funcall callback val nil)))
@@ -374,7 +457,9 @@
 
 ;;;###autoload
 (defun concur:all (promises &rest opts)
-  "Return promise that resolves when all PROMISES are fulfilled, or rejects on first error."
+  "Return promise that resolves when all PROMISES are fulfilled, or rejects on first error.
+PROMISES is a list of promise objects. Resolves with a list of results in order.
+OPTS can include `:cancel-token`."
   (unless (listp promises)
     (error "concur:all: PROMISES must be a list, but got %S" promises))
   (let ((cancel-token (plist-get opts :cancel-token)))
@@ -385,7 +470,7 @@
              (resolved-count 0) (unregister-ids nil) cancel-callback-id)
         (when cancel-token
           (setq cancel-callback-id
-                (concur-cancel-token-on-cancel
+                (concur:cancel-token-on-cancel
                  cancel-token
                  (lambda ()
                    (unless (concur-promise-resolved? done)
@@ -418,18 +503,20 @@
              (lambda (item)
                (concur:unregister-callback (car item) (cdr item))))
            (when (and cancel-token cancel-callback-id)
-             (concur-cancel-token-unregister cancel-token cancel-callback-id))))
+             (concur:cancel-token-unregister cancel-token cancel-callback-id))))
         done))))
 
 ;;;###autoload
 (defun concur:race (promises &optional cancel-token)
-  "Return promise that resolves/rejects with the first PROMISE to settle."
+  "Return promise that resolves/rejects with the first PROMISE to settle.
+Cancels other promises if a winner is found and `cancel-token` (or an internal one)
+is triggered by the win."
   (unless (listp promises)
     (error "concur:race: PROMISES must be a list, but got %S." promises))
   (log! :info "concur:race: Starting race for %d promises." (length promises))
   (let* ((internal-token-p (null cancel-token))
          (effective-cancel-token (or cancel-token
-                                     (concur-cancel-token-create "concur-race-internal")))
+                                     (concur:make-cancel-token "concur-race-internal")))
          (winner-promise (concur:make-promise :cancel-token effective-cancel-token))
          (settled-flag nil) 
          (unregister-ids nil) 
@@ -437,7 +524,7 @@
 
     (when cancel-token 
       (setq main-cancel-callback-id
-            (concur-cancel-token-on-cancel
+            (concur:cancel-token-on-cancel
              cancel-token 
              (lambda ()
                (unless (concur-promise-resolved? winner-promise)
@@ -457,13 +544,13 @@
                                (unless settled-flag
                                  (setq settled-flag t)
                                  (log! :info "race: Promise %S resolved first. Cancelling others." p)
-                                 (concur-cancel-token-cancel effective-cancel-token)
+                                 (concur:cancel-token-cancel effective-cancel-token)
                                  (concur:resolve winner-promise res)))
                 :on-rejected (lambda (err)
                                (unless settled-flag
                                  (setq settled-flag t)
                                  (log! :info "race: Promise %S rejected first. Cancelling others." p)
-                                 (concur-cancel-token-cancel effective-cancel-token)
+                                 (concur:cancel-token-cancel effective-cancel-token)
                                  (concur:reject winner-promise err))))))
           (push (cons p cb-id) unregister-ids))))
 
@@ -473,7 +560,7 @@
        (--each unregister-ids
          (lambda (item) (concur:unregister-callback (car item) (cdr item))))
        (when (and cancel-token main-cancel-callback-id)
-         (concur-cancel-token-unregister cancel-token main-cancel-callback-id))
+         (concur:cancel-token-unregister cancel-token main-cancel-callback-id))
        ))
     winner-promise))
 
@@ -488,7 +575,7 @@ Rejects with AggregateError if all reject."
            (overall (concur:make-promise :cancel-token cancel-token)) (set? nil)
            (ids nil) main-id)
       (when cancel-token
-        (setq main-id (concur-cancel-token-on-cancel
+        (setq main-id (concur:cancel-token-on-cancel
                        cancel-token
                        (lambda () (unless set? (setq set? t)
                                     (concur:cancel overall '(:cancelled "Any cancelled")))))))
@@ -513,7 +600,7 @@ Rejects with AggregateError if all reject."
        (lambda () (log! :debug "any: Overall %S settled. Cleaning." overall)
                 (--each ids (lambda (i) (concur:unregister-callback (car i) (cdr item))))
                 (when (and cancel-token main-id)
-                  (concur-cancel-token-unregister cancel-token main-id))))
+                  (concur:cancel-token-unregister cancel-token main-id))))
       overall)))
 
 ;;;###autoload
@@ -527,7 +614,7 @@ Rejects with AggregateError if all reject."
            (overall (concur:make-promise :cancel-token cancel-token)) (set-c 0)
            (ids nil) main-id)
       (when cancel-token
-        (setq main-id (concur-cancel-token-on-cancel
+        (setq main-id (concur:cancel-token-on-cancel
                        cancel-token
                        (lambda () (unless (concur-promise-resolved? overall)
                                     (concur:cancel overall
@@ -554,7 +641,7 @@ Rejects with AggregateError if all reject."
          (log! :debug "all-settled: Overall %S settled. Cleaning." overall)
          (--each ids (lambda (i) (concur:unregister-callback (car i) (cdr item))))
          (when (and cancel-token main-id)
-           (concur-cancel-token-unregister cancel-token main-id))))
+           (concur:cancel-token-unregister cancel-token main-id))))
       overall)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -592,7 +679,7 @@ Rejects with AggregateError if all reject."
   (concur:with-executor
    (lambda (resolve reject)
      (condition-case ex (resolve (apply fn args))
-       (error (message "CONCUR:WRAP: Wrapped fn %S failed: %S." fn ex)
+       (error (log! :error "concur:wrap: Wrapped fn %S failed: %S." fn ex :trace)
               (reject ex))))))
 
 ;;;###autoload
@@ -646,17 +733,17 @@ Rejects with AggregateError if all reject."
                            (concur:then item-p
                             :on-resolved (lambda (ir) (push ir final-res) ir)
                             :on-rejected (lambda (e)
-                                           (message "CONCUR:MAP-SERIES: Item %S failed: %S" cur-item e)
+                                           (log! :error "map-series: Item %S failed: %S" cur-item e :trace)
                                            (signal 'concur-async-error
                                                    (list "Series item failed" e))))))
           :on-rejected (lambda (e)
-                         (message "CONCUR:MAP-SERIES: Prev failed: %S" e)
+                         (log! :error "map-series: Prev failed: %S" e :trace)
                          (signal 'concur-async-error (list "Series interrupted" e)))))
        res-prom items)
       (concur:then res-prom
        :on-resolved (lambda (_) (nreverse final-res))
        :on-rejected (lambda (e)
-                      (message "CONCUR:MAP-SERIES: Failed: %S" e)
+                      (log! :error "map-series: Failed: %S" e :trace)
                       (signal 'concur-async-error (list "Series failed" e)))))))
 
 ;;;###autoload
@@ -691,7 +778,7 @@ Rejects with AggregateError if all reject."
                                         (progn (log! :warn "retry: Att cancelled.")
                                                (concur:reject final e t))
                                       (if (or (>= att num) (not (funcall p e)))
-                                          (progn (message "CONCUR:RETRY: All retries for %S failed. Final err: %S." fn e)
+                                          (progn (log! :error "retry: All retries for %S failed. Final err: %S" fn e :trace)
                                                  (concur:reject final e))
                                         (let ((cd (if (functionp r-delay)
                                                       (funcall r-delay att) r-delay)))
@@ -700,7 +787,7 @@ Rejects with AggregateError if all reject."
                                           (concur:then (concur:delay cd)
                                            :on-resolved (lambda (_) (do-retry))
                                            :on-rejected (lambda (d-e)
-                                                          (message "CONCUR:RETRY: Delay failed: %S." d-e)
+                                                          (log! :error "retry: Delay failed: %S" d-e :trace)
                                                           (concur:reject final d-e)))))))))))
       (do-retry))
     final))
@@ -746,8 +833,8 @@ Rejects with AggregateError if all reject."
            (push `(:then (lambda (<>)
                            (let ((data <>))
                              (if (listp data)
-                                 (--map (lambda (it) (let ((<> it)) ,arg1)) data) ; Ensure <> is bound to 'it' for map
-                               (let ((<> data)) ,arg1))))) ; Apply to single item
+                                 (--map (lambda (it) (let ((<> it)) ,arg1)) data)
+                               (let ((<> data)) ,arg1)))))
                  processed-steps))
 
           (:filter
@@ -756,7 +843,7 @@ Rejects with AggregateError if all reject."
            (push `(:then (lambda (<>)
                            (let ((data <>))
                              (if (listp data)
-                                 (--filter (lambda (it) (let ((<> it)) ,arg1)) data) ; Ensure <> is bound to 'it' for filter
+                                 (--filter (lambda (it) (let ((<> it)) ,arg1)) data)
                                (if (let ((<> data)) ,arg1) data
                                  (concur:rejected!
                                   (format "Filter predicate %S failed for: %S"
@@ -769,31 +856,28 @@ Rejects with AggregateError if all reject."
            (push `(:tap (lambda (<>)
                           (let ((data <>))
                             (if (listp data)
-                                (--each (lambda (it) (let ((<> it)) ,arg1)) data) ; Ensure <> is bound to 'it' for each
+                                (--each (lambda (it) (let ((<> it)) ,arg1)) data)
                               (let ((<> data)) ,arg1)))))
                  processed-steps))
 
           (:sleep
            (unless remaining-steps (error "concur:chain :sleep needs milliseconds"))
            (setq arg1 (pop remaining-steps))
-           (push `(:then (lambda (<>) ; Explicitly take <>
-                           (let ((original-value <>)) ; Capture it
+           (push `(:then (lambda (<>)
+                           (let ((original-value <>))
                              (concur:then (concur:delay (/ (float ,arg1) 1000.0))
-                                          (lambda (_) original-value))))) ; Return original value
+                                          (lambda (_) original-value)))))
                  processed-steps))
 
           (:log
            (if (or (null remaining-steps) (keywordp (car remaining-steps)))
-               ;; Log current value if no format string
                (push `(:tap (lambda (<>) (log! :info "[concur:chain] value: %S" <>)))
                      processed-steps)
-             ;; Format string and potentially args
              (let ((msg-or-fmt (pop remaining-steps))
                    (log-args nil))
                (while (and remaining-steps (not (keywordp (car remaining-steps))))
                  (push (pop remaining-steps) log-args))
                (setq log-args (nreverse log-args))
-               ;; Ensure <> is appended to the log arguments if there are other arguments
                (if log-args
                    (push `(:tap (lambda (<>)
                                   (apply #'log! :info ,msg-or-fmt (append ,log-args (list <>)))))
@@ -822,14 +906,11 @@ Rejects with AggregateError if all reject."
           (:retry
            (if (or (null remaining-steps) (null (cdr remaining-steps)))
                (error "concur:chain :retry needs N (retries) and BODY-FORM arguments"))
-           (setq arg1 (pop remaining-steps)) ; N retries
-           (setq arg2 (pop remaining-steps)) ; BODY-FORM
-           ;; The BODY-FORM will be wrapped in a lambda that takes the current promise value `<>`
-           ;; and makes it available as `<>` inside the BODY-FORM.
+           (setq arg1 (pop remaining-steps))
+           (setq arg2 (pop remaining-steps))
            (push `(:then (lambda (<>)
                            (concur:retry (lambda () (let ((<> <>)) ,arg2)) :retries ,arg1)))
                  processed-steps))
-
 
           ((or :then :catch :finally :let :if :when :guard :tap :all :race)
            (unless remaining-steps
@@ -847,7 +928,6 @@ Rejects with AggregateError if all reject."
           (_direct-form
            (push key processed-steps)))))
     (nreverse processed-steps)))
-
 
 (defun concur--expand-chain (current-promise-form steps-to-process)
   "Recursive helper to expand `concur:chain` steps into a promise chain."
@@ -1014,9 +1094,6 @@ See `concur--expand-sugar` for details on sugar expansion."
   (concur--expand-chain initial-promise-expr (concur--expand-sugar steps)))
 
 ;;;###autoload
-(defalias 'concur-> #'concur:chain "Obsolete. Use `concur:chain` instead.")
-
-;;;###autoload
 (cl-defmacro concur:chain-when (initial-promise-expr &rest steps)
   "Like `concur:chain` but short-circuits on nil resolved values.
 INITIAL-PROMISE-EXPR must be a form that evaluates to a promise.
@@ -1026,9 +1103,6 @@ Supports the same clauses and sugar keywords as `concur:chain`."
   (unless initial-promise-expr
     (error "concur:chain-when: Must provide at least an initial promise-producing form."))
   (concur--expand-short-circuit-chain initial-promise-expr (concur--expand-sugar steps)))
-
-;;;###autoload
-(defalias 'concur-?> #'concur:chain-when "Obsolete. Use `concur:chain-when` instead.")
 
 (provide 'concur-promise)
 ;;; concur-promise.el ends here
