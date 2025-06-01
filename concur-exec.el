@@ -330,7 +330,7 @@ The last command respects its own `:die-on-error` or `concur:command`'s default.
     `(concur:chain ,@forms)))
 
 ;;;###autoload
-(cl-defmacro concur:define-command (name arglist docstring command-expr
+(cl-defmacro concur:define-command! (name arglist docstring command-expr
                                       &rest default-keys-plist &key interactive)
   "Define NAME as a function that runs an async command via `concur:command`.
 COMMAND-EXPR should evaluate to a command string or a list `(EXE ARGS...)`.

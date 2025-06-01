@@ -17,9 +17,9 @@ Key modules include:
 
 * **`concur-exec.el`** (formerly `concur-proc.el`): For running external OS commands asynchronously.
   * `concur-exec-process`: A low-level function to start an external process and get a promise that resolves with detailed results (stdout, stderr, exit code).
-  * `concur-exec-command`: A higher-level convenience function that takes a command string (or list), handles argument parsing, and returns a promise typically resolving with the command's stdout.
-  * `def-concur-command`: A macro to easily define new, reusable interactive or non-interactive Emacs commands that execute external programs asynchronously.
-  * `concur-pipe`: A macro to chain multiple asynchronous commands, piping the stdout of one to the stdin of the next, similar to shell pipes.
+  * `concur:command`: A higher-level convenience function that takes a command string (or list), handles argument parsing, and returns a promise typically resolving with the command's stdout.
+  * `concur:define-command!`: A macro to easily define new, reusable interactive or non-interactive Emacs commands that execute external programs asynchronously.
+  * `concur-pipe!`: A macro to chain multiple asynchronous commands, piping the stdout of one to the stdin of the next, similar to shell pipes.
 
 * **`concur-cancel.el`** (Assumed Dependency): Provides cancellation token support, allowing for cooperative cancellation of asynchronous operations.
 
@@ -142,7 +142,7 @@ These macros are the primary way to build readable asynchronous workflows. They 
                       "Error handled, default value returned")
 
               ;; Step 4: :finally always runs
-              :finally ((message "Promise chain finished.")))
+              :finally (message "Promise chain finished."))
 
 ;; To get the final result (e.g., for testing or top-level):
 ;; (concur:await (the-whole-concur:chain-form-above))
@@ -154,19 +154,19 @@ These macros are the primary way to build readable asynchronous workflows. They 
 (require 'concur-exec)
 
 ;; Example 1: Simple command, get stdout
-(concur:chain (concur-exec-command "ls -l /tmp")
-              :then ((message "ls output:\n%s" <>)))
+(concur:chain (concur:command "ls -l /tmp")
+              :then (message "ls output:\n%s" <>))
 
 ;; Example 2: Command with input and error handling
 (concur:chain
-    (concur-exec-command "grep 'error'"
+    (concur:command "grep 'error'"
                          :input-string "line1\nline with error\nline3"
-                         :die-on-error t) ; concur-exec-command will error if grep exits non-zero
-  :then ((message "Grep found:\n%s" <>))
-  :catch ((message "Grep failed or found nothing. Error: %S" <!>)))
+                         :die-on-error t) ; concur:command will error if grep exits non-zero
+  :then (message "Grep found:\n%s" <>)
+  :catch (message "Grep failed or found nothing. Error: %S" <!>))
 
-;; Example 3: Using the def-concur-command macro
-(def-concur-command my-git-status (dir)
+;; Example 3: Using the concur:define-command! macro
+(concur:define-command! my-git-status (dir)
   "Get git status for DIR asynchronously."
   (interactive "DDirectory: ") ; Makes M-x my-git-status interactive
   "git status -s" ; Command string
@@ -174,12 +174,12 @@ These macros are the primary way to build readable asynchronous workflows. They 
   :die-on-error nil) ; Don't signal Emacs error, just let promise reject
 
 (concur:chain (my-git-status "~/projects/my-repo")
-              :then ((message "Git Status:\n%s" <>))
-              :catch ((message "Git status failed: %S" <!>)))
+              :then (message "Git Status:\n%s" <>)
+              :catch (message "Git status failed: %S" <!>))
 
 ;; Example 4: Piping commands
 (concur:chain
-    (concur-pipe
+    (concur-pipe!
      "ls -1 /usr/bin"
      '("grep" "emacs") ; Command as a list
      "wc -l")
@@ -203,5 +203,5 @@ These macros are the primary way to build readable asynchronous workflows. They 
 Please refer to the docstrings and commentaries within the individual files for detailed API documentation:
 
 * `concur-promise.el`: For core promise functions and the `concur:chain`/`concur:chain-when` macros.
-* `concur-exec.el`: For `concur-exec-process`, `concur-exec-command`, `def-concur-command`, and `concur-pipe`.
+* `concur-exec.el`: For `concur-exec-process`, `concur:command`, `concur:define-command!`, and `concur-pipe!`.
 * `concur-cancel.el`: For cancellation token functionality.
