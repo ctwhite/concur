@@ -23,7 +23,7 @@ Key modules include:
 
 * **`concur-cancel.el`** (Assumed Dependency): Provides cancellation token support, allowing for cooperative cancellation of asynchronous operations.
 
-* **`concur-future.el`** (Mentioned as part of the ecosystem): Likely provides further utilities for managing future-like computations (details not covered in this README).
+* **`concur-future.el`** (Mentioned as part of the ecosystem): Provides further utilities for managing future-like computations.
 
 ## Installation
 
