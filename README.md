@@ -195,7 +195,7 @@ These macros are the primary way to build readable asynchronous workflows. They 
               :reduce (0 (lambda (acc item) (+ acc item))) ; result: 90
               :sleep 500             ; Waits 500ms, <> is still 90
               :log "Final sum after sleep" ; Logs "Final sum after sleep: 90"
-              :then ((message "All done! Result: %S" <>)))
+              :then (message "All done! Result: %S" <>))
 ```
 
 ## API Reference
