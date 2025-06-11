@@ -2,8 +2,8 @@
 ;;
 ;; Author: Christian White <christiantwhite@protonmail.com>
 ;; Maintainer: Christian White <christiantwhite@protonmail.com>
-;; Created: June 1, 2025
-;; Version: 0.3.2 
+;; Created: June 7, 2025
+;; Version: 1.0.0
 ;; Package-Requires: ((emacs "27.1") (cl-lib "0.5") (s "1.12.0") (dash "2.19.1") (ts "0.3") (ht "2.3") (async "1.9.7"))
 ;; Homepage: https://github.com/ctwhite/concur.el
 ;; Keywords: concurrency, async, promises, futures, tasks, processes, lisp
@@ -19,36 +19,36 @@
 ;; of the concur library.
 ;;
 ;; Core Components (loaded by `concur.el`):
-;; - `concur-promise.el`: Implements Promises/A+ like one-time settable values
-;;   with support for chained continuations (`then`), error handling (`catch`),
-;;   and composition (`all`, `race`).
-;; - `concur-exec.el`: Provides functions for running external commands
-;;   asynchronously, returning promises that resolve with process output or
-;;   rejection details. Includes `concur:command` and `concur:pipe!`.
-;; - `concur-cancel.el`: Defines cancellation tokens for cooperative
-;;   cancellation of asynchronous operations.
-;; - `concur-future.el`: Provides lazily-evaluated asynchronous results,
-;;   representing values that will be available in the future.
-;; - `concur-primitives.el`: Offers lower-level concurrency primitives such as
-;;   locks (mutexes), semaphores, and once-execution macros.
-;; - `concur-async.el`: Provides high-level asynchronous programming utilities,
-;;   including `concur:async!` for running functions with various execution
-;;   modes (deferred, threaded, async process) and `concur:await!` for
-;;   synchronously-looking await patterns.
+;; - `concur-core`: Foundational definitions and the logging hook.
+;; - `concur-promise`: Implements Promises/A+ for managing async results.
+;; - `concur-future`: Provides lazily-evaluated asynchronous computations.
+;; - `concur-cancel`: Defines cancellation tokens for cooperative cancellation.
+;; - `concur-primitives`: Offers locks, semaphores, and other low-level utilities.
+;; - `concur-exec`: Provides functions for running external commands asynchronously.
+;; - `concur-async`: High-level API (`async!`, `await!`, `let-promise*`, etc.)
+;;   for running and managing asynchronous tasks.
 ;;
 ;; These primitives are designed to be used together to build robust and
 ;; manageable asynchronous applications and features within Emacs.
 ;;
 ;;; Code:
 
-(require 'cl-lib)
+;;;###autoload
+(defconst concur-version "1.0.0"
+  "The version number of the concur.el library.")
 
-;; Load the core components
+;; Load the core components in a logical order. `concur-core` provides
+;; foundational definitions and must be loaded first.
+(require 'concur-core)
+
+;; Load the main building blocks of the library.
 (require 'concur-promise)
-(require 'concur-exec)
-(require 'concur-cancel)
 (require 'concur-future)
+(require 'concur-cancel)
+
+;; Load lower-level and higher-level utilities.
 (require 'concur-primitives)
+(require 'concur-exec)
 (require 'concur-async)
 
 (provide 'concur)

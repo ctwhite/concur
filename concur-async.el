@@ -1,523 +1,347 @@
-;;; concur-async.el --- Cooperative async primitives for Emacs -*- lexical-binding: t; -*-
-;;
+;;; concur-async.el --- High-level asynchronous primitives for Emacs -*-
+;;; lexical-binding: t; -*-
+
 ;;; Commentary:
 ;;
-;; This file provides high-level asynchronous programming primitives for Emacs,
-;; building upon the `concur` library. It offers a simplified interface for
-;; managing concurrent operations, integrating with Emacs's event loop and
-;; providing features like cooperative multitasking, thread management,
-;; and error handling.
+;; This file provides high-level asynchronous programming primitives, building
+;; upon the `concur-promise` and `coroutines` libraries. It offers a simplified,
+;; powerful interface for writing modern, readable asynchronous code.
+;;
+;; The central feature is `defasync!`, which allows writing asynchronous logic
+;; in a direct, sequential style using `concur:await`.
 ;;
 ;; Key Features:
 ;;
-;; -  `concur:async!`: A versatile function to run functions asynchronously
-;;      with various execution modes (deferred, delayed, background process,
-;;      native thread).
-;; -  `concur:await!`: A macro to synchronously-looking await the result of
-;;      an asynchronous operation (future or promise), with optional timeout.
-;; -  Thread management: Spawns and manages native threads for CPU-bound
-;;      asynchronous operations.
-;; -  Error handling: Provides robust error propagation and handling for
-;;      asynchronous tasks.
-;; -  Tracing: Optional logging of asynchronous stack traces for debugging.
-;; -  Hooks: Extensible lifecycle hooks for asynchronous operations
-;;      (`concur-async-hooks`, `concur-await-hooks`).
-;; -  `concur:sequence!`: Run async operations in sequence.
-;; -  `concur:parallel!`: Run async operations in parallel.
-;; -  `concur:race!`: Race multiple async operations.
-;; -  `concur:timeout!`: Apply a timeout to an async operation.
-;;
-;; Dependencies:
-;;
-;; -  `async`: For managing asynchronous processes.
-;; -  `cl-lib`: Common Lisp extensions for Emacs Lisp.
-;; -  `concur-promise`: Promise implementation for `concur`.
-;; -  `concur-future`: Future implementation for `concur`.
-;; -  `concur-primitives`: Core primitives of the `concur` library.
-;; -  `scribe`: Logging utility.
-;;
-;; Usage:
-;;
-;; This file is typically used as part of the `concur` library. Users
-;; can use `concur:async!` to initiate asynchronous operations and
-;; `concur:await!` to wait for their results. The library provides
-;; mechanisms to define how the asynchronous operations are executed
-;; (e.g., in a separate thread, in a background process, or deferred
-;; in the Emacs event loop).
-;;
-;; Examples:
-;;
-;; 1. Basic `concur:async!`:
-;;    (concur:async!
-;;        (lambda ()
-;;          (message "Async task started...")
-;;          (sleep-for 0.5) ; Simulate a long-running operation
-;;          (message "Async task finished!"))
-;;      'deferred "my-deferred-task")
-;;
-;; 2. Using `concur:await!`:
-;;    (let ((result (concur:await!
-;;                     (concur:async!
-;;                         (lambda ()
-;;                           (sleep-for 0.1)
-;;                           (+ 1 2))
-;;                       'deferred)
-;;                   :timeout 5)))
-;;      (message "Result: %s" result))
-;;    ;; => Prints "Result: 3"
-;;
-;; 3. `concur:sequence!` example:
-;;    (concur:await!
-;;     (concur:sequence!
-;;      '(1 2 3)
-;;      (lambda (num)
-;;        (message "Processing %d sequentially..." num)
-;;        (concur:async! (lambda () (sleep-for 0.1) (* num 10)) 'deferred))))
-;;    ;; => Processes 1, then 2, then 3, with 0.1s delay between each.
-;;    ;;    Resolves with '(10 20 30) after ~0.3 seconds total.
-;;
-;; 4. `concur:parallel!` example:
-;;    (concur:await!
-;;     (concur:parallel!
-;;      '(1 2 3)
-;;      (lambda (num)
-;;        (message "Processing %d in parallel..." num)
-;;        (concur:async! (lambda () (sleep-for (* num 0.1)) (* num 10)) 'deferred))))
-;;    ;; => Initiates all tasks at once.
-;;    ;;    Resolves with '(10 20 30) after ~0.3 seconds (due to longest delay).
-;;
-;; 5. `concur:race!` example:
-;;    (concur:await!
-;;      (concur:race!
-;;        (concur:async! (lambda () (sleep-for 0.5) "Slow Winner") 'deferred)
-;;        (concur:async! (lambda () (sleep-for 0.1) "Fast Winner") 'deferred)))
-;;    ;; => Resolves with "Fast Winner" after 0.1 seconds.
-;;
-;; 6. `concur:timeout!` example:
-;;    (condition-case err
-;;        (concur:await!
-;;          (concur:timeout!
-;;            (concur:async! (lambda () (sleep-for 2) "Too Slow") 'deferred)
-;;            0.5))
-;;      (concur-timeout (message "Operation timed out: %S" err)))
-;;    ;; => Prints "Operation timed out: (concur-timeout \"Promise timed out\")" after 0.5 seconds.
-;;
+;; -  `defasync!`: Defines a function that is internally a coroutine but
+;;    externally returns a promise, providing a seamless async/await pattern.
+;; -  `concur:await`: The universal "wait" operation. It non-blockingly
+;;    suspends when used inside `defasync!` and blockingly (but cooperatively)
+;;    waits when used in normal functions.
+;; -  `concur:async!`: A versatile function to run code asynchronously
+;;    with various execution modes (deferred, delayed, background process).
+;; -  `concur:let-promise*` & `concur:let-promise`: Async-aware `let` macros
+;;    for managing multiple concurrent or sequential bindings.
+;; -  High-level concurrent iterators and composition functions like
+;;    `concur:parallel!`, `concur:coroutine-all`, and `concur:map-pool`.
+
 ;;; Code:
 
-(require 'async)
 (require 'cl-lib)
-(require 'concur-cancel)
-(require 'concur-future)
-(require 'concur-primitives)
+(require 'async)
+(require 'backtrace)
 (require 'concur-promise)
-(require 'ht)
-(require 'scribe nil t) ; Optional scribe
-
-;; Ensure `log!` is available if scribe isn't fully loaded/configured elsewhere
-(unless (fboundp 'log!)
-  (defun log! (level format-string &rest args)
-    "Placeholder logging function if scribe's log! is not available."
-    (apply #'message (concat "CONCUR-ASYNC-LOG " (symbol-name level) ": " format-string) args)))
+(require 'coroutines)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;                             Customization                                  ;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Customization, Hooks, & Errors
 
 (defcustom concur-async-enable-tracing t
-  "Whether to record and log async stack traces for `concur:async!` tasks."
+  "If non-nil, record and log async stack traces for `concur:async!` tasks."
   :type 'boolean
   :group 'concur)
 
-(defcustom concur-async-await-poll-interval 0.01
-  "Polling interval in seconds used by `concur:await!` when blocking.
-A small value (e.g. 0.005 = 5ms) gives more responsiveness, but may use more CPU."
-  :type 'number
-  :group 'concur)
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;                                 Hooks                                      ;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
 (defvar concur-async-hooks nil
-  "Hook run during `concur:async!`.
+  "Hook run during `concur:async!` lifecycle events.
+Each function receives `(EVENT LABEL PROMISE &optional ERROR)` where
+EVENT is one of `:started`, `:succeeded`, `:failed`, `:cancelled`.")
 
-Each function receives (EVENT LABEL FUTURE &optional ERR), where EVENT is one of:
-  :started     — before task is scheduled
-  :succeeded   — when resolved successfully
-  :failed      — if an error is caught during async execution (ERR is error object)
-  :cancelled   — if the task is cancelled before completion")
-
-(defvar concur-await-hooks nil
-  "Hook run for await lifecycle events.
-
-Each hook function receives:
-  (EVENT LABEL TASK &optional ERR)
-
-Where:
-  - EVENT is one of :started, :yield, :timeout, :succeeded, :failed
-  - LABEL is a string identifier for this await instance
-  - TASK is the original awaitable (usually a concur-future or concur-promise)
-  - ERR is only passed for error-related events such as :timeout or :failed.")
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;                            Internal State                                  ;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(defvar concur-async--active-threads (ht-create)
-  "Hash table tracking active threads keyed by thread object.")
-
-(defvar-local concur-async--stack nil
-  "Dynamic stack of async task labels used for instrumentation and tracing.
-This variable is buffer-local to prevent interference between different
-Emacs contexts, but its primary use is for tracing within a single async flow.")
-
-;; Define a custom error type for async operations
 (define-error 'concur-async-error "Concurrency async operation error.")
-(define-error 'concur-timeout "Concurrency timeout error.") ; Used by concur:await! and concur:timeout!
+(define-error 'concur-timeout "Concurrency timeout error.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;                           Internal Helpers                                 ;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Internal State & Helpers
 
-(defun concur-async--error? (value)
-  "Return non-nil if VALUE is an `error` object."
-  (and (consp value)
-       (eq (car value) 'error)
-       (symbolp (cadr value))))
+(defvar-local concur-async--stack '()
+  "Buffer-local dynamic stack of async task labels for tracing.")
 
-(defun concur-async--push-stack-frame (label)
-  "Push LABEL onto the async task stack."
-  (push label concur-async--stack))
+(defun concur-async--run-hooks (event label promise &optional err)
+  "Run `concur-async-hooks` for a given lifecycle event."
+  (run-hook-with-args 'concur-async-hooks event label promise err))
 
-(defun concur-async--pop-stack-frame ()
-  "Pop a frame from the async task stack."
-  (pop concur-async--stack))
-
-(defun concur-async--label (fn)
-  "Generate a human-readable label for an async task from its function FN."
-  (let ((s (prin1-to-string fn)))
-    (if (> (length s) 40)
-        (concat (substring s 0 37) "...")
-      s)))
-
-(defun concur-async--format-async-trace ()
-  "Return a formatted trace of the current async stack."
-  (mapconcat (lambda (frame)
-               (format "↳ %s" frame))
+(defun concur-async--format-trace ()
+  "Return a formatted string of the current async stack."
+  (mapconcat (lambda (frame) (format "↳ %s" frame))
              (reverse concur-async--stack)
              "\n"))
 
-(defun concur-async--log-trace (label)
-  "Log the current async stack trace for LABEL."
-  (log! :trace "[%s] Async trace:\n%s" label (concur-async--format-async-trace)))
-
-(defun concur-async--maybe-log-trace (label)
-  "Log the async stack trace for LABEL if tracing is enabled."
-  (when concur-async-enable-tracing
-    (concur-async--log-trace label)))
-
-(defun concur-async--run-hooks (event label future &optional err)
-  "Run `concur-async-hooks` for EVENT, LABEL, and FUTURE.
-ERR is included for :failed events."
-  (log! :debug "[%s] Running async hooks: %s" label event)
-  (run-hook-with-args 'concur-async-hooks event label future err))
-
-(defun concur-await--run-hooks (event label task &optional err)
-  "Run `concur-await-hooks` for EVENT, LABEL, and TASK (a future or promise).
-ERR is only passed for error-related events like :timeout or :failed."
-  (log! :debug "[%s] Running await hooks: %s" label event)
-  (run-hook-with-args 'concur-await-hooks event label task err))
-
-(defun concur-async--thread-run-future (future label cancel-token)
-  "Run FUTURE in a background thread.
-Returns the created thread object or nil if not started."
-  (unless (concur-future-p future)
-    (log! :error "concur-async--thread-run-future: Invalid future object: %S" future)
-    (cl-return-from concur-async--thread-run-future nil))
-
-  (log! :info "[%s] Spawning thread for future %S" label future)
-  (if (and cancel-token (not (concur:cancel-token-active? cancel-token)))
-      (progn
-        (log! :warn "[%s] Not started: token %S already canceled"
-               label (concur--cancel-token-get-name cancel-token))
-        (concur-async--run-hooks :cancelled label future)
-        nil)
-    (let* ((thread
-            (make-thread
-             (lambda ()
-               (let (result error)
-                 (unwind-protect
-                     (progn
-                       (concur-async--push-stack-frame label)
-                       (log! :debug "[%s] Thread execution started." label)
-                       (condition-case e
-                           (setq result (concur:future-get future)) 
-                         (error
-                          (setq error e))))
-                   (run-at-time
-                    0 nil
-                    (lambda ()
-                      (ht-remove! concur-async--active-threads thread)
-                      (concur-async--pop-stack-frame)
-                      (if error
-                          (progn
-                            (log! :error "[%s] Thread failed: %S" label error)
-                            (concur-async--run-hooks :failed label future error))
-                        (progn
-                          (log! :info "[%s] Thread succeeded." label)
-                          (concur-async--run-hooks :succeeded label future result))))))))
-           entry)
-      (setq entry `(:thread ,thread :future ,future :label ,label :cancel-token ,cancel-token))
-      (ht-set! concur-async--active-threads thread entry)
-      (when cancel-token
-        (concur:cancel-token-on-cancel
-         cancel-token
-         (lambda ()
-           (when (ht-contains? concur-async--active-threads thread)
-             (ht-remove! concur-async--active-threads thread)
-             (log! :warn "[%s] Cancelled by token %S. Killing thread."
-                    label (concur--cancel-token-get-name cancel-token))
-             (kill-thread thread)
-             (concur-async--run-hooks :cancelled label future)))))
-      (log! :info "[%s] Thread started." label)
-      thread)))))
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;                                 Public API                                 ;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; High-Level Async Execution
 
 ;;;###autoload
 (defun concur:async! (fn &optional mode name cancel-token)
   "Run FN asynchronously according to MODE and return a `concur-promise`.
 
-FN should be a zero-arg function (thunk) to execute. The return value of FN
-will be the result of the promise, or an error if FN throws.
+FN should be a zero-argument function (thunk). The return value
+of FN will be the result of the promise, or an error if FN throws.
 
-MODE determines how the function is scheduled:
-- nil or 'deferred or t: schedule immediately using `run-at-time 0`.
-- number: delay execution by that many seconds using `run-at-time`.
-- 'async: run in a background Emacs process via `async-start`.
-- 'thread: spawn a native thread via `make-thread`.
+Arguments:
+- `FN` (function): The zero-argument function to execute.
+- `MODE` (symbol or number, optional): The execution mode.
+  - `nil` or `'deferred` or `t`: Schedule immediately via `run-at-time`.
+  - A `(number)`: Delay execution by that many seconds.
+  - `'async`: Run in a background Emacs process via `async-start`.
+- `NAME` (string, optional): A human-readable name for the operation.
+- `CANCEL-TOKEN` (`concur-cancel-token`): Optional token to interrupt execution.
 
-Optional arguments:
-  NAME         Human-readable name for the async operation.
-  CANCEL-TOKEN A cancel token object to interrupt execution.
-
-Returns:
-  A `concur-promise` that will resolve with the result of FN, or reject
-  with an error if FN fails or the operation is cancelled."
-  (log! :info "concur:async!: Preparing operation: %S (mode: %S, name: %S)." fn mode name)
-  (let* ((label (or name (concur-async--label fn)))
-         (future (concur:make-future fn)) 
-         (promise (concur-future-promise future))
-         (concur-async--stack (cons label concur-async--stack)))
-
-    (concur-async--run-hooks :started label future)
-    (concur-async--maybe-log-trace label)
-
-    (unwind-protect
-        (pcase mode
-          ((or 'deferred 't (pred null))
-           (log! :debug "concur:async!: Scheduling deferred operation for %S." label)
-           (run-at-time 0 nil
-                        (lambda ()
-                          (concur-async--pop-stack-frame)
-                          (condition-case err
-                              (let* ((result-promise (concur:force future))) 
-                                (concur:on-resolve 
-                                 result-promise
-                                 :on-resolved (lambda (res)
-                                                (concur-async--run-hooks :succeeded label future)
-                                                (concur:resolve promise res)) 
-                                 :on-rejected (lambda (err-cb)
-                                                (concur-async--run-hooks :failed label future err-cb)
-                                                (concur:reject promise err-cb)))) 
-                            (error
-                             (log! :error "concur:async!: Deferred op for %S failed: %S." label err :trace)
-                             (concur-async--run-hooks :failed label future err)
-                             (concur:reject promise err)))))) 
-
-          ((pred numberp)
-           (log! :debug "concur:async!: Scheduling delayed op (%ss) for %S." mode label)
-           (run-at-time mode nil
-                        (lambda ()
-                          (concur-async--pop-stack-frame)
-                          (condition-case err
-                              (let* ((result-promise (concur:force future))) 
-                                (concur:on-resolve 
-                                 result-promise
-                                 :on-resolved (lambda (res)
-                                                (concur-async--run-hooks :succeeded label future)
-                                                (concur:resolve promise res)) ; Use new name
-                                 :on-rejected (lambda (err-cb)
-                                                (concur-async--run-hooks :failed label future err-cb)
-                                                (concur:reject promise err-cb)))) ; Use new name
-                            (error
-                             (log! :error "concur:async!: Delayed op for %S failed: %S." label err :trace)
-                             (concur-async--run-hooks :failed label future err)
-                             (concur:reject promise err)))))) 
-
-          ('async
-           (log! :debug "concur:async!: Scheduling async process for %S." label)
-           (async-start
-            `(lambda ()
-               (require 'scribe)      ; Ensure dependencies in async process
-               (require 'concur-future)
-               (require 'concur-promise)
-               (require 'concur-primitives) 
-               (concur-async--push-stack-frame ,label)
-               (unwind-protect
+Results:
+  Returns a `concur-promise` that will resolve with the result of FN, or
+  reject if FN fails or is cancelled."
+  (let* ((label (or name (format "async-%S" (sxhash fn))))
+         (task (lambda (resolve reject)
+                 (let ((concur-async--stack (cons label concur-async--stack)))
                    (condition-case err
-                       (progn
-                         (log! :debug "[%s] Async process started." ,label)
-                         (concur:force ,future)) ; Use new name
+                       (funcall resolve (funcall fn))
                      (error
-                      (log! :error "[%s] Async process failed: %S." ,label err :trace)
-                      err))
-                 (concur-async--pop-stack-frame)))
-            (lambda (result-promise-or-error)
-              (concur-async--pop-stack-frame)
-              (if (concur-promise-p result-promise-or-error) ; Check if it's a promise
-                  (concur:on-resolve ; Use new name
-                   result-promise-or-error
-                   :on-resolved (lambda (res)
-                                  (concur-async--run-hooks :succeeded label future)
-                                  (concur:resolve promise res)) 
-                   :on-rejected (lambda (err-cb)
-                                  (concur-async--run-hooks :failed label future err-cb)
-                                  (concur:reject promise err-cb))) 
-                (progn ; Handle direct error from async-start's lambda
-                  (log! :error "concur:async!: Async process for %S returned direct error: %S." label result-promise-or-error :trace)
-                  (concur-async--run-hooks :failed label future result-promise-or-error)
-                  (concur:reject promise result-promise-or-error)))))) 
+                      (funcall reject
+                               `(:error-type async-execution-error
+                                 :message ,(error-message-string err)
+                                 :backtrace ,(backtrace-to-string (backtrace))
+                                 :async-trace ,(concur-async--format-trace)
+                                 :original-error ,err))))))))
+    (pcase mode
+      ((or 'nil 'deferred 't)
+       (concur:with-executor
+        (lambda (resolve reject)
+          (run-at-time 0 nil (lambda () (funcall task resolve reject))))
+        cancel-token))
+      ((pred numberp)
+       (concur:with-executor
+        (lambda (resolve reject)
+          (run-at-time mode nil (lambda () (funcall task resolve reject))))
+        cancel-token))
+      ('async
+       (concur:with-executor
+        (lambda (resolve reject)
+          (async-start
+           ;; The background process needs to load the library to understand promises.
+           `(lambda () (require 'concur-promise) (funcall ,task #'identity #'identity))
+           (lambda (result)
+             (if (concur:rejected? result)
+                 (funcall reject (concur:error-value result))
+               (funcall resolve (concur:value result))))))
+        cancel-token))
+      (_ (concur:rejected! (format "Unknown async mode: %S" mode))))))
 
-          ('thread
-           (log! :debug "concur:async!: Scheduling thread-backed op for %S." label)
-           (concur-async--thread-run-future future label cancel-token))
-
-          (_
-           (let ((err (format "Unknown async run mode: %S" mode)))
-             (log! :error "concur:async!: %S" err :trace)
-             (concur-async--run-hooks :failed label future err)
-             (concur:reject promise err)))) ; Use new name
-      (concur-async--pop-stack-frame))
-    promise))
-
-;;;###autoload
-(defmacro concur:await! (form &rest args)
-  "Await the result of FORM (a `concur-future` or `concur-promise`).
-Blocks until resolved or TIMEOUT (seconds).
-ARGS: :timeout (number).
-Runs `concur-await-hooks` for lifecycle events."
-  (let ((task-expr (gensym "task-expr"))
-        (awaitable-promise (gensym "awaitable-promise"))
-        (timeout (gensym "timeout"))
-        (label (gensym "label"))
-        (result (gensym "result"))
-        (error-val (gensym "error-val")))
-    `(let* ((,task-expr ,form)
-            (,timeout (plist-get (list ,@args) :timeout))
-            (,label
-             (format "await[%s]"
-                     (or (and (symbolp ',form) (symbol-name ',form))
-                         (let ((s (prin1-to-string ',form)))
-                           (if (> (length s) 40)
-                               (concat (substring s 0 37) "...")
-                             s)))))
-            (,awaitable-promise
-             (cond
-              ((concur-future-p ,task-expr)
-               (log! :trace "[%s] Normalizing future %S -> promise." ,label ,task-expr)
-               (concur:force ,task-expr)) ; Use new name
-              ((concur-promise-p ,task-expr)
-               ,task-expr)
-              (t (error "[%s] Invalid awaitable: %S. Must be a concur-future or concur-promise." ,label ,task-expr)))))
-
-       (concur-async--push-stack-frame ,label)
-       (concur-await--run-hooks :started ,label ,task-expr)
-
-       (log! :info "[%s] Awaiting %S%s"
-             ,label ,task-expr (if ,timeout (format " (timeout: %.2fs)" ,timeout) ""))
-
-       (unwind-protect
-           (progn
-             (log! :debug "[%s] Awaiting via polling (interval: %.2fs)..." ,label concur-async-await-poll-interval)
-             (let ((start-time (float-time)))
-               (while (and (not (concur-promise-resolved? ,awaitable-promise))
-                           (or (not ,timeout)
-                               (< (- (float-time) start-time) ,timeout)))
-                 (concur-await--run-hooks :yield ,label ,task-expr)
-                 (sleep-for concur-async-await-poll-interval)))
-
-             (let ((awaited-outcome (concur:await ,awaitable-promise ,timeout t nil))) 
-               (setq ,result (car awaited-outcome))
-               (setq ,error-val (cdr awaited-outcome))))
-         (concur-async--pop-stack-frame)
-         (if ,error-val
-             (concur-await--run-hooks :failed ,label ,task-expr ,error-val)
-           (concur-await--run-hooks :succeeded ,label ,task-expr))
-         (concur-await--run-hooks :done ,label ,task-expr)) ; Assuming :done is a valid hook event
-
-       (when ,error-val
-         (log! :error "[%s] Await completed with error: %S" ,label ,error-val)
-         (signal (car ,error-val) (cdr ,error-val)))
-
-       ,result)))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Async/Await Style API
 
 ;;;###autoload
-(defmacro concur:sequence! (items fn &rest args)
-  "Process ITEMS sequentially with async FN `(lambda (item))` -> promise/future.
-Returns promise with list of results or rejects on first error.
-ARGS: Optional keyword args for `concur:map-series` (e.g., :cancel-token)."
-  (declare (indent 2) (debug t))
-  `(concur:map-series ; Use new name
-    ,items
-    (lambda (item)
-      (let ((result (funcall ,fn item)))
-        (if (or (concur-promise-p result) (concur-future-p result))
-            (if (concur-future-p result) (concur-future-promise result) result)
-          (concur:resolved! result)))) 
-    ,@args))
+(defmacro defasync! (name args &rest body)
+  "Define an async function NAME that returns a promise.
+
+This is the primary macro for creating asynchronous operations using a
+sequential, `await`-based style. It wraps `defcoroutine!` and
+`concur:from-coroutine` into a single, convenient definition.
+
+Example:
+  (defasync! fetch-url-content (url)
+    (let* ((response (concur:await (url-retrieve-synchronously url)))
+           (buffer (with-current-buffer (url-retrieve-buffer response)
+                     (current-buffer))))
+      (with-current-buffer buffer
+        (goto-char (point-min))
+        (search-forward \"\r\n\r\n\")
+        (buffer-substring-no-properties (point) (point-max)))))
+
+Arguments:
+- `NAME` (symbol): The name of the async function.
+- `ARGS` (list): The argument list. Can include a `:locals` specification.
+- `BODY` (form...): The asynchronous logic for the function.
+
+Results:
+  Defines a function `NAME` that, when called, returns a `concur-promise`."
+  (declare (indent defun))
+  (let* ((docstring (if (stringp (car body)) (pop body)
+                      (format "Asynchronous function %s." name)))
+         (coro-name (intern (format "%s--coro" name)))
+         (parsed-args (coroutines--parse-defcoroutine-args args))
+         (fn-args (car parsed-args)))
+    `(progn
+       ;; 1. Define the underlying coroutine that contains the body logic.
+       (defcoroutine! ,coro-name ,args ,@body)
+       ;; 2. Define the user-facing async function.
+       (defun ,name (,@fn-args &key cancel-token)
+         ,docstring
+         ;; 3. When called, it creates an instance of the coroutine
+         ;;    and wraps it in a promise that will settle with the
+         ;;    coroutine's final outcome.
+         (concur:from-coroutine
+          (apply #',coro-name (list ,@fn-args))
+          cancel-token)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Async-aware `let` bindings
 
 ;;;###autoload
-(defmacro concur:parallel! (items fn &rest args)
-  "Process ITEMS in parallel with async FN `(lambda (item))` -> promise/future.
-Returns promise with list of results or rejects on first error.
-ARGS: Optional keyword args for `concur:map-parallel` (e.g., :cancel-token)."
-  (declare (indent 2) (debug t))
-  `(concur:map-parallel ; Use new name
-    (cl-loop for item in ,items
-             collect (let ((result (funcall ,fn item)))
-                       (if (or (concur-promise-p result) (concur-future-p result))
-                           (if (concur-future-p result) (concur-future-promise result) result)
-                         (concur:resolved! result)))) 
-    (lambda (p) p) 
-    ,@args))
+(defmacro concur:let-promise (bindings &rest body)
+  "Execute BODY with BINDINGS resolved from promises in parallel.
+
+This macro provides an async-aware version of `let`. It evaluates
+all `form`s in `BINDINGS` concurrently, waits for all of them to
+resolve, and then executes `BODY` with variables bound to the results.
+
+Arguments:
+- `BINDINGS`: A list of `(variable form)` bindings, like `let`.
+- `BODY`: The forms to execute after all bindings are resolved.
+
+Results:
+  A promise that resolves with the value of the last form in BODY."
+  (declare (indent 1))
+  (if (null bindings)
+      `(concur:resolved! (progn ,@body))
+    (let ((vars (--map #'car bindings))
+          (forms (--map #'cadr bindings)))
+      `(concur:then (concur:all ,forms)
+                    (lambda (results)
+                      (cl-destructuring-bind ,vars results
+                        ,@body))))))
+
+;;;###autoload
+(defmacro concur:let-promise* (bindings &rest body)
+  "Execute BODY with BINDINGS resolved from promises sequentially.
+
+This macro provides an async-aware version of `let*`. Each form in
+`BINDINGS` is evaluated, and if it returns a promise, the macro
+waits for it to resolve before evaluating the next binding.
+
+Arguments:
+- `BINDINGS`: A list of `(variable form)` bindings, like `let*`.
+- `BODY`: The forms to execute after all bindings are resolved.
+
+Results:
+  A promise that resolves with the value of the last form in BODY."
+  (declare (indent 1))
+  (if (null bindings)
+      `(concur:resolved! (progn ,@body))
+    (let* ((binding (car bindings))
+           (var (car binding))
+           (form (cadr binding)))
+      `(concur:then ,form
+                    (lambda (,var)
+                      (concur:let-promise* ,(cdr bindings) ,@body))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; High-Level Concurrent Operations
+
+;;;###autoload
+(defun concur:sequence! (items fn)
+  "Process ITEMS sequentially with async FN.
+
+Each item is processed only after the previous one's promise resolves.
+
+Arguments:
+- `ITEMS` (list): The list of items to process.
+- `FN` (function): An async fn `(lambda (item))` that returns a promise.
+
+Results:
+  A promise that resolves with a list of results, or rejects on first failure."
+  (concur:map-series items fn))
+
+;;;###autoload
+(defun concur:parallel! (items fn)
+  "Process ITEMS in parallel with async FN.
+
+All async operations are started concurrently.
+
+Arguments:
+- `ITEMS` (list): The list of items to process.
+- `FN` (function): An async fn `(lambda (item))` that returns a promise.
+
+Results:
+  A promise that resolves with a list of results, or rejects on first failure."
+  (concur:all (--map (funcall fn it) items)))
 
 ;;;###autoload
 (defmacro concur:race! (&rest forms)
-  "Race multiple async operations (promise/future FORMS).
-Returns promise with outcome of the first to settle."
-  (declare (indent 0) (debug t))
-  (let ((promises-list (gensym "promises-list")))
-    `(let ((,promises-list
-            (cl-loop for form in (list ,@forms)
-                     collect (let ((p-or-f form))
-                               (if (concur-future-p p-or-f)
-                                   (concur-future-promise p-or-f)
-                                 p-or-f)))))
-       (concur:race ,promises-list)))) 
+  "Race multiple async operations (promises).
+
+Arguments:
+- `FORMS`: One or more forms, each evaluating to a promise.
+
+Results:
+  A promise that settles with the outcome of the first form to settle."
+  (declare (indent 0))
+  `(concur:race (list ,@forms)))
 
 ;;;###autoload
 (defmacro concur:timeout! (form timeout-seconds)
-  "Wrap async operation FORM (promise/future) with TIMEOUT-SECONDS.
-Returns promise that rejects on timeout or settles with FORM's outcome."
-  (declare (indent 1) (debug t))
-  (let ((p-or-f (gensym "p-or-f")))
-    `(let ((,p-or-f ,form))
-       (concur:timeout ; Use new name
-        (if (concur-future-p ,p-or-f) (concur-future-promise ,p-or-f) ,p-or-f)
-        ,timeout-seconds))))
+  "Wrap async operation FORM with a TIMEOUT-SECONDS.
+
+Arguments:
+- `FORM`: An expression that evaluates to a promise.
+- `TIMEOUT-SECONDS` (number): The timeout in seconds.
+
+Results:
+  A promise that rejects on timeout or settles with FORM's outcome."
+  (declare (indent 1))
+  `(concur:timeout ,form ,timeout-seconds))
+
+;;;###autoload
+(defun concur:coroutine-all (runners)
+  "Run a list of coroutine RUNNERS in parallel and wait for all to complete.
+
+Arguments:
+- `RUNNERS` (list): A list of coroutine runner functions.
+
+Results:
+  Returns a `concur-promise` that resolves with a list of all results. The
+  promise will reject if any of the coroutines reject."
+  (concur:all (-map #'concur:from-coroutine runners)))
+
+;;;###autoload
+(defun concur:coroutine-race (runners)
+  "Race a list of coroutine RUNNERS in parallel.
+
+The first coroutine to settle (resolve or reject) determines the outcome
+of the returned promise.
+
+Arguments:
+- `RUNNERS` (list): A list of coroutine runner functions.
+
+Results:
+  Returns a `concur-promise` that settles with the first coroutine to settle."
+  (concur:race (-map #'concur:from-coroutine runners)))
+
+;;;###autoload
+(cl-defun concur:map-pool (items fn &key (size 4))
+  "Process ITEMS using async FN, with a concurrency limit of SIZE.
+
+This function creates a pool of coroutines to process items in parallel,
+but limits the number of concurrently running coroutines.
+
+Arguments:
+- `ITEMS` (list): The list of items to process.
+- `FN` (function): An async function `(lambda (item))` that returns a
+  coroutine runner.
+- `:size` (integer): The maximum number of coroutines to run at once.
+  Defaults to 4.
+
+Results:
+  Returns a `concur-promise` that resolves with a list of all results in
+  the original order of ITEMS."
+  (concur:with-executor
+   (lambda (resolve reject)
+     (let* ((total (length items))
+            (results (make-vector total nil))
+            (item-queue (copy-sequence items))
+            (in-flight 0)
+            (completed 0))
+       (cl-labels ((process-next ()
+                     (while (and (< in-flight size) item-queue)
+                       (let* ((item (pop item-queue))
+                              (runner (funcall fn item))
+                              (index (- total (length item-queue) 1)))
+                         (cl-incf in-flight)
+                         (concur:then (concur:from-coroutine runner)
+                           (lambda (res)
+                             (aset results index res)
+                             (cl-decf in-flight)
+                             (cl-incf completed)
+                             (if (= completed total)
+                                 (funcall resolve (cl-coerce results 'list))
+                               (process-next)))
+                           (lambda (err) (funcall reject err)))))))
+         (process-next))))))
 
 (provide 'concur-async)
 ;;; concur-async.el ends here
