@@ -33,6 +33,21 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Helpers
 
+;; Private `plist-delete` implementation for `concur-exec`.
+;; This ensures the function is always available for `concur-exec`'s needs,
+;; regardless of the Emacs version or `cl-lib`'s exports.
+(defun concur-exec--plist-delete (plist key)
+  "Return a new plist with KEY and its value removed from PLIST.
+This is a private helper for `concur-exec`."
+  (let (new-plist)
+    (while plist
+      (let ((k (car plist))
+            (v (cadr plist)))
+        (setq plist (cddr plist))
+        (unless (eq k key)
+          (setq new-plist (nconc new-plist (list k v))))))
+    new-plist))
+
 (cl-defun concur--process-output (cmd args stdout stderr exit-code
                                    &key discard-ansi die-on-error)
   "Format the raw output of a finished process into a result plist.
@@ -109,14 +124,13 @@ Arguments:
 - `cwd` (string, optional): The current working directory for the process.
   Defaults to `default-directory`.
 - `env` (plist, optional): A plist of environment variables to set for the process.
-  e.g., `(:VAR1 "value1" :VAR2 "value2")`. These are prepended to
+  e.g., `(:VAR1 \"value1\" :VAR2 \"value2\")`. These are prepended to
   `process-environment`.
 - `discard-ansi` (boolean, optional): If non-nil, ANSI escape codes are
   removed from the captured `stdout`. Defaults to nil.
 - `die-on-error` (boolean or string, optional): If non-nil and the process exits
   with a non-zero status, the promise will reject with a result plist
-  containing an `:error` key. If `die-on-error` is a string, it will be
-  used as the error message. Defaults to nil (promise always resolves).
+  containing an `:error` key. If `die-on-error` is a string, it's used as the error message. Defaults to nil.
 - `trace` (string, optional): A debug string to log when the process starts,
   useful for tracking.
 - `stdin` (string, optional): A string to send to the process's standard input.
@@ -144,10 +158,11 @@ Returns:
 
   ;; `concur:with-executor` ensures the promise is correctly managed
   ;; within the Concur framework.
+  ;; MODIFIED FOR DIAGNOSTICS
   (concur:with-executor
-   (lambda (resolve reject)
+   ;; The executor now receives the promise object and raw function pointers.
+   (lambda (the-promise resolve-fn reject-fn)
      (let* ((proc-name (format "concur-%s" (file-name-nondirectory command)))
-            ;; Create dedicated buffers for stdout and stderr to capture output.
             (stdout-buf (generate-new-buffer (format "*%s-stdout*" proc-name)))
             (stderr-buf (unless merge-stderr
                           (generate-new-buffer (format "*%s-stderr*" proc-name))))
@@ -157,12 +172,10 @@ Returns:
            (progn
              (setq proc
                    (let ((default-directory (or cwd default-directory))
-                         ;; Prepend specified environment variables.
-                         (process-environment (append
-                                               (--map (format "%s=%s"
-                                                              (car it) (cdr it))
-                                                      env)
-                                               process-environment)))
+                         (process-environment (if env
+                                                  (append (--map (lambda (pair) (format "%s=%s" (car pair) (cdr pair))) env)
+                                                          process-environment)
+                                                process-environment)))
                      ;; Create the external process.
                      (make-process
                       :name proc-name          ; Name for the Emacs process object.
@@ -170,12 +183,10 @@ Returns:
                       :command (cons command (or args '())) ; Full command and args.
                       :stderr (if merge-stderr proc-pty-slave stderr-buf) ; Stderr handling.
                       :noquery t               ; Don't query user if process fails.
-                      :connection-type 'pipe))) ; Use pipes for I/O.
+                      :connection-type 'pipe)))
 
-             ;; Store promise resolution/rejection functions and buffer info on the process object.
-             ;; This allows the sentinel to access them after the process completes.
-             (process-put proc 'concur-resolve-fn resolve)
-             (process-put proc 'concur-reject-fn reject)
+             ;; Instead of storing the closure, store the promise object itself.
+             (process-put proc 'concur-the-promise the-promise)
              (process-put proc 'concur-stdout-buf stdout-buf)
              (process-put proc 'concur-stderr-buf stderr-buf)
              (process-put proc 'concur-cmd-info
@@ -187,12 +198,12 @@ Returns:
                (process-send-eof proc)) ; Signal end of input.
 
              ;; Set a sentinel function to be called when the process changes state (e.g., exits).
+             ;; The sentinel now retrieves the promise and calls the raw resolve function.
              (set-process-sentinel
               proc
               (lambda (process _event)
                 "Sentinel that retrieves its state from the process object."
-                (let* ((resolve-fn (process-get process 'concur-resolve-fn))
-                       (reject-fn (process-get process 'concur-reject-fn))
+                (let* ((promise-to-resolve (process-get process 'concur-the-promise))
                        (s-buf (process-get process 'concur-stdout-buf))
                        (e-buf (process-get process 'concur-stderr-buf))
                        (cmd-info (process-get process 'concur-cmd-info))
@@ -214,8 +225,10 @@ Returns:
                                         :die-on-error d-err))
                                (error-info (plist-get result :error)))
                           (if error-info
-                              (funcall reject-fn result)
-                            (funcall resolve-fn result))))
+                              ;; Reject the promise
+                              (funcall reject-fn promise-to-resolve result)
+                            ;; Resolve the promise
+                            (funcall resolve-fn promise-to-resolve result))))
                     ;; Clean up the temporary buffers.
                     (when (buffer-live-p s-buf) (kill-buffer s-buf))
                     (when (buffer-live-p e-buf) (kill-buffer e-buf))))))
@@ -228,7 +241,7 @@ Returns:
                   (when (process-live-p proc)
                     (kill-process proc)
                     ;; Reject the promise upon cancellation.
-                    (funcall reject
+                    (funcall reject-fn the-promise
                              `(:error-type concur-exec-cancelled
                                :message ,(format "Process '%s' cancelled" command))))))))
          ;; Handle errors that occur *before* the process is successfully created.
@@ -239,11 +252,12 @@ Returns:
             ;; Call the optional error callback.
             (when error-callback (funcall error-callback error-info))
             ;; Reject the promise with creation error info.
-            (funcall reject error-info)
+            (funcall reject-fn the-promise error-info)
             ;; Ensure buffers are killed even if process creation fails.
             (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))
             (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))))
    cancel-token))
+
 
 ;;;###autoload
 (defun concur:command (command &rest keys)
@@ -288,32 +302,46 @@ Returns:
     `:die-on-error` is t) or resolves with the full result plist (if
     `:die-on-error` is nil).
   - On process creation failure: rejects with an error plist."
+  ;; Determine the executable and arguments from the `command` input.
   (let* ((cmd-list (if (listp command) command (s-split " " command t)))
-         (exe (car cmd-list))
-         (args (cdr cmd-list))
-         ;; Default :die-on-error to `t` for `concur:command` if the user doesn't specify.
-         (die-on-error (or (plist-get keys :die-on-error) t))
-         ;; Create the key list to pass to `concur:process`.
-         ;; We override `:die-on-error` to be `nil` for `concur:process` so that
-         ;; `concur:process` *always* resolves with the full result plist.
-         ;; This allows `concur:command` to handle the logic of whether to
-         ;; resolve with just stdout or reject with the full plist.
-         (process-keys (plist-put (copy-sequence keys) :die-on-error nil)))
+         (exe (car cmd-list)) ; The executable command.
+         (implicit-args (cdr cmd-list)) ; Arguments parsed from the command string/list.
+         (user-provided-keys (copy-sequence keys)) ; Original keys passed by the user.
 
-    (concur--log :debug "concur:command: Running '%s', :die-on-error=%S"
-                 (s-join " " (cons exe args)) die-on-error)
+         ;; Determine the final `:die-on-error` behavior.
+         ;; `concur:command` defaults to `t` if not explicitly set by the user.
+         (die-on-error-final (or (plist-get user-provided-keys :die-on-error) t))
 
+         ;; Get any `:args` explicitly passed by the user.
+         (explicit-args (plist-get user-provided-keys :args))
+         ;; Combine arguments from the command string/list and explicit `:args` key.
+         (combined-args (append implicit-args (or explicit-args '())))
+
+         ;; Filter out `:args` and `:die-on-error` from `user-provided-keys`
+         ;; before passing to `concur:process` to avoid duplicates/conflicts.
+         (filtered-user-keys (concur-exec--plist-delete (concur-exec--plist-delete user-provided-keys :args) :die-on-error))
+
+         ;; Construct the final plist of arguments for `concur:process`.
+         ;; We explicitly set `:die-on-error` to `nil` for `concur:process`
+         ;; because `concur:command` wants to handle the success/rejection logic itself.
+         (plist-for-process (append (list :command exe :args combined-args :die-on-error nil)
+                                    filtered-user-keys)))
+
+    ;; Log the command being run for debugging purposes.
+    (concur--log :debug "concur:command: Running '%s', final :die-on-error=%S"
+                 (s-join " " (cons exe combined-args)) die-on-error-final)
+
+    ;; Validate that a non-empty executable is provided.
     (unless (and exe (not (string-empty-p exe)))
       (error "Invalid command provided to concur:command: %S" command))
 
     ;; Use `concur:chain` to process the result of `concur:process`.
+    ;; `concur:process` will always resolve with a detailed plist because we force its :die-on-error to nil.
     (concur:chain
-     ;; 1. Run the process using `concur:process`.
-     ;; This promise will *always* resolve with the full result plist,
-     ;; because we set `:die-on-error` to `nil` for `concur:process-keys`.
-     (apply #'concur:process :command exe :args args process-keys)
+     ;; 1. Execute the process using `concur:process`.
+     (apply #'concur:process plist-for-process)
 
-     ;; 2. Handle the result plist from the resolved promise (`<>` holds the result).
+     ;; 2. Process the detailed result plist (`<>` holds the plist).
      :then
      (let* ((result-plist <>)
             (exit-code (plist-get result-plist :exit)))
@@ -321,32 +349,32 @@ Returns:
 
        (if (zerop exit-code)
            ;; --- SUCCESS CASE (exit code is 0) ---
-           (if die-on-error
-               ;; If die-on-error is true, resolve with trimmed stdout.
+           (if die-on-error-final
+               ;; If die-on-error-final is true, resolve with trimmed stdout.
                (let ((stdout (s-trim (plist-get result-plist :stdout))))
-                 (concur--log :debug "concur:command: Success, resolving with stdout string.")
+                 (concur--log :debug "concur:command: Success, resolving with trimmed stdout string.")
                  stdout)
-             ;; If die-on-error is false, resolve with the full result plist.
+             ;; If die-on-error-final is false, resolve with the full result plist.
              (progn
                (concur--log :debug "concur:command: Success, resolving with full result plist.")
                result-plist))
 
          ;; --- FAILURE CASE (exit code is non-zero) ---
-         (if die-on-error
-             ;; If die-on-error is true, reject with the full result plist.
+         (if die-on-error-final
+             ;; If die-on-error-final is true, reject with the full result plist.
              (progn
-               (concur--log :debug "concur:command: Failure, rejecting with result plist.")
+               (concur--log :debug "concur:command: Failure, rejecting with full result plist.")
                (concur:rejected! result-plist))
-           ;; If die-on-error is false, resolve with the full result plist even on failure.
+           ;; If die-on-error-final is false, resolve with the full result plist even on failure.
            (progn
-             (concur--log :debug "concur:command: Failure, resolving with result plist (:die-on-error is nil).")
+             (concur--log :debug "concur:command: Failure, resolving with full result plist (:die-on-error is nil)." )
              result-plist))))
 
      ;; 3. This `:catch` block only handles true *creation* errors from `concur:process`
-     ;; (e.g., the command executable not found).
+     ;;    (e.g., the command executable not found).
      :catch
      (let ((err-info <!>))
-       (concur--log :error "concur:command: Process creation failed: %S" err-info)
+       (concur--log :error "concur:command: Process creation or unhandled error: %S" err-info)
        ;; Re-reject the promise with the original error information.
        (concur:rejected! err-info)))))
 

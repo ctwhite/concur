@@ -1,4 +1,3 @@
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; concur-promise.el --- Lightweight Promises for async chaining in Emacs -*-
 ;;; lexical-binding: t; -*-
 
@@ -121,7 +120,7 @@
             (if promise-error
                 (when on-rejected (funcall on-rejected promise-error))
               (when on-resolved (funcall on-resolved promise-result))))
-        ('error (message "[concur] Callback failed: %S" err))))))
+        ('error (concur--log :error "[concur] Callback failed: %S" err))))))
 
 (defun concur--settle-promise (promise &optional value error is-cancellation)
   "Internal helper to settle a promise (resolve or reject).
@@ -193,7 +192,7 @@ Handles state setting, callback execution, and unhandled rejection errors."
               result))
         (when timer (cancel-timer timer))
         (concur--destroy-await-latch latch)))))
-        
+
 (defun concur--non-keyword-symbol-p (s)
   "Return non-nil if S is a symbol but not a keyword."
   (and (symbolp s) (not (keywordp s))))
@@ -214,9 +213,13 @@ Handles state setting, callback execution, and unhandled rejection errors."
   (let ((promise (concur:make-promise :cancel-token cancel-token)))
     (concur--log :debug "Executing promise with: %S" executor-fn)
     (condition-case err
-        (funcall executor-fn
-                 (lambda (value) (concur:resolve promise value))
-                 (lambda (error) (concur:reject promise error)))
+        ;; MODIFIED FOR DIAGNOSTICS
+        ;; This uses `lexical-let` to be absolutely certain that the
+        ;; created lambdas form a proper lexical closure over `p`.
+        (lexical-let ((p promise))
+          (funcall executor-fn
+                   (lambda (value) (concur:resolve p value))
+                   (lambda (error) (concur:reject p error))))
       (error
        (concur:reject promise
                       `(:error-type executor-error
@@ -786,6 +789,15 @@ Returns:
       (condition-case nil (macro-function sym) (error nil))
       (memq sym '(lambda defun defmacro let let* progn cond if))))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Chain Macro & Expansion Helpers
+
+(defun concur--special-or-macro-p (sym)
+  "Return non-nil if SYM is a special form or macro."
+  (or (special-form-p sym)
+      (condition-case nil (macro-function sym) (error nil))
+      (memq sym '(lambda defun defmacro let let* progn cond if))))
+
 (defun concur--expand-sugar (steps)
   "Transform sugar keywords in STEPS into canonical `concur:chain` clauses."
   (let ((processed nil) (remaining steps))
@@ -882,6 +894,16 @@ Returns:
       (`(<> . ,rest)
        (concur--expand-chain-steps current-promise rest short-circuit-p))
 
+      ;; NEW: Support direct lambda expressions
+      (`(,(and (pred (lambda (form) (and (listp form) (eq (car form) 'lambda))))
+               lambda-expr) . ,rest)
+       (let ((next-promise `(concur:then
+                             ,current-promise
+                             ,(if short-circuit-p
+                                  `(lambda (<>) (when <> ,lambda-expr))
+                                lambda-expr))))
+         (concur--expand-chain-steps next-promise rest short-circuit-p)))
+
       ;; General shorthand for any form. Any step that is a list but
       ;; doesn't start with a known keyword is treated as a `:then` clause.
       (`(,(and (pred listp) form) . ,rest)
@@ -901,13 +923,38 @@ Returns:
 
 This macro provides a clean, sequential way to define a series of
 asynchronous operations. The resolved value from the previous step
-is available as `<>` in `:then` clauses and other steps. The
+is available as `<>` in `:then` clauses and other forms. The
 rejection reason is available as `<!>` in `:catch` clauses.
 
 (Examples)
+  ;; Example 1: Basic chaining with both lambda and anaphor/form syntax
   (concur:chain (concur:resolved! 5)
-    :then (lambda (v) (* v 10))   ; v is 5, returns 50
-    :then (lambda (v) (message \"Final: %d\" v))) ; v is 50
+    ;; Using a direct lambda expression (NEW)
+    (lambda (v) (* v 10)) ; v is 5, returns 50
+
+    ;; Using an anaphor in a `:then` clause (existing functionality)
+    :then (message \"Current value: %d\" <>) ; <> is 50, displays message
+
+    ;; Using an anaphor in a direct form (existing functionality)
+    (1+ <>) ; <> is 50, returns 51
+
+    ;; Using a lambda expression for final display
+    (lambda (final-value) (message \"Final: %d\" final-value))) ; final-value is 51
+
+  ;; Example 2: Chaining with error handling
+  (concur:chain (concur:rejected! \"Something went wrong!\")
+    (lambda (v) (message \"This won't run: %S\" v)) ; Skipped on rejection
+    :catch (lambda (err) (message \"Caught error: %S\" err)) ; Handles the rejection
+    (message \"After catch, chain continues with new resolved value.\") ; The catch handler resolved the promise
+    (lambda (msg) (upcase msg))) ; msg is the result of the previous step
+
+  ;; Example 3: Mixed bag with :let and sugar forms
+  (concur:chain (concur:resolved! '(1 2 3))
+    :let ((factor 10))
+    (lambda (nums) (--map (* factor it) nums)) ; nums is '(1 2 3), returns '(10 20 30)
+    :log \"Processed list: %S\" ; logs '(10 20 30)
+    (lambda (processed-list) (length processed-list))) ; returns 3
+    :then (message \"List length: %d\" <>)
 
 Arguments:
 - `INITIAL-PROMISE-EXPR` (form): A form that evaluates to a promise.
@@ -920,7 +967,27 @@ Arguments:
 (cl-defmacro concur:chain-when (initial-promise-expr &rest steps)
   "Like `concur:chain` but short-circuits on `nil` resolved values.
 If any step resolves to `nil`, subsequent `:then` clauses and sugar
-forms are skipped. `:catch` and `:finally` clauses are still executed."
+forms are skipped. `:catch` and `:finally` clauses are still executed.
+
+(Examples)
+  ;; Example: Short-circuiting with `concur:chain-when`
+  (concur:chain-when (concur:resolved! 10)
+    (lambda (v) (if (> v 5) v nil)) ; v is 10, returns 10
+    (lambda (v) (message \"Value is %d, chain continues.\" v)) ; v is 10, runs
+    (lambda (v) (if (> v 100) v nil)) ; v is 10, returns nil
+    (message \"This message will NOT appear.\") ; Skipped because previous step returned nil
+    :then (message \"This then clause will NOT run.\")) ; Also skipped
+  ;; => Displays "Value is 10, chain continues."
+
+  (concur:chain-when (concur:resolved! 3)
+    (lambda (v) (if (> v 5) v nil)) ; v is 3, returns nil
+    (message \"This message will NOT appear.\") ; Skipped
+    :then (message \"This then clause will NOT run.\")) ; Skipped
+  ;; No output, as the chain short-circuited early.
+
+Arguments:
+- `INITIAL-PROMISE-EXPR` (form): A form that evaluates to a promise.
+- `STEPS` (forms): A sequence of keywords and associated forms."
   (declare (indent 1))
   (concur--expand-chain-steps
    initial-promise-expr (concur--expand-sugar steps) t))
