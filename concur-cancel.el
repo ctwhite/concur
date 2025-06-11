@@ -16,7 +16,7 @@
 ;; - `concur-cancel-token`: A struct representing a cancel token.
 ;; - `concur:make-cancel-token`: Creates a new, active cancel token.
 ;; - `concur:cancel-token-cancel!`: Signals cancellation for a token.
-;; - `concur:cancel-token-active?`: Checks if a token is still active.
+;; - `concur:cancel-token-active-p`: Checks if a token is still active.
 ;; - `concur:cancel-token-on-cancel`: Registers a callback for cancellation.
 ;; - `concur:cancel-token-unregister`: Cleans up a token and its hooks.
 
@@ -58,7 +58,7 @@ A new `concur-cancel-token` struct, initialized as active."
     token))
 
 ;;;###autoload
-(defun concur:cancel-token-active? (token)
+(defun concur:cancel-token-active-p (token)
   "Check if the cancel TOKEN is still active (not canceled).
 
 Arguments:
@@ -80,7 +80,7 @@ Arguments:
 
 Returns:
 `t` if the token is canceled (task should terminate), `nil` otherwise."
-  (unless (concur:cancel-token-active? token)
+  (unless (concur:cancel-token-active-p token)
     (concur--log :debug "Task canceled via token: %S"
                  (concur-cancel-token-name token))
     t))
@@ -98,7 +98,7 @@ Arguments:
 Returns:
 `t` if the token was successfully canceled, `nil` if it was
 already inactive."
-  (when (concur:cancel-token-active? token)
+  (when (concur:cancel-token-active-p token)
     (concur--log :info "Canceling token: %S" (concur-cancel-token-name token))
     (setf (concur-cancel-token-active token) nil)
 
@@ -131,7 +131,7 @@ Returns:
   (unless (functionp callback)
     (error "Callback must be a function: %S" callback))
 
-  (if (concur:cancel-token-active? token)
+  (if (concur:cancel-token-active-p token)
       ;; Token is active, add the hook if not already present.
       (let ((hooks (ht-get concur--cancel-token-hooks token)))
         (unless (memq callback hooks)

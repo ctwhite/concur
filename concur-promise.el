@@ -53,7 +53,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Constants and Customization
 
-(defcustom concur-throw-on-promise-rejection t
+(defcustom concur-throw-on-promise-rejection nil
   "If non-nil, unhandled rejected promises throw an error."
   :type 'boolean
   :group 'concur)
@@ -70,11 +70,11 @@
     "Represents an asynchronous operation that can resolve or reject."
     (result nil "The success value of the promise once resolved.")
     (error nil "The error reason of the promise once rejected.")
-    (resolved? nil "A flag indicating if the promise has settled." :type boolean)
+    (resolved-p nil "A flag indicating if the promise has settled." :type boolean)
     (callbacks '()
      "A list of `concur-promise-callback-entry' structs." :type list)
     (cancel-token nil "An optional `concur-cancel-token` for cancellation.")
-    (cancelled? nil "A flag indicating if the promise was cancelled." :type boolean)
+    (cancelled-p nil "A flag indicating if the promise was cancelled." :type boolean)
     (proc nil "An associated process, for cancellation.")
     (lock (concur:make-lock) "A mutex to protect the callbacks list.")))
 
@@ -93,7 +93,7 @@
     "Internal latch used by the blocking implementation of `concur:await`."
     (process (start-process (format "await-latch-%s" (random)) nil nil)
              "A dummy background process used for cooperative waiting.")
-    (signaled? nil "A flag to indicate the latch has been released."
+    (signaled-p nil "A flag to indicate the latch has been released."
                :type boolean)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -126,15 +126,15 @@
 (defun concur--settle-promise (promise &optional value error is-cancellation)
   "Internal helper to settle a promise (resolve or reject).
 Handles state setting, callback execution, and unhandled rejection errors."
-  (unless (concur-promise-resolved? promise)
+  (unless (concur-promise-resolved-p promise)
     (concur--log :debug "Settling promise: %S, Value: %S, Error: %S"
                  promise value error)
     ;; 1. Set the final state of the promise.
     (setf (concur-promise-result promise) value)
     (setf (concur-promise-error promise) error)
-    (setf (concur-promise-resolved? promise) t)
+    (setf (concur-promise-resolved-p promise) t)
     (when is-cancellation
-      (setf (concur-promise-cancelled? promise) t))
+      (setf (concur-promise-cancelled-p promise) t))
 
     ;; 2. Execute all pending callbacks synchronously.
     (concur--run-callbacks promise)
@@ -154,7 +154,7 @@ Handles state setting, callback execution, and unhandled rejection errors."
   "Blocking (but cooperative) implementation of `await`."
   (unless (concur-promise-p promise)
     (error "Invalid object passed to concur--await-blocking: %S" promise))
-  (if (concur-promise-resolved? promise)
+  (if (concur-promise-resolved-p promise)
       (if-let ((err (concur:error-value promise)))
           (signal (car err) (cdr err))
         (concur:value promise))
@@ -169,22 +169,22 @@ Handles state setting, callback execution, and unhandled rejection errors."
              ;; on-resolved: capture the result and signal the latch.
              (lambda (value)
                (setq result value)
-               (setf (concur-await-latch-signaled? latch) t))
+               (setf (concur-await-latch-signaled-p latch) t))
              ;; on-rejected: capture the error and signal the latch.
              (lambda (err)
                (setq had-error err)
-               (setf (concur-await-latch-signaled? latch) t)))
+               (setf (concur-await-latch-signaled-p latch) t)))
 
             (when timeout
               (setq timer (run-at-time timeout nil
                                        (lambda ()
-                                         (setf (concur-await-latch-signaled?
+                                         (setf (concur-await-latch-signaled-p
                                                 latch)
                                                'timeout)))))
-            (while (not (concur-await-latch-signaled? latch))
+            (while (not (concur-await-latch-signaled-p latch))
               (accept-process-output (concur-await-latch-process latch) 0.1))
 
-            (when (eq (concur-await-latch-signaled? latch) 'timeout)
+            (when (eq (concur-await-latch-signaled-p latch) 'timeout)
               (concur:cancel promise "Await timed out")
               (error 'concur:timeout-error "Await timed out"))
 
@@ -239,7 +239,7 @@ Handles state setting, callback execution, and unhandled rejection errors."
   "Return a new promise that is already resolved with VALUE."
   (let ((p (concur:make-promise)))
     (setf (concur-promise-result p) value)
-    (setf (concur-promise-resolved? p) t)
+    (setf (concur-promise-resolved-p p) t)
     p))
 
 ;;;###autoload
@@ -247,13 +247,13 @@ Handles state setting, callback execution, and unhandled rejection errors."
   "Return a new promise that is already rejected with ERROR."
   (let ((p (concur:make-promise)))
     (setf (concur-promise-error p) error)
-    (setf (concur-promise-resolved? p) t)
+    (setf (concur-promise-resolved-p p) t)
     p))
 
 ;;;###autoload
 (defun concur:cancel (promise &optional reason)
   "Cancel PROMISE by rejecting it and killing any associated process."
-  (unless (concur-promise-resolved? promise)
+  (unless (concur-promise-resolved-p promise)
     (when-let ((proc (concur-promise-proc promise)))
       (when (process-live-p proc)
         (ignore-errors (kill-process proc))))
@@ -274,8 +274,8 @@ Handles state setting, callback execution, and unhandled rejection errors."
   "Return the current status of PROMISE as a symbol."
   (unless (concur-promise-p promise)
     (error "Invalid promise object: %S" promise))
-  (cond ((not (concur-promise-resolved? promise)) 'pending)
-        ((concur-promise-cancelled? promise) 'cancelled)
+  (cond ((not (concur-promise-resolved-p promise)) 'pending)
+        ((concur-promise-cancelled-p promise) 'cancelled)
         ((concur-promise-error promise) 'rejected)
         (t 'resolved)))
 
@@ -292,7 +292,7 @@ Handles state setting, callback execution, and unhandled rejection errors."
     (concur-promise-error promise)))
 
 ;;;###autoload
-(defun concur:rejected? (promise)
+(defun concur:rejected-p (promise)
   "Return non-nil if PROMISE has been rejected (including cancellation)."
   (memq (concur:status promise) '(rejected cancelled)))
 
@@ -319,7 +319,7 @@ Handles state setting, callback execution, and unhandled rejection errors."
       (concur--log :debug "Attaching callback to: %S" promise)
       (concur--log :debug "  on-resolved: %S" on-resolved)
       (concur--log :debug "  on-rejected: %S" on-rejected)
-      (if (concur-promise-resolved? promise)
+      (if (concur-promise-resolved-p promise)
           (progn
             (concur--log :debug "Promise already settled, firing immediately.")
             (let ((err (concur:error-value promise)))
@@ -337,7 +337,7 @@ Handles state setting, callback execution, and unhandled rejection errors."
   "Unregister a callback from PROMISE using its CALLBACK-ID."
   (concur:with-mutex! (concur-promise-lock promise)
       (:else (error "Impossible state: Contention in unregister-callback"))
-    (unless (concur-promise-resolved? promise)
+    (unless (concur-promise-resolved-p promise)
       (let* ((current (concur-promise-callbacks promise))
              (new (-remove (lambda (cb)
                              (eq (concur-promise-callback-entry-id cb)
@@ -474,14 +474,14 @@ Returns:
           (let ((p (if (concur-promise-p p) p (concur:resolved! p))))
             (concur:then p
                          (lambda (res)
-                           (unless (concur-promise-resolved? done-p)
+                           (unless (concur-promise-resolved-p done-p)
                              (aset results i res)
                              (cl-incf resolved-count)
                              (when (= resolved-count total)
                                (concur:resolve
                                 done-p (cl-coerce results 'list)))))
                          (lambda (err)
-                           (unless (concur-promise-resolved? done-p)
+                           (unless (concur-promise-resolved-p done-p)
                              (concur:reject done-p err)))))))
       done-p)))
 
@@ -499,10 +499,10 @@ Returns:
       (let ((p (if (concur-promise-p p) p (concur:resolved! p))))
         (concur:then p
                      (lambda (res)
-                       (unless (concur-promise-resolved? race-p)
+                       (unless (concur-promise-resolved-p race-p)
                          (concur:resolve race-p res)))
                      (lambda (err)
-                       (unless (concur-promise-resolved? race-p)
+                       (unless (concur-promise-resolved-p race-p)
                          (concur:reject race-p err))))))
     race-p))
 
@@ -528,10 +528,10 @@ Returns:
           (let ((p (if (concur-promise-p p) p (concur:resolved! p))))
             (concur:then p
                          (lambda (res)
-                           (unless (concur-promise-resolved? any-p)
+                           (unless (concur-promise-resolved-p any-p)
                              (concur:resolve any-p res)))
                          (lambda (err)
-                           (unless (concur-promise-resolved? any-p)
+                           (unless (concur-promise-resolved-p any-p)
                              (aset errors i err)
                              (cl-incf rejected-count)
                              (when (= rejected-count total)
@@ -570,9 +570,9 @@ Returns:
           (let ((p (if (concur-promise-p p) p (concur:resolved! p))))
             (concur:finally p
                             (lambda ()
-                              (unless (concur-promise-resolved? all-p)
+                              (unless (concur-promise-resolved-p all-p)
                                 (aset outcomes i
-                                      (if (concur:rejected? p)
+                                      (if (concur:rejected-p p)
                                           `(:status 'rejected
                                             :reason ,(concur:error-value p))
                                         `(:status 'fulfilled
@@ -615,7 +615,7 @@ macro signals the rejection error."
   `(if (and (boundp 'coroutine--current-ctx) coroutine--current-ctx)
        ;; Cooperative, non-blocking await for coroutines.
        (let ((promise ,promise-form))
-         (if (concur-promise-resolved? promise)
+         (if (concur-promise-resolved-p promise)
              (if-let ((err (concur:error-value promise)))
                  (signal (car err) (cdr err))
                (concur:value promise))

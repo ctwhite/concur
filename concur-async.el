@@ -116,7 +116,7 @@ Results:
            ;; The background process needs to load the library to understand promises.
            `(lambda () (require 'concur-promise) (funcall ,task #'identity #'identity))
            (lambda (result)
-             (if (concur:rejected? result)
+             (if (concur:rejected-p result)
                  (funcall reject (concur:error-value result))
                (funcall resolve (concur:value result))))))
         cancel-token))

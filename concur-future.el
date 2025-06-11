@@ -40,6 +40,9 @@
 (require 'concur-promise)
 (require 'concur-core)
 
+;; Forward declarations to satisfy the byte-compiler.
+(declare-function yield--internal-throw-form (value tag))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definition
 
