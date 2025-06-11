@@ -355,36 +355,45 @@ Handles state setting, callback execution, and unhandled rejection errors."
   "Chain a new promise from SOURCE-PROMISE, transforming its result.
 Returns a new promise that settles based on the return value of
 the handler. If a handler returns another promise, the new
-promise will assimilate its state."
-  (let ((next-p (concur:make-promise
-                 :cancel-token (concur-promise-cancel-token source-promise))))
-    (concur:on-resolve
-     source-promise
-     ;; This embeds the handler functions directly into the lambda's body,
-     ;; avoiding (what appears to be) a broken lexical closure mechanism.
-     `(lambda (value)
-        (if ,on-resolved-handler
+promise will assimilate its state.
+
+(Examples)
+  (-> (concur:resolved! 10)
+      (concur:then (lambda (v) (* v 2)))
+      (concur:then (lambda (v) (message \"Result: %d\" v)))) ; => \"Result: 20\"
+
+Arguments:
+- `SOURCE-PROMISE` (concur-promise): The promise to chain from.
+- `ON-RESOLVED-HANDLER` (function): `(lambda (value))` for success.
+- `ON-REJECTED-HANDLER` (function): `(lambda (error))` for failure.
+
+Returns:
+  A new `concur-promise`."
+  (concur:with-executor
+   (lambda (resolve reject)
+     (concur:on-resolve
+      source-promise
+      ;; on-resolved handler
+      (lambda (value)
+        (if on-resolved-handler
             (condition-case err
-                (let ((next-val (funcall ,on-resolved-handler value)))
+                (let ((next-val (funcall on-resolved-handler value)))
                   (if (concur-promise-p next-val)
-                      (concur:then next-val
-                                   (lambda (v) (concur:resolve ,next-p v))
-                                   (lambda (e) (concur:reject ,next-p e)))
-                    (concur:resolve ,next-p next-val)))
-              (error (concur:reject ,next-p err)))
-          (concur:resolve ,next-p value)))
-     `(lambda (error)
-        (if ,on-rejected-handler
+                      (concur:then next-val resolve reject)
+                    (funcall resolve next-val)))
+              (error (funcall reject err)))
+          (funcall resolve value)))
+      ;; on-rejected handler
+      (lambda (error)
+        (if on-rejected-handler
             (condition-case err
-                (let ((next-val (funcall ,on-rejected-handler error)))
+                (let ((next-val (funcall on-rejected-handler error)))
                   (if (concur-promise-p next-val)
-                      (concur:then next-val
-                                   (lambda (v) (concur:resolve ,next-p v))
-                                   (lambda (e) (concur:reject ,next-p e)))
-                    (concur:resolve ,next-p next-val)))
-              (error (concur:reject ,next-p err)))
-          (concur:reject ,next-p error))))
-    next-p))
+                      (concur:then next-val resolve reject)
+                    ;; A catch handler's return value RESOLVES the chain.
+                    (funcall resolve next-val)))
+              (error (funcall reject err)))
+          (funcall reject error)))))))
 
 ;;;###autoload
 (defun concur:catch (promise handler)
@@ -799,7 +808,7 @@ Returns:
   (if (null steps)
       current-promise
     (pcase steps
-      ;; Success handler. The resolved value is available as `<>` in ARG.
+      ;; Success handler.
       (`(:then ,arg . ,rest)
        (let ((next-promise `(concur:then
                              ,current-promise
@@ -808,14 +817,13 @@ Returns:
                                              arg)))))
          (concur--expand-chain-steps next-promise rest short-circuit-p)))
 
-      ;; Error handler. The rejection reason is available as `<!>` in ARG.
+      ;; Error handler.
       (`(:catch ,arg . ,rest)
        (let ((next-promise `(concur:then ,current-promise nil
                                          (lambda (<!>) ,arg))))
          (concur--expand-chain-steps next-promise rest short-circuit-p)))
 
-      ;; Side-effect handler. Runs ARG after settlement, passing through the
-      ;; original result or error.
+      ;; Side-effect handler.
       (`(:finally ,arg . ,rest)
        (let ((next-promise `(concur:then
                              ,current-promise
@@ -824,33 +832,28 @@ Returns:
                                (prog1 (concur:rejected! <!>) ,arg)))))
          (concur--expand-chain-steps next-promise rest short-circuit-p)))
 
-      ;; Lexical bindings. Introduces `let*` bindings for subsequent steps.
+      ;; Lexical bindings.
       (`(:let ,bindings . ,rest)
        `(let* ,bindings
           ,(concur--expand-chain-steps current-promise rest short-circuit-p)))
 
-      ;; Composition. Replaces the current promise with one that waits for all
-      ;; promises in ARG.
+      ;; Composition.
       (`(:all ,arg . ,rest)
        (concur--expand-chain-steps `(concur:all ,arg) rest short-circuit-p))
 
-      ;; Composition. Replaces the current promise with one that settles with
-      ;; the first promise in ARG.
       (`(:race ,arg . ,rest)
        (concur--expand-chain-steps `(concur:race ,arg) rest short-circuit-p))
 
-      ;; Side-effect "tap". Runs ARG with the resolved value `<>` but passes
-      ;; the original value through.
+      ;; Side-effect "tap".
       (`(:tap ,arg . ,rest)
        (let ((next-promise `(concur:tap ,current-promise (lambda (<>) ,arg))))
          (concur--expand-chain-steps next-promise rest short-circuit-p)))
 
-      ;; Handle `<>` as a pass-through (identity) step.
+      ;; Identity step.
       (`(<> . ,rest)
        (concur--expand-chain-steps current-promise rest short-circuit-p))
 
-      ;; General shorthand for any form. Any step that is a list but
-      ;; doesn't start with a known keyword is treated as a `:then` clause.
+      ;; General shorthand form.
       (`(,(and (pred listp) form) . ,rest)
        (let ((next-promise `(concur:then
                              ,current-promise
