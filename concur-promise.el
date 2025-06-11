@@ -379,9 +379,12 @@ Returns:
             (condition-case err
                 (let ((next-val (funcall on-resolved-handler value)))
                   (if (concur-promise-p next-val)
+                      ;; Assimilate the promise returned by the handler.
                       (concur:then next-val resolve reject)
+                    ;; Resolve with the transformed value.
                     (funcall resolve next-val)))
               (error (funcall reject err)))
+          ;; If no handler, pass the original value through.
           (funcall resolve value)))
       ;; on-rejected handler
       (lambda (error)
@@ -389,10 +392,12 @@ Returns:
             (condition-case err
                 (let ((next-val (funcall on-rejected-handler error)))
                   (if (concur-promise-p next-val)
+                      ;; Assimilate the promise returned by the handler.
                       (concur:then next-val resolve reject)
                     ;; A catch handler's return value RESOLVES the chain.
                     (funcall resolve next-val)))
               (error (funcall reject err)))
+          ;; If no handler, pass the original error through.
           (funcall reject error)))))))
 
 ;;;###autoload
@@ -418,10 +423,28 @@ Returns:
 
 ;;;###autoload
 (defun concur:tap (promise callback)
-  "Attach CALLBACK for side effects without altering the promise chain."
-  (concur:on-resolve promise
-                     (lambda (v) (ignore-errors (funcall callback v nil)))
-                     (lambda (e) (ignore-errors (funcall callback nil e)))))
+  "Attach CALLBACK for side effects without altering the promise chain.
+The `CALLBACK` `(lambda (value error))` is called when the promise
+settles. Its return value is ignored, and the original promise's
+settlement value is passed through to the next link in the chain.
+
+Arguments:
+- `PROMISE` (concur-promise): The promise to tap into.
+- `CALLBACK` (function): A `(lambda (value error))` function.
+
+Returns:
+  A new `concur-promise` that resolves or rejects with the
+original promise's value after the callback has been run."
+  (concur:then
+   promise
+   ;; on-resolved: run the side-effect, then pass the original value through.
+   (lambda (value)
+     (ignore-errors (funcall callback value nil))
+     value)
+   ;; on-rejected: also run the side-effect, then re-reject with the original error.
+   (lambda (error)
+     (ignore-errors (funcall callback nil error))
+     (concur:rejected! error))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Promise Composition
@@ -771,15 +794,13 @@ Returns:
         (pcase key
           (:map
            (setq arg1 (pop remaining))
-           (push `(:then (lambda (<>) (--map (let ((it <>)) ,arg1) <>)))
-                 processed))
+           (push `(:then (lambda (<>) (--map (let ((it <>)) ,arg1) <>))) processed))
           (:filter
            (setq arg1 (pop remaining))
-           (push `(:then (lambda (<>) (--filter (let ((it <>)) ,arg1) <>)))
-                 processed))
+           (push `(:then (lambda (<>) (--filter (let ((it <>)) ,arg1) <>))) processed))
           (:each
            (setq arg1 (pop remaining))
-           (push `(:tap (lambda (<>) (--each (let ((it <>)) ,arg1) <>)))
+           (push `(:then (lambda (<>) (prog1 <> (--each (let ((it <>)) ,arg1) <>))))
                  processed))
           (:sleep
            (setq arg1 (pop remaining))
@@ -791,7 +812,7 @@ Returns:
            (let ((fmt (if (and remaining (stringp (car remaining)))
                           (pop remaining)
                         "%S")))
-             (push `(:tap (lambda (<>) (message ,fmt <>))) processed)))
+             (push `(:tap (message ,fmt <>)) processed)))
           (:retry
            (setq arg1 (pop remaining) arg2 (pop remaining))
            (push `(:then (lambda (<>)
@@ -808,7 +829,7 @@ Returns:
   (if (null steps)
       current-promise
     (pcase steps
-      ;; Success handler.
+      ;; Success handler. The resolved value is available as `<>` in ARG.
       (`(:then ,arg . ,rest)
        (let ((next-promise `(concur:then
                              ,current-promise
@@ -817,13 +838,14 @@ Returns:
                                              arg)))))
          (concur--expand-chain-steps next-promise rest short-circuit-p)))
 
-      ;; Error handler.
+      ;; Error handler. The rejection reason is available as `<!>` in ARG.
       (`(:catch ,arg . ,rest)
        (let ((next-promise `(concur:then ,current-promise nil
                                          (lambda (<!>) ,arg))))
          (concur--expand-chain-steps next-promise rest short-circuit-p)))
 
-      ;; Side-effect handler.
+      ;; Side-effect handler. Runs ARG after settlement, passing through the
+      ;; original result or error.
       (`(:finally ,arg . ,rest)
        (let ((next-promise `(concur:then
                              ,current-promise
@@ -832,28 +854,36 @@ Returns:
                                (prog1 (concur:rejected! <!>) ,arg)))))
          (concur--expand-chain-steps next-promise rest short-circuit-p)))
 
-      ;; Lexical bindings.
+      ;; Side-effect "tap".
+      (`(:tap ,arg . ,rest)
+       (let ((next-promise `(concur:tap
+                             ,current-promise
+                             (lambda (<> error)
+                               (declare (ignore error))
+                               ,arg))))
+         (concur--expand-chain-steps next-promise rest short-circuit-p)))
+
+      ;; Lexical bindings. Introduces `let*` bindings for subsequent steps.
       (`(:let ,bindings . ,rest)
        `(let* ,bindings
           ,(concur--expand-chain-steps current-promise rest short-circuit-p)))
 
-      ;; Composition.
+      ;; Composition. Replaces the current promise with one that waits for all
+      ;; promises in ARG.
       (`(:all ,arg . ,rest)
        (concur--expand-chain-steps `(concur:all ,arg) rest short-circuit-p))
 
+      ;; Composition. Replaces the current promise with one that settles with
+      ;; the first promise in ARG.
       (`(:race ,arg . ,rest)
        (concur--expand-chain-steps `(concur:race ,arg) rest short-circuit-p))
 
-      ;; Side-effect "tap".
-      (`(:tap ,arg . ,rest)
-       (let ((next-promise `(concur:tap ,current-promise (lambda (<>) ,arg))))
-         (concur--expand-chain-steps next-promise rest short-circuit-p)))
-
-      ;; Identity step.
+      ;; Handle `<>` as a pass-through (identity) step.
       (`(<> . ,rest)
        (concur--expand-chain-steps current-promise rest short-circuit-p))
 
-      ;; General shorthand form.
+      ;; General shorthand for any form. Any step that is a list but
+      ;; doesn't start with a known keyword is treated as a `:then` clause.
       (`(,(and (pred listp) form) . ,rest)
        (let ((next-promise `(concur:then
                              ,current-promise
