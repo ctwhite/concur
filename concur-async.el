@@ -22,7 +22,8 @@
 ;; -  `concur:let-promise*` & `concur:let-promise`: Async-aware `let` macros
 ;;    for managing multiple concurrent or sequential bindings.
 ;; -  High-level concurrent iterators and composition functions like
-;;    `concur:parallel!`, `concur:coroutine-all`, and `concur:map-pool`.
+;;    `concur:parallel!`, `concur:coroutine-all`, and `concur:map-pool`,
+;;    now with optional semaphore support.
 
 ;;; Code:
 
@@ -223,84 +224,149 @@ Results:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; High-Level Concurrent Operations
 
+;; Internal helper to apply semaphore to a list of tasks
+(defun concur-async--apply-semaphore-to-tasks (tasks semaphore)
+  "Wrap each task in TASKS with semaphore acquisition/release logic.
+  This is used by high-level concurrent operations that accept a `:semaphore`
+  keyword argument."
+  (--map (lambda (task-promise)
+           (concur:chain
+            (concur:semaphore-acquire semaphore)
+            (:then (lambda (_sem-acquired)
+                     task-promise)) ; Pass the original task promise through
+            (:finally (lambda () (concur:semaphore-release semaphore)))))
+         tasks))
+
 ;;;###autoload
-(defun concur:sequence! (items fn)
+(cl-defun concur:sequence! (items fn &key semaphore)
   "Process ITEMS sequentially with async FN.
 
 Each item is processed only after the previous one's promise resolves.
+Optionally, a SEMAPHORE can be provided to limit overall concurrency
+if FN itself triggers concurrent sub-tasks, or if `concur:sequence!`
+is used within a larger parallel context that needs throttling.
 
 Arguments:
 - `ITEMS` (list): The list of items to process.
 - `FN` (function): An async fn `(lambda (item))` that returns a promise.
+- `:semaphore` (`concur-semaphore`, optional): A semaphore to limit
+  the execution of `FN` for each item.
 
 Results:
   A promise that resolves with a list of results, or rejects on first failure."
-  (concur:map-series items fn))
+  (let* ((tasks (--map (funcall fn it) items)))
+    (if semaphore
+        (concur:map-series (concur-async--apply-semaphore-to-tasks tasks semaphore)
+                           #'identity) ; Identity function to just pass through
+      (concur:map-series items fn))))
 
 ;;;###autoload
-(defun concur:parallel! (items fn)
+(cl-defun concur:parallel! (items fn &key semaphore)
   "Process ITEMS in parallel with async FN.
 
 All async operations are started concurrently.
+Optionally, a SEMAPHORE can be provided to limit overall concurrency.
 
 Arguments:
 - `ITEMS` (list): The list of items to process.
 - `FN` (function): An async fn `(lambda (item))` that returns a promise.
+- `:semaphore` (`concur-semaphore`, optional): A semaphore to limit
+  the number of concurrently executing `FN` calls.
 
 Results:
   A promise that resolves with a list of results, or rejects on first failure."
-  (concur:all (--map (funcall fn it) items)))
+  (let* ((tasks (--map (funcall fn it) items)))
+    (if semaphore
+        (concur:all (concur-async--apply-semaphore-to-tasks tasks semaphore))
+      (concur:all tasks))))
 
 ;;;###autoload
-(defmacro concur:race! (&rest forms)
+(cl-defmacro concur:race! (forms &key semaphore)
   "Race multiple async operations (promises).
 
+Optionally, a SEMAPHORE can be provided to limit concurrency
+if the individual forms trigger concurrent sub-tasks.
+
 Arguments:
-- `FORMS`: One or more forms, each evaluating to a promise.
+- `FORMS` (list): A list of forms, each evaluating to a promise.
+- `:semaphore` (`concur-semaphore`, optional): A semaphore to limit
+  the execution of `FORMS`.
 
 Results:
   A promise that settles with the outcome of the first form to settle."
   (declare (indent 0))
-  `(concur:race (list ,@forms)))
+  (let ((form-sym (gensym "form-")))
+    `(let ((,form-sym (list ,@forms))) ; Evaluate forms into a list of promises
+       (if ,semaphore
+           (concur:race (concur-async--apply-semaphore-to-tasks ,form-sym ,semaphore))
+         (concur:race ,form-sym)))))
 
 ;;;###autoload
-(defmacro concur:timeout! (form timeout-seconds)
+(cl-defmacro concur:timeout! (form timeout-seconds &key semaphore)
   "Wrap async operation FORM with a TIMEOUT-SECONDS.
+
+Optionally, a SEMAPHORE can be provided if FORM itself triggers
+concurrent sub-tasks that need throttling. When a semaphore is used,
+it's acquired before the form executes and released regardless of
+timeout or resolution.
 
 Arguments:
 - `FORM`: An expression that evaluates to a promise.
 - `TIMEOUT-SECONDS` (number): The timeout in seconds.
+- `:semaphore` (`concur-semaphore`, optional): A semaphore to limit
+  the execution of `FORM`.
 
 Results:
   A promise that rejects on timeout or settles with FORM's outcome."
   (declare (indent 1))
-  `(concur:timeout ,form ,timeout-seconds))
+  (let ((promise-sym (gensym "promise-")))
+    `(let ((,promise-sym ,form))
+       (if ,semaphore
+           (concur:chain
+            (concur:semaphore-acquire ,semaphore)
+            (:then (lambda (_sem-acquired)
+                     (concur:timeout ,promise-sym ,timeout-seconds)))
+            (:finally (lambda () (concur:semaphore-release ,semaphore))))
+         (concur:timeout ,promise-sym ,timeout-seconds)))))
 
 ;;;###autoload
-(defun concur:coroutine-all (runners)
+(cl-defun concur:coroutine-all (runners &key semaphore)
   "Run a list of coroutine RUNNERS in parallel and wait for all to complete.
+
+Optionally, a SEMAPHORE can be provided to limit overall concurrency.
 
 Arguments:
 - `RUNNERS` (list): A list of coroutine runner functions.
+- `:semaphore` (`concur-semaphore`, optional): A semaphore to limit
+  the number of concurrently executing coroutines.
 
 Results:
   Returns a `concur-promise` that resolves with a list of all results. The
   promise will reject if any of the coroutines reject."
-  (concur:all (-map #'concur:from-coroutine runners)))
+  (let* ((runner-promises (-map #'concur:from-coroutine runners)))
+    (if semaphore
+        (concur:all (concur-async--apply-semaphore-to-tasks runner-promises semaphore))
+      (concur:all runner-promises))))
 
 ;;;###autoload
-(defun concur:coroutine-race (runners)
+(cl-defun concur:coroutine-race (runners &key semaphore)
   "Race a list of coroutine RUNNERS in parallel.
 
 The first coroutine to settle (resolve or reject) determines the outcome
 of the returned promise.
+Optionally, a SEMAPHORE can be provided to limit overall concurrency.
 
 Arguments:
 - `RUNNERS` (list): A list of coroutine runner functions.
+- `:semaphore` (`concur-semaphore`, optional): A semaphore to limit
+  the number of concurrently executing coroutines.
 
 Results:
   Returns a `concur-promise` that settles with the first coroutine to settle."
-  (concur:race (-map #'concur:from-coroutine runners)))
+  (let* ((runner-promises (-map #'concur:from-coroutine runners)))
+    (if semaphore
+        (concur:race (concur-async--apply-semaphore-to-tasks runner-promises semaphore))
+      (concur:race runner-promises))))
 
 ;;;###autoload
 (cl-defun concur:map-pool (items fn &key (size 4))
@@ -308,6 +374,8 @@ Results:
 
 This function creates a pool of coroutines to process items in parallel,
 but limits the number of concurrently running coroutines.
+Note: This function has its own internal concurrency limit (`:size`),
+so an external semaphore is typically not needed or recommended.
 
 Arguments:
 - `ITEMS` (list): The list of items to process.
