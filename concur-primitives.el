@@ -65,10 +65,15 @@ The result of BODY or FALLBACK."
 
 (eval-and-compile
   (cl-defstruct (concur-lock (:constructor %%make-lock))
-    "A simple mutual exclusion lock (mutex)."
-    (locked-p nil "A flag indicating if the lock is held." :type boolean)
-    (owner nil "The entity that currently holds the lock.")
-    (name nil "A descriptive name for the lock, for debugging.")))
+    "A simple mutual exclusion lock (mutex).
+
+Fields:
+- `locked-p` (boolean): A flag indicating if the lock is held.
+- `owner` (any): The entity that currently holds the lock.
+- `name` (string): A descriptive name for the lock, for debugging."
+    (locked-p nil :type boolean)
+    (owner nil)
+    (name nil)))
 
 ;;;###autoload
 (defun concur:make-lock (&optional name)
@@ -188,11 +193,12 @@ The result of BODY or FALLBACK."
           &key timeout interval meta error-function timeout-callback
           (start-time (float-time)))
   "Block cooperatively until TEST returns non-nil, then run SUCCESS-CALLBACK.
-This function does not block Emacs's main thread. Instead, it
-uses a timer to periodically re-check the `TEST` function.
+This function does not block Emacs's main thread. Instead, it uses a timer to
+periodically re-check the `TEST` function.
 
 Arguments:
-- `TEST` (function): A zero-argument function. Blocking stops when it returns non-nil.
+- `TEST` (function): A zero-argument function. Blocking stops when it returns
+  non-nil.
 - `SUCCESS-CALLBACK` (function): A zero-argument function called upon success.
 - `:timeout` (float, optional): Maximum seconds to wait.
 - `:interval` (float, optional): Seconds between checks. Defaults to 0.1.
@@ -232,11 +238,17 @@ Returns:
 
 (eval-and-compile
   (cl-defstruct (concur-semaphore (:constructor %%make-semaphore))
-    "A semaphore object for controlling concurrent access."
-    (count 0 "The current number of available slots." :type integer)
-    (max-count 0 "The maximum number of available slots." :type integer)
-    (lock (concur:make-lock) "A mutex to protect internal state." :type t)
-    (name nil "A descriptive name for debugging.")))
+    "A semaphore object for controlling concurrent access.
+
+Fields:
+- `count` (integer): The current number of available slots.
+- `max-count` (integer): The maximum number of available slots.
+- `lock` (concur-lock): A mutex to protect internal state.
+- `name` (string): A descriptive name for debugging."
+    (count 0 :type integer)
+    (max-count 0 :type integer)
+    (lock nil :type concur-lock) ;; Will be initialized in make-semaphore
+    (name nil)))
 
 ;;;###autoload
 (defun concur:make-semaphore (n &optional name)

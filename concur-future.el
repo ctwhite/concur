@@ -99,7 +99,7 @@ invalid or `nil`, this function returns `nil`."
             (concur:with-executor
              (lambda (resolve reject)
                (condition-case err
-                   (funcall (concur-future-thunk future))
+                   (funcall resolve (funcall (concur-future-thunk future))) ;; Explicitly resolve on success
                  (error (funcall reject err)))))))
     (concur-future-promise future)))
 
