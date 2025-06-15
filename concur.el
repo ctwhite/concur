@@ -37,9 +37,12 @@
 (defconst concur-version "1.0.0"
   "The version number of the concur.el library.")
 
-;; Load the core components in a logical order. `concur-core` provides
-;; foundational definitions and must be loaded first.
-(require 'concur-core)
+;;;###autoload
+(defgroup concur nil
+  "Asynchronous programming library for Emacs."
+  :group 'lisp)
+
+(require 'concur-hooks)
 
 ;; Load the main building blocks of the library.
 (require 'concur-promise)
