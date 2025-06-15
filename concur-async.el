@@ -112,82 +112,66 @@ Returns:
 A `concur-promise` that will resolve with the result of FN, or reject if FN
 fails or is cancelled."
   (let* ((label (or name (format "async-%S" (sxhash fn))))
-         ;; This `let` binding establishes the async stack frame for this task.
-         ;; `concur:reject` will automatically capture this dynamic variable.
          (concur--current-async-stack (cons label concur--current-async-stack)))
-
-    ;; This wrapper encapsulates the core execution and error handling logic.
     (let ((task-wrapper
            (lambda (resolve-fn reject-fn)
              (concur-async--run-hooks :started label (concur:make-promise))
              (condition-case err
-                 ;; Try to execute the user's function.
                  (let ((result (funcall fn)))
                    (concur-async--run-hooks :succeeded label (concur:resolved! result))
                    (funcall resolve-fn result))
-               ;; If any Lisp error occurs, catch it.
                (error
                 (let ((err-cond `(concur-async-error :original-error ,err)))
                   (concur-async--run-hooks :failed label (concur:rejected! err-cond) err-cond)
                   (funcall reject-fn err-cond)))))))
 
+      ;; CORRECTION: Restructure pcase to robustly handle the 'nil' case.
       (pcase mode
-        ;; --- Deferred / Delayed Execution via Timer ---
-        ((or nil t 'deferred (pred numberp))
+        ;; Case 1: Deferred execution (the default).
+        ((or 'deferred 't (pred null))
          (concur:with-executor
              (lambda (resolve reject)
-               (run-at-time (if (numberp mode) mode 0) nil
-                            (lambda () (funcall task-wrapper resolve reject))))
+               (run-at-time 0 nil (lambda () (funcall task-wrapper resolve reject))))
            cancel-token))
 
-        ;; --- OS-level Process Execution ---
+        ;; Case 2: Delayed execution.
+        ((pred numberp)
+         (concur:with-executor
+             (lambda (resolve reject)
+               (run-at-time mode nil (lambda () (funcall task-wrapper resolve reject))))
+           cancel-token))
+
+        ;; Case 3: OS-level Process Execution.
         ('async
          (concur:from-callback
           (lambda (cb)
-            (async-start
-             ;; The code to be executed in the async process. We pass a
-             ;; wrapper that returns either the value or the error condition.
-             `(lambda ()
-                (let ((concur--current-async-stack '(,label)))
-                  (condition-case err (funcall ,fn) (error err))))
-             cb))))
+            (async-start `(lambda () (funcall ,task-wrapper #'identity #'identity)) cb))))
 
-        ;; --- Native Emacs Thread Execution ---
+        ;; Case 4: Native Emacs Thread Execution.
         ('thread
          (concur:with-executor
              (lambda (resolve reject)
-               (let ((mailbox (list nil))
-                     (timer nil)
-                     ;; Capture the stack to pass into the thread, as threads
-                     ;; do not inherit dynamic bindings.
-                     (captured-stack concur--current-async-stack))
-                 ;; 1. The worker thread runs the user's function and places
-                 ;;    the result into the shared mailbox.
+               (let ((mailbox (list nil)) timer)
                  (make-thread
                   (lambda ()
-                    ;; Re-establish the dynamic binding inside the thread.
-                    (let ((concur--current-async-stack captured-stack))
-                      (condition-case err
-                          (setcar mailbox (cons :success (funcall fn)))
-                        (error (setcar mailbox (cons :failure err))))))
+                    (condition-case err
+                        (setcar mailbox (cons :success (funcall fn)))
+                      (error (setcar mailbox (cons :failure err)))))
                   (format "concur-thread-%s" label))
-                 ;; 2. The poller runs on the main thread, checking the mailbox.
                  (setq timer
-                       (run-with-timer
-                        0.01 0.01
+                       (run-with-timer 0.01 0.01
                         (lambda ()
                           (when-let ((result (car mailbox)))
                             (cancel-timer timer)
                             (pcase result
                               (`(:success . ,val) (funcall resolve val))
                               (`(:failure . ,err)
-                               (funcall reject
-                                        `(concur-async-error :original-error ,err))))))))))
+                               (funcall reject `(concur-async-error :original-error ,err))))))))))
            cancel-token))
 
-        ;; --- Unknown Mode ---
+        ;; Case 5: Unknown mode.
         (_ (concur:rejected! `(concur-async-error "Unknown async mode" ,mode)))))))
-        
+                
 ;;;###autoload
 (defun concur:deferred! (fn &optional name cancel-token)
   "Run FN asynchronously in a deferred manner and return a `concur-promise`.
@@ -307,6 +291,39 @@ A promise that resolves with a list of results, or rejects on first failure."
     (if semaphore
         (concur:all (concur-async--apply-semaphore-to-tasks tasks semaphore))
       (concur:all tasks))))
+
+;;;###autoload
+(defmacro concur:race! (&rest forms)
+  "Race multiple asynchronous operations and settle with the first to finish.
+
+Arguments:
+- FORMS: A sequence of forms, each evaluating to a `concur-promise` or
+  `concur-future`.
+- :SEMAPHORE (`concur-semaphore`, optional): A keyword argument specifying
+  a semaphore to apply to each operation for throttling purposes.
+
+Returns:
+A `concur-promise` that settles with the value or error of the first
+form to complete."
+  (declare (indent 0) (debug t))
+  ;; --- Manually parse keyword arguments from the &rest list ---
+  (let* ((semaphore-keyword-pos (cl-position :semaphore forms))
+         (task-forms (if semaphore-keyword-pos
+                         (cl-subseq forms 0 semaphore-keyword-pos)
+                       forms))
+         (semaphore-form (if semaphore-keyword-pos
+                             (nth (1+ semaphore-keyword-pos) forms)
+                           nil)))
+
+    ;; --- Generate the simplified runtime code ---
+    `(let* ((awaitables-list (list ,@task-forms))
+            (semaphore ,semaphore-form))
+       ;; The low-level `concur:race` will handle normalizing any futures
+       ;; in the list into promises automatically.
+       (if semaphore
+           (concur:race
+            (concur-async--apply-semaphore-to-tasks awaitables-list semaphore))
+         (concur:race awaitables-list)))))
 
 ;;;###autoload
 (defun concur:coroutine-all (runners &key semaphore)

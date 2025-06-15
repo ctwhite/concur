@@ -128,12 +128,10 @@ Errors:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Future Chaining & Composition
 
-;;;###autoload
 (defun concur:map-future (future transform-fn)
   "Apply TRANSFORM-FN to the result of a future, creating a new future.
-This is the `then` equivalent for futures. When the new future is forced, it
-first forces the original `FUTURE`. Once the original future resolves,
-`TRANSFORM-FN` is applied to its result.
+When the new future is forced, it first forces the original `FUTURE`.
+Once the original future resolves, `TRANSFORM-FN` is applied to its result.
 
 Arguments:
 - FUTURE (`concur-future`): The original future object.
@@ -144,7 +142,9 @@ Returns:
 A new `concur-future` representing the transformed computation."
   (concur:make-future
    (lambda ()
-     (concur:then (concur:force future) transform-fn))))
+     (concur:then (concur:force future)
+                  (lambda (value)
+                    (funcall transform-fn value))))))
 
 ;;;###autoload
 (defun concur:then-future (future callback-fn)
@@ -162,21 +162,24 @@ A new `concur-future`."
 ;;;###autoload
 (defun concur:catch-future (future error-handler-fn)
   "Attach an error handler to a future.
-Creates a new future that, when forced, will execute the original `FUTURE`.
-If the original future rejects, `ERROR-HANDLER-FN` is called with the error.
-The return value of the handler can resolve the new future, allowing for
-error recovery in a chain.
+
+Creates a new future that, when forced, will execute the original
+`FUTURE`. If the original future rejects, `ERROR-HANDLER-FN` is
+called with the error. The return value of the handler resolves
+the new future, allowing for recovery.
 
 Arguments:
-- FUTURE (`concur-future`): The original future object.
-- ERROR-HANDLER-FN (function): A function `(lambda (error))` to call
+- `FUTURE` (concur-future): The original future object.
+- `ERROR-HANDLER-FN` (function): A function `(lambda (error))` to call
   if the original future rejects.
 
 Returns:
 A new `concur-future` with error handling."
   (concur:make-future
    (lambda ()
-     (concur:catch (concur:force future) error-handler-fn))))
+     (concur:catch (concur:force future)
+                   (lambda (err)
+                     (funcall error-handler-fn err))))))
 
 ;;;###autoload
 (defun concur:all-futures (futures)
@@ -217,6 +220,15 @@ A new, evaluated `concur-future`."
   (unless (concur-promise-p promise)
     (error "Argument must be a concur-promise object, got %S" promise))
   (%%make-future :promise promise :evaluated? t))
+
+;; --- Plug into the core promise system ---
+;; Set the normalizer hook so that core functions like `concur:then`
+;; can transparently accept futures.
+(setq concur--normalize-awaitable-fn
+      (lambda (awaitable)
+        (if (concur-future-p awaitable)
+            (concur:force awaitable)
+          awaitable)))
 
 (provide 'concur-future)
 ;;; concur-future.el ends here
