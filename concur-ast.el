@@ -445,7 +445,7 @@
              (pcase-let ((`(,test . ,body) clause))
                (concur-ast--analyze-form-recursively ast-ctx test)
                (concur-ast--analyze-body-sequence ast-ctx body)))
-    form))
+    form)
 
   (defun concur-ast--analyze-condition-case (ast-ctx form)
     "Traverses a `condition-case` form for analysis.
@@ -606,7 +606,7 @@
         initial-param-alist additional-capture-vars env))
       ;; --- CASE 4: Unhandled form ---
       (_ (error "concur-ast: Expected a lambda or function symbol, got %S"
-                expanded-callable-form))))
+                expanded-callable-form)))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Public API - Top-level Analysis Functions
