@@ -48,6 +48,7 @@
 (require 'concur-promise)
 (require 'concur-future)
 (require 'concur-cancel)
+(require 'concur-ast)
 
 ;; Load lower-level and higher-level utilities.
 (require 'concur-primitives)

@@ -14,6 +14,9 @@
 (require 'dash)
 (require 'concur-promise-core)
 (require 'concur-promise-chain)
+(require 'concur-ast)
+
+(declare-function concur-ast-analysis "concur-ast")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API - Combinators
@@ -129,45 +132,88 @@ resolve. If all reject, it rejects with an `aggregate-error` condition."
                                      ,(cl-coerce errors 'list)))))))))))
       any-promise)))
 
-(defun concur:all-settled (promises-list)
-  "Return a promise that resolves after all promises in PROMISES-LIST settle.
+;;;###autoload
+(cl-defmacro concur:all-settled (promises-list-form) ; <-- Change from promises-list to promises-list-form
+  "Return a promise that resolves after all promises in PROMISES-LIST-FORM settle.
 The returned promise *always* resolves with a list of status objects and
 never rejects. This is useful when you need to know the outcome of every
 promise, regardless of success or failure.
 
 Arguments:
-- PROMISES-LIST (list): A list of promises or plain values.
+- PROMISES-LIST-FORM (form): A form that evaluates to a list of promises or plain values.
 
 Returns:
 A `concur-promise` that resolves to a list of status plists.
 Each plist has a `:status` key (`'fulfilled` or `'rejected`), and either a
 `:value` key or a `:reason` key."
-  (if (null promises-list) (concur:resolved! '())
-    (let* ((total (length promises-list))
-           (outcomes (make-vector total nil))
-           (aggregate-promise (concur:make-promise))
-           (settled-count 0)
-           (lock (concur:make-lock)))
-      (--each-indexed
-       promises-list
-       (lambda (i p)
-         (let ((promise (if (concur-promise-p p) p (concur:resolved! p))))
-           (concur:finally
-            promise
-            (lambda ()
-              (concur:with-mutex! lock
-                (unless (concur-promise-resolved-p aggregate-promise)
-                  (aset outcomes i
-                        (if (concur:rejected-p promise)
-                            `(:status 'rejected
-                              :reason ,(concur:error-value promise))
-                          `(:status 'fulfilled
-                            :value ,(concur:value promise))))
-                  (cl-incf settled-count)
-                  (when (= settled-count total)
-                    (concur:resolve aggregate-promise
-                                    (cl-coerce outcomes 'list))))))))))
-      aggregate-promise)))
+  (declare (indent 1) (debug t)) ; Added declare for macro
+  `(let* ((_promises-list ,promises-list-form)) ; <-- Evaluate the form at runtime
+     (if (null _promises-list) (concur:resolved! '())
+       (let* ((total (length _promises-list)) ; <-- Operate on the evaluated list
+              (outcomes (make-vector total nil))
+              (aggregate-promise (concur:make-promise))
+              (settled-count 0)
+              (lock (concur:make-lock)))
+         (--each-indexed
+          _promises-list ; <-- Operate on the evaluated list
+          (lambda (i p)
+            (let ((promise (if (concur-promise-p p) p (concur:resolved! p))))
+              (concur:finally
+               promise
+               (lambda ()
+                 (concur:with-mutex! lock
+                   (unless (concur-promise-resolved-p aggregate-promise)
+                     (aset outcomes i
+                           (if (concur:rejected-p promise)
+                               `(:status 'rejected
+                                 :reason ,(concur:error-value promise))
+                             `(:status 'fulfilled
+                               :value ,(concur:value promise))))
+                   (cl-incf settled-count)
+                   (when (= settled-count total)
+                     (concur:resolve aggregate-promise
+                                     (cl-coerce outcomes 'list))))))))))
+         aggregate-promise))))
+         
+;; (defun concur:all-settled (promises-list)
+;;   "Return a promise that resolves after all promises in PROMISES-LIST settle.
+;; The returned promise *always* resolves with a list of status objects and
+;; never rejects. This is useful when you need to know the outcome of every
+;; promise, regardless of success or failure.
+
+;; Arguments:
+;; - PROMISES-LIST (list): A list of promises or plain values.
+
+;; Returns:
+;; A `concur-promise` that resolves to a list of status plists.
+;; Each plist has a `:status` key (`'fulfilled` or `'rejected`), and either a
+;; `:value` key or a `:reason` key."
+;;   (if (null promises-list) (concur:resolved! '())
+;;     (let* ((total (length promises-list))
+;;            (outcomes (make-vector total nil))
+;;            (aggregate-promise (concur:make-promise))
+;;            (settled-count 0)
+;;            (lock (concur:make-lock)))
+;;       (--each-indexed
+;;        promises-list
+;;        (lambda (i p)
+;;          (let ((promise (if (concur-promise-p p) p (concur:resolved! p))))
+;;            (concur:finally
+;;             promise
+;;             (lambda ()
+;;               (concur:with-mutex! lock
+;;                 (unless (concur-promise-resolved-p aggregate-promise)
+;;                   (aset outcomes i
+;;                         (if (concur:rejected-p promise)
+;;                             `(:status 'rejected
+;;                               :reason ,(concur:error-value promise))
+;;                           `(:status 'fulfilled
+;;                             :value ,(concur:value promise))))
+;;                   (cl-incf settled-count)
+;;                   (when (= settled-count total)
+;;                     (concur:resolve aggregate-promise
+;;                                     (cl-coerce outcomes 'list))))))))))
+;;       aggregate-promise)))
 
 (defun concur:map-series (items fn)
   "Process ITEMS sequentially with an asynchronous function FN.

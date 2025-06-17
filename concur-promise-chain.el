@@ -20,121 +20,101 @@
 (require 'concur-hooks)
 (require 'concur-ast)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Internal Helpers - Compile-Time Macro Logic
-
-;; These helpers are called by the macros during compilation. They must be
-;; defined within `eval-and-compile` to be available to the byte-compiler.
+;; All of these functions are helpers for macros and need to be available
+;; to the byte-compiler.
 (eval-and-compile
   (require 'concur-ast)
 
-  (defun concur--process-handler (handler-form handler-type initial-param-bindings)
-    "Process a handler form (lambda or function symbol) at macro-expansion time.
-This function is the bridge to the AST lifter. It takes a handler form,
-analyzes it, and returns a new form ready for inclusion in a macro expansion.
+  (defun concur--safe-ht-get (hash-table key &optional default)
+    "Safely get `KEY` from `HASH-TABLE`, returning `DEFAULT` if not a hash
+    table or key not found.
 
-Arguments:
-- HANDLER-FORM: The user-provided Lisp form, e.g., `(lambda (v) v)`.
-- HANDLER-TYPE: A string describing the handler type, for logging.
-- INITIAL-PARAM-BINDINGS: An alist mapping parameter symbols to themselves,
-  to prevent the AST lifter from treating them as free variables.
+    Arguments:
+    - `hash-table`: The hash table to query.
+    - `key`: The key to look up.
+    - `default`: (optional) The value to return if `hash-table` is not a hash
+      table or `key` is not found.
 
-Returns:
-A cons cell `(LIFTED-LAMBDA . FREE-VARS-LIST)`."
-    (pcase handler-form
-      ;; Case 1: A raw lambda form. Lift its free variables.
-      (`(lambda . ,_)
-       (concur-ast-lift-lambda-form handler-form initial-param-bindings))
-      ;; Case 2: A function symbol reference like #'foo. Wrap it in a lambda.
-      (`(function ,sym)
-       (let* ((arg-names (mapcar #'car initial-param-bindings))
-              (extra-data-sym (gensym "extra-data")))
-         (list `(lambda (,@arg-names ,extra-data-sym)
-                  (funcall #',sym ,@arg-names))
-               nil)))
-      ;; Case 3: A `nil` handler. Substitute a default implementation.
-      ('nil
-       (list (if (string= handler-type "resolved")
-                 '(lambda (val extra-data) val)
-               '(lambda (err extra-data) (concur:rejected! err)))
-             nil))
-      ;; Case 4: A quoted form like '(lambda ...). Process the quoted content.
-      (`(quote ,quoted-form)
-       (concur--process-handler quoted-form handler-type initial-param-bindings))
-      (_ (error "concur:%s: Invalid handler form: %S" handler-type handler-form))))
+    Returns:
+    The value associated with `key`, or `DEFAULT`."
+    (if (hash-table-p hash-table)
+        (gethash key hash-table default)
+      default))
 
-  (defun concur--process-callback (callback-form cb-type initial-param-bindings)
-    "Process a general callback form for `finally` and `tap`.
-This is a wrapper around `concur--process-handler`.
+  (defun concur--prepare-then-macro-data (on-resolved-form on-rejected-form env)
+    "Prepare data for `concur:then` using the read-only AST analyzer.
 
-Arguments:
-- CALLBACK-FORM: The user-provided Lisp form.
-- CB-TYPE: A string describing the callback type, for logging.
-- INITIAL-PARAM-BINDINGS: An alist of parameter symbols.
+    This function orchestrates the analysis of resolved and rejected handler
+    forms, identifies their free variables, and prepares the necessary code
+    to capture these variables into a runtime context hash table.
 
-Returns:
-A cons cell `(LIFTED-LAMBDA . FREE-VARS-LIST)`."
-    (pcase callback-form
-      (`(lambda . ,_)
-       (concur-ast-lift-lambda-form callback-form initial-param-bindings))
-      (`(function ,sym)
-       (let* ((arg-names (mapcar #'car initial-param-bindings))
-              (extra-data-sym (gensym "extra-data")))
-         (list `(lambda (,@arg-names ,extra-data-sym) (funcall #',sym ,@arg-names))
-               nil)))
-      ('nil (list '(lambda (&rest _args) nil) nil))
-      (`(quote ,quoted-form)
-       (concur--process-callback quoted-form cb-type initial-param-bindings))
-      (_ (error "concur:%s: Invalid callback form: %S" cb-type callback-form))))
+    Arguments:
+    - `on-resolved-form`: The user-provided form for the resolved handler.
+      Defaults to `(lambda (val) val)`.
+    - `on-rejected-form`: The user-provided form for the rejected handler.
+      Defaults to `(lambda (err) (concur:rejected! err))`.
+    - `env`: The lexical environment captured by the calling macro, used
+      for `macroexpand-all`.
 
-  (defun concur--prepare-handler-params (handler-form default-form handler-type)
-    "Prepare a handler at macro-expansion time, parsing params and lifting.
-Arguments:
-- HANDLER-FORM: The user-provided Lisp form, e.g., `(lambda (v) v)`.
-- DEFAULT-FORM: The default lambda to use if HANDLER-FORM is nil.
-- HANDLER-TYPE: A string (e.g., \"resolved\") for logging and errors.
-Returns:
-A plist with keys `:lifted-form` and `:captured-vars`."
-    (let* ((final-form (or handler-form default-form))
-           (params (if (and (consp final-form) (eq (car final-form) 'lambda))
-                       (cadr final-form) nil))
-           (param-names (if (listp params) params (if params (list params) nil)))
-           (param-alist (mapcar (lambda (p) (cons p p)) param-names))
-           (handler-info (concur--process-handler final-form handler-type param-alist))
-           (lifted-form (car handler-info))
-           (captured-vars (cdr handler-info)))
-      (list :lifted-form lifted-form :captured-vars captured-vars)))
+    Returns:
+    A plist containing:
+    - `:source-promise-sym`: A generated symbol for the source promise.
+    - `:new-promise-sym`: A generated symbol for the new promise created by `concur:then`.
+    - `:original-resolved-lambda`: The expanded resolved handler lambda.
+    - `:resolved-vars`: A list of original symbols identified as free variables
+      in the resolved handler.
+    - `:original-rejected-lambda`: The expanded rejected handler lambda.
+    - `:rejected-vars`: A list of original symbols identified as free variables
+      in the rejected handler.
+    - `:captured-vars-form`: The Lisp code (a `let` block) to create and populate
+      a hash table with the values of all combined free variables."
+    (-let* ((source-promise-sym (gensym "source-promise"))
+            (new-promise-sym (gensym "new-promise"))
 
-  (defun concur--prepare-then-macro-data (on-resolved-form on-rejected-form)
-    "Prepare all data needed for the `concur:then` macro expansion.
-Arguments:
-- ON-RESOLVED-FORM: The user-provided form for the resolved handler.
-- ON-REJECTED-FORM: The user-provided form for the rejected handler.
-Returns:
-A plist containing all necessary symbols and forms for the macro."
-    (let* ((source-promise-sym (gensym "source-promise"))
-           (new-promise-sym (gensym "new-promise"))
-           (resolved-data
-            (concur--prepare-handler-params on-resolved-form
-                                            '(lambda (val) val) "resolved"))
-           (rejected-data
-            (concur--prepare-handler-params on-rejected-form
-                                            '(lambda (err) (concur:rejected! err)) "rejected"))
-           (lifted-resolved-form (plist-get resolved-data :lifted-form))
-           (resolved-vars (plist-get resolved-data :captured-vars))
-           (lifted-rejected-form (plist-get rejected-data :lifted-form))
-           (rejected-vars (plist-get rejected-data :captured-vars))
-           (captured-vars-form
-            (let ((all-vars (cl-delete-duplicates (append resolved-vars rejected-vars))))
-              `(list ,@(mapcar (lambda (v) `(cons ',v ,v)) all-vars)))))
+            ;; Analyze the resolved handler using the centralized AST analysis function.
+            (resolved-analysis (concur-ast-analysis
+                                (or on-resolved-form '(lambda (val) val))
+                                env))
+
+            ;; Analyze the rejected handler using the centralized AST analysis function.
+            (rejected-analysis (concur-ast-analysis
+                                (or on-rejected-form '(lambda (err) (concur:rejected! err)))
+                                env))
+
+            ;; Combine all free variables from both handlers.
+            (all-vars (cl-delete-duplicates
+                       (append (concur-ast-analysis-result-free-vars-list resolved-analysis)
+                               (concur-ast-analysis-result-free-vars-list rejected-analysis))))
+
+            ;; Generate the Lisp code for the context hash table from all combined free variables.
+            (captured-vars-form (concur-ast-make-captured-vars-form all-vars)))
+
+    ;; ADD THIS LOG HERE:
+    (message "DEBUG: resolved-analysis: %S (type %S), rejected-analysis: %S (type %S)"
+             resolved-analysis (type-of resolved-analysis)
+             rejected-analysis (type-of rejected-analysis))
+             
+      ;; Return all the pieces the macro needs to build the final code.
       `(:source-promise-sym ,source-promise-sym
         :new-promise-sym ,new-promise-sym
-        :lifted-resolved-fn ,lifted-resolved-form
-        :lifted-rejected-fn ,lifted-rejected-form
+        :original-resolved-lambda
+        ,(concur-ast-analysis-result-expanded-callable-form resolved-analysis)
+        :resolved-vars
+        ,(concur-ast-analysis-result-free-vars-list resolved-analysis)
+        :original-rejected-lambda
+        ,(concur-ast-analysis-result-expanded-callable-form rejected-analysis)
+        :rejected-vars
+        ,(concur-ast-analysis-result-free-vars-list rejected-analysis)
         :captured-vars-form ,captured-vars-form)))
 
   (defun concur--expand-sugar (steps)
-    "Transform sugar keywords in `concur:chain` STEPS into canonical clauses."
+    "Transform sugar keywords in `concur:chain` `STEPS` into canonical clauses.
+
+    Arguments:
+    - `steps`: A list of step clauses from `concur:chain`.
+
+    Returns:
+    A list of canonical `concur:then`, `concur:catch`, etc., clauses."
     (let ((processed nil)
           (remaining steps))
       (while remaining
@@ -168,42 +148,32 @@ A plist containing all necessary symbols and forms for the macro."
       (nreverse processed)))
 
   (defun concur--chain-process-single-step-form (current-form step when-p prefix)
-    "Helper to expand a single step in a `concur:chain` or `chain-when`."
-    (let ((step-name (if (listp step) (car step) 'lambda)))
+    "Helper to expand a single step in a `concur:chain` or `concur:chain-when`.
+
+    Arguments:
+    - `current-form`: The promise form representing the current state of the chain.
+    - `step`: A single step clause (e.g., `(:then handler)`, `(expression)`).
+    - `when-p`: Non-nil if this is a `concur:chain-when` context (skips `:then` on `nil`).
+    - `prefix`: A string prefix for error messages, indicating the macro context.
+
+    Returns:
+    The expanded Lisp form for this step."
+    (let* ((anaphoric-lambda
+            (lambda (handler-body)
+              (let ((lambda-body `(let ((<> <>)) ,handler-body)))
+                `(lambda (<>) ,(if when-p `(when <> ,lambda-body) lambda-body))))))
       (pcase step
-        (`(:then ,arg)
-         (let ((val (gensym "val-")))
-           `(concur:then ,current-form
-                         (lambda (,val)
-                           (let ((<> ,val))
-                             (if ,when-p (when <> ,arg) ,arg))))))
-        (`(:catch ,arg)
-         (let ((err (gensym "err-")))
-           `(concur:then ,current-form nil
-                         (lambda (,err) (let ((<!> ,err)) ,arg)))))
-        (`(:finally ,arg)
-         `(concur:finally ,current-form (lambda () ,arg)))
-        (`(:tap ,arg)
-         (let ((val (gensym "val-")) (err (gensym "err-")))
-           `(concur:tap ,current-form
-                        (lambda (,val ,err)
-                          (let ((<> ,val) (<!> ,err))
-                            (if ,when-p (when <> ,arg) ,arg))))))
-        (`(:all ,arg) `(concur:all ,arg))
-        (`(:race ,arg) `(concur:race ,arg))
-        (`(<>))
+        ;; Explicit clauses like :then, :catch just pass through.
+        (`(:then ,handler)     `(concur:then ,current-form ,handler))
+        (`(:catch ,handler)    `(concur:catch ,current-form ,handler))
+        (`(:finally ,handler)  `(concur:finally ,current-form ,handler))
+        (`(:tap ,handler)      `(concur:tap ,current-form ,handler))
+        (`(:all ,promises)     `(concur:all ,promises))
+        (`(:race ,promises)    `(concur:race ,promises))
+
+        ;; This handles implicit :then steps, e.g., `(message "%s" <>)`
         (_ (if (listp step)
-               (let ((val (gensym "val-")))
-                 (if (eq (car step) 'lambda)
-                     (if when-p
-                         `(concur:then ,current-form
-                                       (lambda (,val) (when ,val (funcall ,step ,val))))
-                       `(concur:then ,current-form ,step))
-                   (if when-p
-                       `(concur:then ,current-form
-                                     (lambda (,val) (let ((<> ,val)) (when <> ,step))))
-                     `(concur:then ,current-form
-                                   (lambda (,val) (let ((<> ,val)) ,step))))))
+               `(concur:then ,current-form ,(funcall anaphoric-lambda step))
              (error "%sInvalid concur:chain step: %S" prefix step))))))
 
 ) ; End of eval-and-compile block
@@ -211,136 +181,137 @@ A plist containing all necessary symbols and forms for the macro."
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API - Promise Chaining and Flow Control
 
-(defmacro concur:then (source-promise-form
-                       &optional on-resolved-form on-rejected-form)
-  "Chain a new promise from SOURCE-PROMISE-FORM, transforming its result.
-This is the fundamental promise chaining primitive. It returns a new promise
-that will be resolved or rejected based on the outcome of the handlers.
+(cl-defmacro concur:then (source-promise-form
+                         &optional on-resolved-form on-rejected-form
+                         &environment env)
+  "Chain a new promise from `SOURCE-PROMISE-FORM`, transforming its result.
 
-This macro uses an AST transformation step to find and 'lift' any lexically
-free variables from the provided handler lambdas, ensuring they are
-available when the asynchronous callbacks are executed.
+  This is the fundamental promise chaining primitive. It allows attaching
+  success and failure handlers that execute asynchronously when the source
+  promise settles. Lexical variables from the `concur:then`'s macro expansion
+  environment are automatically captured and made available to handlers.
 
-Arguments:
-- SOURCE-PROMISE-FORM: A form that evaluates to a `concur-promise`.
-- ON-RESOLVED-FORM (form, optional): A lambda `(lambda (value) ...)` or
-  function symbol called when the source promise resolves. Its return value
-  becomes the resolved value of the new promise. Defaults to an identity
-  function `(lambda (val) val)`.
-- ON-REJECTED-FORM (form, optional): A lambda `(lambda (error) ...)` or
-  function symbol called when the source promise rejects. Its return value
-  (or a new rejection) determines the state of the new promise. Defaults
-  to a function that re-rejects the promise.
+  Arguments:
+  - `source-promise-form`: A form that evaluates to a `concur-promise`.
+  - `on-resolved-form`: (optional) A lambda `(lambda (value) ...)` or a
+    function symbol. Called if `source-promise-form` resolves successfully.
+    Defaults to `(lambda (val) val)`.
+  - `on-rejected-form`: (optional) A lambda `(lambda (error) ...)` or a
+    function symbol. Called if `source-promise-form` rejects. It can recover
+    from errors by resolving to a value or another promise. Defaults to
+    `(lambda (err) (concur:rejected! err))`.
+  - `env`: (Implicit) The lexical environment for macro expansion.
 
-Returns:
-A new `concur-promise` representing the chained operation."
+  Returns:
+  A new `concur-promise` that resolves or rejects based on the outcome
+  of the handlers."
   (declare (indent 1) (debug t))
-  ;; Use -let* to call the helper and destructure the results into local
-  ;; variables, making the macro's body clean and declarative.
-  (-let* (((&plist :source-promise-sym source-promise-sym
-                   :new-promise-sym new-promise-sym
-                   :lifted-resolved-fn lifted-resolved-handler-form
-                   :lifted-rejected-fn lifted-rejected-handler-form
-                   :captured-vars-form captured-vars-alist-form)
-           ;; All preparation logic is now encapsulated in this one call.
-           (concur--prepare-then-macro-data on-resolved-form on-rejected-form)))
+  ;; --- STEP 1: Analyze user code and prepare all components first. ---
+  (-let* (((&plist :original-resolved-lambda original-resolved-lambda
+                   :resolved-vars resolved-vars
+                   :original-rejected-lambda original-rejected-lambda
+                   :rejected-vars rejected-vars
+                   :captured-vars-form captured-vars-context-form)
+           (concur--prepare-then-macro-data
+            on-resolved-form on-rejected-form env))
+          (new-promise-sym (gensym "new-promise"))
+          (err-sym (gensym "err-"))) ; Gensym for `err` in condition-case
 
-    ;; The body of the macro is now just the final code assembly.
-    `(let ((,source-promise-sym ,source-promise-form)
-           (lifted-resolved-fn ,lifted-resolved-handler-form)
-           (lifted-rejected-fn ,lifted-rejected-handler-form))
-       (let ((,new-promise-sym (concur:make-promise)))
-         ;; At runtime, build the full `extra-data` alist.
-         (let ((extra-data
-                (append (list (cons 'handler-target-promise ,new-promise-sym)
-                              (cons 'source-promise ,source-promise-sym)
-                              (cons 'internal--lifted-resolved-fn lifted-resolved-fn)
-                              (cons 'internal--lifted-rejected-fn lifted-rejected-fn))
-                        ,captured-vars-alist-form)))
-           (concur--on-resolve
-            ,source-promise-sym
-            (concur--make-resolved-callback
-             (lambda (value extra-data)
-               (let* ((h-target-promise
-                       (cdr (assoc 'handler-target-promise extra-data)))
-                      (user-handler-fn
-                       (cdr (assoc 'internal--lifted-resolved-fn extra-data))))
-                 (condition-case err
-                     (concur--resolve-with-maybe-promise
-                      h-target-promise
-                      (funcall user-handler-fn value extra-data))
-                   (error (concur:reject h-target-promise err)))))
-             ,new-promise-sym :context extra-data)
-            (concur--make-rejected-callback
-             (lambda (error extra-data)
-               (let* ((h-target-promise
-                       (cdr (assoc 'handler-target-promise extra-data)))
-                      (user-handler-fn
-                       (cdr (assoc 'internal--lifted-rejected-fn extra-data))))
-                 (condition-case err-in-handler
-                     (concur--resolve-with-maybe-promise
-                      h-target-promise
-                      (funcall user-handler-fn error extra-data))
-                   (error (concur:reject h-target-promise err-in-handler)))))
-             ,new-promise-sym :context extra-data)))
+    (let ((err-in-handler-sym (gensym "err-in-handler-"))) ; Gensym for `err-in-handler`
+
+      ;; --- STEP 2: Assemble the final code structure. ---
+      `(let ((,new-promise-sym (concur:make-promise)))
+         (concur--on-resolve
+          ,source-promise-form
+          (concur--make-resolved-callback
+           (lambda (value context) ; `context` here is the hash table or nil from captured-vars-context-form
+             (condition-case ,err-sym ; Use the gensym'd error variable for macro hygiene
+                 (concur--resolve-with-maybe-promise
+                  ,new-promise-sym
+                  (let ,(cl-loop for var in resolved-vars
+                                 ;; Ensure context is a hash-table before using gethash
+                                 collect `(,var (concur--safe-ht-get context ',var)))
+                    (funcall ,original-resolved-lambda value)))
+               (error (concur:reject ,new-promise-sym `(executor-error :original-error ,,err-sym)))))
+           ,new-promise-sym :captured-vars ,captured-vars-context-form)
+          (concur--make-rejected-callback
+           (lambda (error context) ; `context` here is the hash table or nil from captured-vars-context-form
+             (condition-case ,err-in-handler-sym ; Use the gensym'd error variable for macro hygiene
+                 (concur--resolve-with-maybe-promise
+                  ,new-promise-sym
+                  (let ,(cl-loop for var in rejected-vars
+                                 ;; Ensure context is a hash-table before using gethash
+                                 collect `(,var (concur--safe-ht-get context ',var)))
+                    (funcall ,original-rejected-lambda error)))
+               (error (concur:reject ,new-promise-sym `(executor-error :original-error ,,err-in-handler-sym)))))
+           ,new-promise-sym  :captured-vars ,captured-vars-context-form))
          ,new-promise-sym))))
 
 ;;;###autoload
 (defmacro concur:catch (caught-promise-form handler-form)
-  "Attach an error HANDLER-FORM to CAUGHT-PROMISE-FORM.
-This is a convenience alias for `(concur:then promise nil handler)`.
+  "Attach an error `HANDLER-FORM` to `CAUGHT-PROMISE-FORM`.
 
-Arguments:
-- CAUGHT-PROMISE-FORM: A form that evaluates to a `concur-promise`.
-- HANDLER-FORM: A lambda `(lambda (error) ...)` or function symbol that
-  is called if the promise rejects.
+  This is a convenience alias for `(concur:then promise nil handler)`.
 
-Returns:
-A new `concur-promise`."
+  Arguments:
+  - `caught-promise-form`: A form that evaluates to a `concur-promise`.
+  - `handler-form`: A lambda `(lambda (error) ...)` or function symbol that
+    is called if the promise rejects.
+
+  Returns:
+  A new `concur-promise`."
   (declare (indent 1) (debug t))
   `(concur:then ,caught-promise-form nil ,handler-form))
 
 (defmacro concur:finally (final-promise-form callback-form)
-  "Attach CALLBACK-FORM to run after FINAL-PROMISE-FORM settles.
-This runs regardless of outcome. The returned promise adopts the state of the
-original promise, unless the `callback-form` itself fails or rejects.
+  "Attach `CALLBACK-FORM` to run after `FINAL-PROMISE-FORM` settles.
 
-Arguments:
-- FINAL-PROMISE-FORM: A form evaluating to a `concur-promise`.
-- CALLBACK-FORM: A lambda `(lambda () ...)` or function symbol called when
-  the promise settles.
+  This runs regardless of outcome. The returned promise adopts the state of the
+  original promise, unless the `callback-form` itself fails or rejects.
 
-Returns:
-A new `concur-promise` that settles with the same value/error as the
-`final-promise-form`, after the `callback-form` has completed."
+  Arguments:
+  - `final-promise-form`: A form evaluating to a `concur-promise`.
+  - `callback-form`: A lambda `(lambda () ...)` or function symbol called when
+    the promise settles.
+
+  Returns:
+  A new `concur-promise` that settles with the same value/error as the
+  `final-promise-form`, after the `callback-form` has completed."
   (declare (indent 1) (debug t))
   `(concur:then
     ,final-promise-form
     ;; on-resolved:
     (lambda (val)
-      ;; Run the callback, then chain to a new promise that resolves
-      ;; with the *original* value.
-      (concur:then (funcall ,callback-form)
+      ;; We must wait for the callback to complete before passing through the
+      ;; original value. By wrapping the funcall in `concur:resolved!`, we get
+      ;; a promise that resolves when the callback is done. This also handles
+      ;; the case where the callback itself might return a promise for async cleanup.
+      (concur:then (concur:resolved! (funcall ,callback-form))
+                   ;; Once the callback is done, this lambda ignores its result (_)
+                   ;; and resolves with the *original* value.
                    (lambda (_) val)))
     ;; on-rejected:
     (lambda (err)
-      ;; Run the callback, then chain to a new promise that re-rejects
-      ;; with the *original* error.
-      (concur:then (funcall ,callback-form)
+      (funcall ,callback-form nil err)
+      ;; Always re-reject with the original error.
+      (concur:then (concur:resolved! (funcall ,callback-form))
+                   ;; Once the callback is done, this lambda ignores its result (_)
+                   ;; and re-rejects with the *original* error.
                    (lambda (_) (concur:rejected! err))))))
 
 (defmacro concur:tap (tapped-promise-form callback-form)
-  "Attach CALLBACK-FORM for side effects, without altering the promise chain.
-This is useful for logging or debugging. The return value and any errors from
-the callback are ignored.
+  "Attach `CALLBACK-FORM` for side effects, without altering the promise chain.
 
-Arguments:
-- TAPPED-PROMISE-FORM: A form evaluating to a `concur-promise`.
-- CALLBACK-FORM: A lambda `(lambda (value error) ...)` or function symbol.
-  `value` is non-nil on resolution, `error` is non-nil on rejection.
+  This is useful for logging or debugging. The return value and any errors from
+  the callback are ignored.
 
-Returns:
-A new `concur-promise` that settles with the identical state as the original."
+  Arguments:
+  - `tapped-promise-form`: A form evaluating to a `concur-promise`.
+  - `callback-form`: A lambda `(lambda (value error) ...)` or function symbol.
+    `value` is non-nil on resolution, `error` is non-nil on rejection.
+
+  Returns:
+  A new `concur-promise` that settles with the identical state as the original."
   (declare (indent 1) (debug t))
   `(concur:then
     ,tapped-promise-form
@@ -357,28 +328,32 @@ A new `concur-promise` that settles with the identical state as the original."
 
 (defmacro concur:chain (initial-promise-expr &rest steps)
   "Thread `INITIAL-PROMISE-EXPR` through a series of asynchronous steps.
-This provides a readable, linear syntax for chaining promises.
 
-Supported steps:
-- `:then (lambda (val) ...)`: Transforms the resolved value.
-- `:catch (lambda (err) ...)`: Handles a rejection, can recover.
-- `:finally (lambda () ...)`: Runs a side-effecting callback when settled.
-- `:tap (lambda (val err) ...)`: Side-effecting callback, ignores result.
-- `:all (list-of-promises)`: Waits for all promises in a list.
-- `:race (list-of-promises)`: Waits for the first promise to settle.
-- `:sleep (ms)`: Delays the chain.
-- `:log (fmt)`: Logs the current value/error.
-- `:retry (n fn)`: Retries an async function `fn` up to `n` times.
-- `:let ((v e) ...)`: Lexical bindings for subsequent steps.
+  This macro provides a readable, linear syntax for composing and chaining
+  promises. It supports various step types, including transformations,
+  error handling, and side effects.
 
-Anaphoric variables `<>` (value) and `<!>` (error) are bound in steps.
+  Arguments:
+  - `initial-promise-expr`: The promise or value to start the chain.
+  - `steps`: A list of step clauses. Supported step types:
+    - `:then (lambda (val) ...)`: Transforms the resolved value.
+    - `:catch (lambda (err) ...)`: Handles a rejection, can recover.
+    - `:finally (lambda () ...)`: Runs a side-effecting callback when settled.
+    - `:tap (lambda (val err) ...)`: Side-effecting callback, ignores result.
+    - `:all (list-of-promises)`: Waits for all promises in a list.
+    - `:race (list-of-promises)`: Waits for the first promise to settle.
+    - `:sleep (ms)`: Delays the chain execution for a specified duration in ms.
+    - `:log (fmt)`: Logs the current value/error using a format string.
+    - `:retry (n fn)`: Retries an asynchronous function `fn` up to `n` times
+      on failure.
+    - `:let ((v e) ...)`: Introduces lexical bindings for subsequent steps,
+      evaluated in order.
 
-Arguments:
-- INITIAL-PROMISE-EXPR: The promise or value to start the chain.
-- STEPS: A list of step clauses.
+  Anaphoric variables `<>` (for the resolved value) and `<!>` (for the error)
+  are bound within `:then`, `:catch`, `:tap`, and implicit expression steps.
 
-Returns:
-A `concur-promise` representing the final outcome of the chain."
+  Returns:
+  A `concur-promise` representing the final outcome of the chain."
   (declare (indent 1) (debug t))
   (let* ((sugared-steps (concur--expand-sugar steps))
          (result-form initial-promise-expr)
@@ -406,15 +381,16 @@ A `concur-promise` representing the final outcome of the chain."
 
 (defmacro concur:chain-when (initial-promise-expr &rest steps)
   "Like `concur:chain` but short-circuits on `nil` resolved values.
-If a promise in the chain resolves with `nil`, subsequent `:then` steps
-are skipped. Error handling (`:catch`, `:finally`) still executes.
 
-Arguments:
-- INITIAL-PROMISE-EXPR: The initial promise or value.
-- STEPS: A list of step clauses.
+  If a promise in the chain resolves with `nil`, subsequent `:then` steps
+  are skipped. Error handling (`:catch`, `:finally`) still executes.
 
-Returns:
-A `concur-promise` representing the final outcome of the chain."
+  Arguments:
+  - `initial-promise-expr`: The initial promise or value.
+  - `steps`: A list of step clauses (same as `concur:chain`).
+
+  Returns:
+  A `concur-promise` representing the final outcome of the chain."
   (declare (indent 1) (debug t))
   (let* ((sugared-steps (concur--expand-sugar steps))
          (result-form initial-promise-expr)

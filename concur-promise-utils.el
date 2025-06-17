@@ -79,7 +79,7 @@ or rejects if the coroutine throws an error or is cancelled."
                     (condition-case err
                         (pcase (send! ,runner-sym ,resume-val-sym)
                           ;; Case 1: Coroutine yields an external promise to await.
-                          (`(:await-external ,awaited-promise-sym)
+                          (`(:await-external ,,awaited-promise-sym)
                            ;; We chain the next step of the driver to the
                            ;; yielded promise. The `concur:then` macro will
                            ;; correctly handle lifting `driver-sym` and `reject-sym`.
@@ -96,7 +96,7 @@ or rejects if the coroutine throws an error or is cancelled."
                       (error (funcall ,reject-sym err)))))
                ;; Initial call to start the coroutine driver.
                (,driver-sym)))
-         ,cancel-token-form))))
+         :cancel-token ,cancel-token-form))))
 
 (defun concur:delay (seconds &optional value)
   "Return a promise that resolves with VALUE after SECONDS.

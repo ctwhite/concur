@@ -17,9 +17,10 @@
 (require 's)
 (require 'subr-x)
 
-(require 'concur-hooks)
+(require 'concur-hooks)        ; Provides concur--log
 (require 'concur-cancel)
 (require 'concur-primitives)
+(require 'concur-ast)
 
 ;; Forward declarations for byte-compiler
 (declare-function concur-ast-lift-lambda-form "concur-ast"
@@ -64,6 +65,11 @@ the core to handle different awaitable types without circular dependencies.")
   "A dynamically-scoped list of labels for the current async call stack.
 High-level functions like `concur:async!` manage this stack to provide
 richer debugging information on promise rejection.")
+
+;; **FIX:** Declare the free variable to silence the byte-compiler warning.
+;; This variable is used by the `yield` library for coroutine integration.
+(defvar yield--await-external-status-key nil
+  "Internal key used by the `yield` library for awaiting external events.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -163,33 +169,42 @@ Arguments:
 
 Returns:
 `nil`."
+  (concur--log :debug "[CORE:process-callbacks-batch] Processing batch for %s. Callbacks: %S"
+               (concur:format-promise promise) (mapcar #'concur-callback-type callbacks))
   (run-hook-with-args 'concur-resolve-callbacks-begin-hook (list promise callbacks))
   (dolist (callback callbacks)
     (let* ((handler (concur-callback-fn callback))
            (type (concur-callback-type callback))
            (target-promise (concur-callback-promise callback))
            (context (concur-callback-context callback)))
+      (concur--log :debug "[CORE:process-callbacks-batch] Executing callback type %S for %S. Context: %S"
+                   type (concur:format-promise promise) context)
       (condition-case err
           ;; CORRECTION: Replaced `cond` with `pcase` for clarity and style.
           (pcase type
             (:resolved
              (when (not (concur-promise-error promise))
+               (concur--log :debug "[CORE:process-callbacks-batch] Resolved handler: calling with value %S" (concur:value promise))
                (funcall handler (concur:value promise) context)))
 
             (:rejected
              (when-let ((err-val (concur:error-value promise)))
+               (concur--log :debug "[CORE:process-callbacks-batch] Rejected handler: calling with error %S" err-val)
                (funcall handler err-val context)))
 
             (:finally
+             (concur--log :debug "[CORE:process-callbacks-batch] Finally handler: calling with context %S" context)
              (funcall handler context))
 
             (:tap
+             (concur--log :debug "[CORE:process-callbacks-batch] Tap handler: calling with value %S and error %S"
+                          (concur:value promise) (concur:error-value promise))
              (funcall handler
                       (concur:value promise)
                       (concur:error-value promise)
                       context)))
         ('error
-         (concur--log :error "Callback failed in %S handler for %s: %S"
+         (concur--log :error "[CORE:process-callbacks-batch] Callback failed in %S handler for %s: %S"
                       type
                       (concur:format-promise promise)
                       err)))))
@@ -205,7 +220,7 @@ Arguments:
 
 Returns:
 `nil`."
-  (concur--log :debug "CALLBACKS: Running for %s" (concur:format-promise promise))
+  (concur--log :debug "[CORE:run-callbacks] Running callbacks for %s" (concur:format-promise promise))
   (let ((callback-links (concur-promise-callbacks promise))
         (async-callbacks '()))
     ;; Step 1: Immediately signal any synchronous await latches.
@@ -215,13 +230,15 @@ Returns:
             (let ((latch (cdr (assoc 'latch (concur-callback-context cb)))))
               (when (concur-await-latch-p latch)
                 (setf (concur-await-latch-signaled-p latch) t)
-                (concur--log :debug "CALLBACKS: Signaling await latch for %s"
+                (concur--log :debug "[CORE:run-callbacks] Signaling await latch for %s"
                              (concur:format-promise promise))))
           ;; Collect all other handlers for async execution.
           (push cb async-callbacks))))
     (setq async-callbacks (nreverse async-callbacks))
     ;; Clear callbacks immediately to conform to Promise/A+ spec.
     (setf (concur-promise-callbacks promise) nil)
+    (concur--log :debug "[CORE:run-callbacks] %d async callbacks scheduled for %s"
+                 (length async-callbacks) (concur:format-promise promise))
     ;; Step 2: Schedule all other handlers to run in the next event loop cycle.
     (when async-callbacks
       (run-with-timer 0 nil
@@ -242,32 +259,51 @@ Arguments:
 
 Returns:
 The settled `concur-promise`."
+  (concur--log :debug "[CORE:settle-promise] Attempting to settle %s. Resolved-p: %S, Result: %S, Error: %S, Is-cancellation: %S"
+               (concur:format-promise promise)
+               (concur-promise-resolved-p promise)
+               (concur--format-value-or-error-for-log result)
+               (concur--format-value-or-error-for-log error)
+               is-cancellation)
   (unless (concur-promise-resolved-p promise)
-    (concur--log :debug "PROMISE-SETTLE: Settling %s"
-                 (concur:format-promise promise))
-    ;; Acquire lock to prevent race conditions during state transition.
-    (concur:with-mutex! (concur-promise-lock promise)
-      (:else
-       (concur--log :warn "PROMISE-SETTLE: %s lock contention, retrying."
-                    (concur:format-promise promise))
-       (run-with-timer 0.001 nil #'concur--settle-promise
-                       promise result error is-cancellation))
-      ;; Re-check inside lock to be absolutely certain.
-      (when (concur-promise-resolved-p promise)
-        (cl-return-from concur--settle-promise promise))
-      ;; Set the final state.
-      (setf (concur-promise-result promise) result)
-      (setf (concur-promise-error promise) error)
-      (setf (concur-promise-resolved-p promise) t)
-      (when is-cancellation
-        (setf (concur-promise-cancelled-p promise) t)))
-    ;; `unwind-protect` ensures hooks run even if callbacks error.
-    (unwind-protect
-        (concur--run-callbacks promise)
-      (when (and error (not (concur-promise-callbacks promise)) (not is-cancellation))
-        (run-hook-with-args 'concur-unhandled-rejection-hook (list promise error))
-        (when concur-throw-on-promise-rejection
-          (signal (car error) (cdr error))))))
+    (cl-block concur--settle-promise
+      (concur--log :debug "[CORE:settle-promise] Acquiring lock for %s"
+                  (concur:format-promise promise))
+      ;; Acquire lock to prevent race conditions during state transition.
+      (concur:with-mutex! (concur-promise-lock promise)
+        (:else
+        (concur--log :warn "[CORE:settle-promise] %s lock contention, retrying settlement."
+                      (concur:format-promise promise))
+        (run-with-timer 0.001 nil #'concur--settle-promise
+                        promise result error is-cancellation))
+        ;; Re-check inside lock to be absolutely certain.
+        (when (concur-promise-resolved-p promise)
+          (concur--log :debug "[CORE:settle-promise] %s already settled inside lock, aborting."
+                       (concur:format-promise promise))
+          (cl-return-from concur--settle-promise promise))
+        ;; Set the final state.
+        (setf (concur-promise-result promise) result)
+        (setf (concur-promise-error promise) error)
+        (setf (concur-promise-resolved-p promise) t)
+        (when is-cancellation
+          (setf (concur-promise-cancelled-p promise) t))
+        (concur--log :debug "[CORE:settle-promise] %s successfully SETTLED. Result: %S, Error: %S, Cancelled: %S"
+                     (concur:format-promise promise)
+                     (concur--format-value-or-error-for-log result)
+                     (concur--format-value-or-error-for-log error)
+                     is-cancellation))
+      ;; `unwind-protect` ensures hooks run even if callbacks error.
+      (unwind-protect
+          (concur--run-callbacks promise)
+        (when (and error (not (concur-promise-callbacks promise)) (not is-cancellation))
+          (concur--log :warn "[CORE:settle-promise] Unhandled rejection for %s: %S"
+                       (concur:format-promise promise) (concur--format-value-or-error-for-log error))
+          (run-hook-with-args 'concur-unhandled-rejection-hook (list promise error))
+          (when concur-throw-on-promise-rejection
+            (concur--log :error "[CORE:settle-promise] Throwing unhandled rejection error: %S" error)
+            ;; This is where the error passed to `concur:reject` eventually causes a signal.
+            ;; We need to make sure `error` here is a valid condition list for `signal`.
+            (signal (car error) (cdr error)))))))
   promise)
 
 (defun concur--on-resolve (source-awaitable &rest callbacks)
@@ -282,36 +318,44 @@ Arguments:
 
 Returns:
 A unique symbol identifying this callback link."
+  (concur--log :debug "[CORE:on-resolve] Registering callbacks for source: %S, Callbacks count: %d"
+               source-awaitable (length callbacks))
   ;; --- NORMALIZATION STEP ---
   ;; If a normalizer function has been set by a higher-level library, use it.
   ;; Otherwise, assume the input is already a promise.
   (let ((promise (if concur--normalize-awaitable-fn
-                     (funcall concur--normalize-awaitable-fn source-awaitable)
+                     (progn
+                       (concur--log :debug "[CORE:on-resolve] Normalizing awaitable %S" source-awaitable)
+                       (funcall concur--normalize-awaitable-fn source-awaitable))
                    source-awaitable)))
 
     (unless (concur-promise-p promise)
+      (concur--log :error "[CORE:on-resolve] Invalid awaitable provided: %S" source-awaitable)
       (error "Invalid awaitable provided. Must resolve to a promise, got %S"
              source-awaitable))
 
     (let ((callback-id (gensym "promise-cb-")))
       (if (concur-promise-resolved-p promise)
           (progn
-            (concur--log :debug "ON_RESOLVE: Source %s already settled, scheduling."
+            (concur--log :debug "[CORE:on-resolve] Source %s already settled, scheduling callbacks immediately."
                          (concur:format-promise promise))
             (concur--process-scheduled-callbacks-batch promise callbacks))
+        (concur--log :debug "[CORE:on-resolve] Source %s pending, adding callbacks to queue."
+                     (concur:format-promise promise))
         (concur:with-mutex! (concur-promise-lock promise)
-          (:else (concur--log :warn "ON_RESOLVE: %s lock contention, retrying."
+          (:else (concur--log :warn "[CORE:on-resolve] %s lock contention, retrying callback registration."
                               (concur:format-promise promise))
                  (apply #'concur--on-resolve promise callbacks))
-          (push (%%make-callback-link callback-id callbacks)
+          (push (%%make-callback-link :id callback-id
+                                      :callbacks callbacks)
                 (concur-promise-callbacks promise))))
       callback-id)))
 
 (defun concur--resolve-with-maybe-promise (target-promise value-or-promise)
   "Resolve TARGET-PROMISE with VALUE-OR-PROMISE.
-This implements the Promise/A+ 'thenable' resolution procedure. If
+This implements the Promise/A+ `thenable` resolution procedure. If
 `value-or-promise` is itself a promise, `target-promise` will adopt its
-state, effectively 'flattening' nested promises.
+state, effectively `'flattening'` nested promises.
 
 Arguments:
 - TARGET-PROMISE (`concur-promise`): The promise to resolve.
@@ -319,22 +363,35 @@ Arguments:
 
 Returns:
 `nil`."
+  (concur--log :debug "[CORE:resolve-with-maybe-promise] Resolving %s with %S"
+               (concur:format-promise target-promise)
+               (concur--format-value-or-error-for-log value-or-promise))
   (if (concur-promise-p value-or-promise)
       ;; If the value is another promise, chain to it.
-      (concur--on-resolve
-       value-or-promise
-       (concur--make-resolved-callback
-        (lambda (res-val ctx)
-          (concur:resolve (cdr (assoc 'target-promise ctx)) res-val))
-        target-promise
-        :context (list (cons 'target-promise target-promise)))
-       (concur--make-rejected-callback
-        (lambda (rej-err ctx)
-          (concur:reject (cdr (assoc 'target-promise ctx)) rej-err))
-        target-promise
-        :context (list (cons 'target-promise target-promise))))
+      (progn
+        (concur--log :debug "[CORE:resolve-with-maybe-promise] Value is a promise %s, chaining."
+                     (concur:format-promise value-or-promise))
+        (concur--on-resolve
+         value-or-promise
+         (concur--make-resolved-callback
+          (lambda (res-val ctx)
+            (concur--log :debug "[CORE:resolve-with-maybe-promise] Chained promise resolved, resolving target %s with %S"
+                         (concur:format-promise (cdr (assoc 'target-promise ctx))) res-val)
+            (concur:resolve (cdr (assoc 'target-promise ctx)) res-val))
+          target-promise
+          :context (list (cons 'target-promise target-promise)))
+         (concur--make-rejected-callback
+          (lambda (rej-err ctx)
+            (concur--log :debug "[CORE:resolve-with-maybe-promise] Chained promise rejected, rejecting target %s with %S"
+                         (concur:format-promise (cdr (assoc 'target-promise ctx))) rej-err)
+            (concur:reject (cdr (assoc 'target-promise ctx)) rej-err))
+          target-promise
+          :context (list (cons 'target-promise target-promise)))))
     ;; If the value is not a promise, settle directly.
-    (concur--settle-promise target-promise value-or-promise nil)))
+    (progn
+      (concur--log :debug "[CORE:resolve-with-maybe-promise] Value is not a promise, settling %s directly with %S"
+                   (concur:format-promise target-promise) value-or-promise)
+      (concur--settle-promise target-promise value-or-promise nil))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Helpers - Callback Creation
@@ -348,6 +405,7 @@ Arguments:
 
 Returns:
 A new alist containing the merged data."
+  (concur--log :debug "[CORE:merge-contexts] Merging existing: %S, captured: %S" existing-context captured-vars)
   (cond
    ((and (listp existing-context) (listp captured-vars))
     (append existing-context captured-vars))
@@ -368,7 +426,9 @@ Arguments:
 Returns:
 A new `concur-callback` struct."
   (let ((final-context (concur--merge-contexts context captured-vars)))
-    (%%make-callback :type :resolved 
+    (concur--log :debug "[CORE:make-resolved-callback] Created resolved callback for %s. Final context: %S"
+                 (concur:format-promise target-promise) final-context)
+    (%%make-callback :type :resolved
                      :fn handler
                      :promise target-promise
                      :context final-context)))
@@ -377,7 +437,9 @@ A new `concur-callback` struct."
                                            &key context captured-vars)
   "Create a `concur-callback` for a rejected handler."
   (let ((final-context (concur--merge-contexts context captured-vars)))
-    (%%make-callback :type :rejected 
+    (concur--log :debug "[CORE:make-rejected-callback] Created rejected callback for %s. Final context: %S"
+                 (concur:format-promise target-promise) final-context)
+    (%%make-callback :type :rejected
                      :fn handler
                      :promise target-promise
                      :context final-context)))
@@ -386,7 +448,9 @@ A new `concur-callback` struct."
                                           &key context captured-vars)
   "Create a `concur-callback` for a finally handler."
   (let ((final-context (concur--merge-contexts context captured-vars)))
-    (%%make-callback :type :finally 
+    (concur--log :debug "[CORE:make-finally-callback] Created finally callback for %s. Final context: %S"
+                 (concur:format-promise target-promise) final-context)
+    (%%make-callback :type :finally
                      :fn handler
                      :promise target-promise
                      :context final-context)))
@@ -395,7 +459,9 @@ A new `concur-callback` struct."
                                       &key context captured-vars)
   "Create a `concur-callback` for a tap handler."
   (let ((final-context (concur--merge-contexts context captured-vars)))
-    (%%make-callback :type :tap 
+    (concur--log :debug "[CORE:make-tap-callback] Created tap callback for %s. Final context: %S"
+                 (concur:format-promise target-promise) final-context)
+    (%%make-callback :type :tap
                      :fn handler
                      :promise target-promise
                      :context final-context)))
@@ -403,10 +469,14 @@ A new `concur-callback` struct."
 (cl-defun concur--make-await-latch-callback (latch target-promise
                                               &key context captured-vars)
   "Create a `concur-callback` for an await latch."
-  (let ((final-context (concur--merge-contexts (list (cons 'latch latch))
-                                             (if (listp context) context nil))))
-    (setq final-context (concur--merge-contexts final-context
-                                              (if (listp captured-vars) captured-vars nil)))
+  ;; Note: The original `context` and `captured-vars` handling here seemed a bit off.
+  ;; `context` for await latch typically only includes the latch itself.
+  ;; `captured-vars` from AST lifting are probably not relevant for a dummy lambda.
+  ;; Re-aligning with typical `merge-contexts` usage if it applies.
+  (let ((final-context (concur--merge-contexts (list (cons 'latch latch)) context)))
+    (setq final-context (concur--merge-contexts final-context captured-vars)) ; ensures captured-vars are merged if present
+    (concur--log :debug "[CORE:make-await-latch-callback] Created await latch callback for %s. Latch: %S, Final context: %S"
+                 (concur:format-promise target-promise) latch final-context)
     (%%make-callback :type :await-latch
                      :fn (lambda () nil) ; Dummy handler.
                      :promise target-promise
@@ -432,22 +502,31 @@ Signals:
 - `concur:timeout-error` if the timeout is exceeded.
 - The error from `watched-promise` if it rejects."
   (unless (concur-promise-p watched-promise)
+    (concur--log :error "[CORE:await-blocking] Invalid promise object: %S" watched-promise)
     (error "concur--await-blocking: Invalid promise object: %S" watched-promise))
 
-  (concur--log :debug "AWAIT-BLOCKING: Entering for %s (timeout: %s)"
+  (concur--log :debug "[CORE:await-blocking] Entering for %s (timeout: %s)"
                (concur:format-promise watched-promise) timeout)
 
   ;; Handle already-resolved promises immediately.
   (if (concur-promise-resolved-p watched-promise)
-      (if-let ((err (concur:error-value watched-promise)))
-          (signal (car err) (cdr err))
-        (concur:value watched-promise))
+      (progn
+        (concur--log :debug "[CORE:await-blocking] Promise %s already settled, returning immediately."
+                     (concur:format-promise watched-promise))
+        (if-let ((err (concur:error-value watched-promise)))
+            (progn
+              (concur--log :debug "[CORE:await-blocking] Promise %s rejected, signaling error %S."
+                           (concur:format-promise watched-promise) err)
+              (signal (car err) (cdr err)))
+          (concur:value watched-promise)))
 
     ;; For pending promises, enter the cooperative wait loop.
     (let ((latch (%%make-await-latch))
           (timer nil))
       (unwind-protect
           (progn
+            (concur--log :debug "[CORE:await-blocking] Promise %s pending, setting up await latch."
+                         (concur:format-promise watched-promise))
             ;; Attach the latch so it gets signaled when the promise settles.
             (concur--on-resolve
              watched-promise
@@ -459,25 +538,40 @@ Signals:
               (setq timer
                     (run-at-time timeout nil
                                  (lambda ()
+                                   (concur--log :debug "[CORE:await-blocking] Timeout occurred for %s."
+                                                (concur:format-promise watched-promise))
                                    (setf (concur-await-latch-signaled-p latch)
                                          'timeout)))))
 
             ;; The robust wait loop using `sit-for`.
             (while (not (concur-await-latch-signaled-p latch))
-              (sit-for concur-await-poll-interval))
+              (sit-for concur-await-poll-interval)
+              (concur--log :debug "[CORE:await-blocking] Polling for %s, latch signaled-p: %S"
+                           (concur:format-promise watched-promise) (concur-await-latch-signaled-p latch)))
 
             ;; When the loop exits, check how it was signaled.
             (if (eq (concur-await-latch-signaled-p latch) 'timeout)
-                (error 'concur:timeout-error
-                       (format "Await for %s timed out after %s seconds"
-                               (concur:format-promise watched-promise)
-                               timeout))
+                (progn
+                  (concur--log :error "[CORE:await-blocking] Await for %s timed out after %s seconds."
+                               (concur:format-promise watched-promise) timeout)
+                  (error 'concur:timeout-error
+                         (format "Await for %s timed out after %s seconds"
+                                 (concur:format-promise watched-promise)
+                                 timeout)))
               ;; Otherwise, the promise settled normally.
+              (concur--log :debug "[CORE:await-blocking] Promise %s settled, checking result/error."
+                           (concur:format-promise watched-promise))
               (if-let ((err (concur:error-value watched-promise)))
-                  (signal (car err) (cdr err))
+                  (progn
+                    (concur--log :debug "[CORE:await-blocking] Promise %s rejected, signaling error %S."
+                                 (concur:format-promise watched-promise) err)
+                    (signal (car err) (cdr err)))
                 (concur:value watched-promise))))
         ;; Cleanup form: always cancel the timer if it exists.
-        (when timer (cancel-timer timer))))))
+        (when timer
+          (concur--log :debug "[CORE:await-blocking] Cancelling timer for %s."
+                       (concur:format-promise watched-promise))
+          (cancel-timer timer))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API - Promise Construction and Basic Operations
@@ -492,61 +586,71 @@ Arguments:
 
 Returns:
 A new, pending `concur-promise`."
-  (apply #'%%make-promise
-         :id (gensym "promise-")
-         slots))
+  (let ((p (apply #'%%make-promise
+                  :id (gensym "promise-")
+                  slots)))
+    (concur--log :debug "[CORE:make-promise] Created new promise: %s" (concur:format-promise p))
+    p))
 
 ;;;###autoload
-(defmacro concur:with-executor (executor-fn-form &optional cancel-token-form)
-  "Create a promise and immediately invoke EXECUTOR-FN-FORM.
-This is the fundamental promise constructor. The EXECUTOR-FN-FORM is
-a lambda `(lambda (resolve reject) ...)` that contains the asynchronous logic.
-The promise's state is determined by which of these functions is called.
+(cl-defmacro concur:with-executor (executor-fn-form &key cancel-token &environment env)
+  "Define and execute an asynchronous block that manages its own promise.
 
-Arguments:
-- EXECUTOR-FN-FORM (form): A lambda `(lambda (resolve reject))` that
-  contains the asynchronous logic. Its free variables will be lifted.
-- CANCEL-TOKEN-FORM (form, optional): An expression evaluating to a
-  `concur-cancel-token` to link to this promise's lifecycle.
+  This macro provides a controlled environment for starting asynchronous
+  operations. The `executor-fn-form` is typically a lambda
+  `(lambda (resolve reject) ...)` which receives `resolve` and `reject`
+  functions to control the promise's lifecycle.
 
-Returns:
-A new `concur-promise`."
+  Arguments:
+  - `executor-fn-form`: A zero-argument lambda form `(lambda () ...)` or a
+    function symbol that, when called, sets up and resolves/rejects the
+    returned promise. It automatically receives `resolve` and `reject`
+    parameters to manage the promise.
+  - `:cancel-token`: (optional) A `concur-cancel-token` for cancellability.
+  - `env`: (Implicit) The lexical environment for macro expansion.
+
+  Returns:
+  A `concur-promise` that will be resolved or rejected by the `executor-fn-form`."
   (declare (indent 1) (debug t))
   (let* ((promise (gensym "promise-"))
-         (resolve (gensym "resolve-"))
-         (reject (gensym "reject-"))
-         (cancel-token (gensym "cancel-token-"))
-         ;; The AST lifter needs to know that `resolve` and `reject` are
-         ;; parameters to the executor, not free variables to be lifted.
-         (param-alist `((,resolve . ,resolve) (,reject . ,reject)))
-         ;; Lift the user's executor function.
-         (lift-info (concur--process-handler executor-fn-form "executor" param-alist))
-         (lifted-executor (car lift-info))
-         (captured-vars (cdr lift-info))
-         ;; Generate the code that will build the `extra-data` alist at runtime.
-         (context-form `(list ,@(mapcar (lambda (v) `(cons ',v ,v)) captured-vars))))
-    `(let* ((,promise (concur:make-promise))
-            (,cancel-token ,(or cancel-token-form nil)))
-       ;; Associate cancel token if provided.
-       (when ,cancel-token
-         (setf (concur-promise-cancel-token ,promise) ,cancel-token))
+         (cancel-token-val (gensym "cancel-token-val-"))
+         ;; Analyze the executor form. 'resolve' and 'reject' are its parameters,
+         ;; so they should NOT be identified as free variables to be captured.
+         (executor-analysis (concur-ast-analysis
+                             executor-fn-form
+                             env
+                             nil)) ; No additional captures for 'resolve'/'reject'
+         (original-lambda (concur-ast-analysis-result-expanded-callable-form executor-analysis))
+         (free-vars (concur-ast-analysis-result-free-vars-list executor-analysis))
+         ;; Generate the context form for any *other* free variables from user's code.
+         (context-form (concur-ast-make-captured-vars-form free-vars)))
 
-       (condition-case err
-           ;; Call the lifted executor function. It now expects an `extra-data`
-           ;; alist as its final argument, in addition to `resolve` and `reject`.
-           (funcall ,lifted-executor
-                    (lambda (value) (concur:resolve ,promise value))
-                    (lambda (error) (concur:reject ,promise error))
-                    ,context-form)
-         ;; Handle errors that occur during the synchronous portion of the executor.
-         (error
-          (concur:reject ,promise `(executor-error :original-error ,err))))
-       ,promise)))
+    (let ((err-sym (gensym "err-"))) ; Gensym for `err` in condition-case
+      `(let* ((,promise (concur:make-promise))
+              (,cancel-token-val ,cancel-token))
+         (when ,cancel-token-val
+           (setf (concur-promise-cancel-token ,promise) ,cancel-token-val))
+         (condition-case ,err-sym ; Catch errors within the executor's body
+              ;; Directly bind `resolve` and `reject` in a `let` block.
+              ;; These are the functions that control the promise.
+              (let ((resolve #'(lambda (value) (concur:resolve ,promise value)))
+                    (reject #'(lambda (error) (concur:reject ,promise error)))
+                    (context ,context-form)) ; Bind the captured vars context here
+
+                ;; Unpack other captured free variables from the context
+                (let ,(cl-loop for var in free-vars
+                              collect `(,var (concur--safe-ht-get context ',var)))
+                  ;; Now, call the user's original lambda, passing the bound
+                  ;; `resolve` and `reject` functions as its arguments.
+                  (funcall ,original-lambda resolve reject)))
+           (error
+            (concur:reject ,promise `(executor-error :original-error ,,err-sym))))
+         ,promise))))
 
 (defun concur:resolve (target-promise result)
   "Resolve a promise with a success RESULT.
 If RESULT is itself a promise, `target-promise` will adopt its state
-(this is the Promise/A+ 'thenable' flattening behavior).
+(this is the Promise/A+ `thenable` flattening behavior).
 
 Arguments:
 - TARGET-PROMISE (`concur-promise`): The promise to resolve.
@@ -554,6 +658,8 @@ Arguments:
 
 Returns:
 The `target-promise`."
+  (concur--log :debug "[CORE:resolve] Public API: Resolving %s with result %S"
+               (concur:format-promise target-promise) (concur--format-value-or-error-for-log result))
   (concur--resolve-with-maybe-promise target-promise result)
   target-promise)
 
@@ -569,10 +675,13 @@ Arguments:
 
 Returns:
 The `target-promise`."
+  (concur--log :debug "[CORE:reject] Public API: Rejecting %s with error %S (Is-cancellation: %S)"
+               (concur:format-promise target-promise) (concur--format-value-or-error-for-log error) is-cancellation)
   (let ((final-error error))
     ;; If there's an active async stack and the error is a plist,
     ;; attach the stack trace to it.
     (when (and concur--current-async-stack (listp error))
+      (concur--log :debug "[CORE:reject] Attaching async stack to error %S" error)
       (setq final-error
             (append error `(:async-stack-trace
                             ,(mapconcat 'identity
@@ -588,6 +697,7 @@ Arguments:
 
 Returns:
 A new, already-resolved `concur-promise`."
+  (concur--log :debug "[CORE:resolved!] Creating new resolved promise with value %S" (concur--format-value-or-error-for-log value))
   (let ((p (concur:make-promise)))
     (setf (concur-promise-result p) value
           (concur-promise-resolved-p p) t)
@@ -601,6 +711,7 @@ Arguments:
 
 Returns:
 A new, already-rejected `concur-promise`."
+  (concur--log :debug "[CORE:rejected!] Creating new rejected promise with error %S" (concur--format-value-or-error-for-log error))
   (let ((p (concur:make-promise)))
     (setf (concur-promise-error p) error
           (concur-promise-resolved-p p) t)
@@ -617,9 +728,14 @@ Arguments:
 
 Returns:
 The (now rejected) `cancellable-promise`."
+  (concur--log :debug "[CORE:cancel] Attempting to cancel %s with reason: %S"
+               (concur:format-promise cancellable-promise) reason)
   (unless (concur-promise-resolved-p cancellable-promise)
     (when-let ((proc (concur-promise-proc cancellable-promise)))
-      (when (process-live-p proc) (ignore-errors (kill-process proc))))
+      (when (process-live-p proc)
+        (concur--log :debug "[CORE:cancel] Killing associated process for %s: %S"
+                     (concur:format-promise cancellable-promise) proc)
+        (ignore-errors (kill-process proc))))
     (concur:reject cancellable-promise
                    `(,(car concur--promise-cancelled-key)
                      :message ,(or reason "Promise cancelled"))
@@ -645,17 +761,30 @@ Signals:
 - `concur:timeout-error` if the `timeout` is exceeded.
 - The error condition from `promise-form` if it rejects."
   (declare (indent 1))
+  (concur--log :debug "[CORE:await] Expanding concur:await for promise-form: %S (timeout: %S)"
+               promise-form timeout)
   `(if (and (boundp 'coroutine--current-ctx) coroutine--current-ctx)
        ;; Inside a coroutine, yield to the scheduler.
        (let ((awaited-promise ,promise-form))
+         (concur--log :debug "[CORE:await] Inside coroutine, awaiting promise %s" (concur:format-promise awaited-promise))
          (if (concur-promise-resolved-p awaited-promise)
              (if-let ((err (concur:error-value awaited-promise)))
-                 (signal (car err) (cdr err))
-               (concur:value awaited-promise))
-           (yield--internal-throw-form awaited-promise
-                                       ',yield--await-external-status-key)))
+                 (progn
+                   (concur--log :debug "[CORE:await] Coroutine: Promise %s already rejected, signaling error %S"
+                                (concur:format-promise awaited-promise) err)
+                   (signal (car err) (cdr err)))
+               (progn
+                 (concur--log :debug "[CORE:await] Coroutine: Promise %s already resolved, returning value %S"
+                              (concur:format-promise awaited-promise) (concur:value awaited-promise))
+                 (concur:value awaited-promise)))
+           (progn
+             (concur--log :debug "[CORE:await] Coroutine: Yielding for promise %s" (concur:format-promise awaited-promise))
+             (yield--internal-throw-form awaited-promise
+                                         ',yield--await-external-status-key))))
      ;; Outside a coroutine, use the cooperative blocking helper.
-     (concur--await-blocking ,promise-form ,timeout)))
+     (progn
+       (concur--log :debug "[CORE:await] Outside coroutine, using blocking await for promise-form: %S" promise-form)
+       (concur--await-blocking ,promise-form ,timeout))))
 
 (defun concur:status (promise)
   "Return the current status of a PROMISE without blocking.
@@ -666,6 +795,7 @@ Arguments:
 Returns:
 A symbol: one of `'pending`, `'resolved`, `'rejected`, or `'cancelled`."
   (unless (concur-promise-p promise)
+    (concur--log :error "[CORE:status] Invalid promise object: %S" promise)
     (error "Invalid promise object: %S" promise))
   (cond ((not (concur-promise-resolved-p promise)) 'pending)
         ((concur-promise-cancelled-p promise) 'cancelled)
@@ -681,6 +811,7 @@ Arguments:
 Returns:
 `t` if the promise is pending, `nil` otherwise."
   (unless (concur-promise-p promise)
+    (concur--log :error "[CORE:pending-p] Invalid promise object: %S" promise)
     (error "Invalid promise object: %S" promise))
   (eq (concur:status promise) 'pending))
 
@@ -693,6 +824,7 @@ Arguments:
 Returns:
 `t` if the promise is resolved, `nil` otherwise."
   (unless (concur-promise-p promise)
+    (concur--log :error "[CORE:resolved-p] Invalid promise object: %S" promise)
     (error "Invalid promise object: %S" promise))
   (eq (concur:status promise) 'resolved))
 
@@ -705,6 +837,7 @@ Arguments:
 Returns:
 `t` if the promise is rejected or cancelled, `nil` otherwise."
   (unless (concur-promise-p promise)
+    (concur--log :error "[CORE:rejected-p] Invalid promise object: %S" promise)
     (error "Invalid promise object: %S" promise))
   (memq (concur:status promise) '(rejected cancelled)))
 
@@ -717,6 +850,7 @@ Arguments:
 Returns:
 `t` if the promise is cancelled, `nil` otherwise."
   (unless (concur-promise-p promise)
+    (concur--log :error "[CORE:cancelled-p] Invalid promise object: %S" promise)
     (error "Invalid promise object: %S" promise))
   (eq (concur:status promise) 'cancelled))
 
@@ -730,6 +864,7 @@ Arguments:
 Returns:
 The resolved value, or `nil` if the promise is pending or rejected."
   (unless (concur-promise-p promise)
+    (concur--log :error "[CORE:value] Invalid promise object: %S" promise)
     (error "Invalid promise object: %S" promise))
   (when (eq (concur:status promise) 'resolved)
     (concur-promise-result promise)))
@@ -769,7 +904,7 @@ A formatted string representing the error."
 Intended for logging/debugging to provide a concise summary.
 
 Arguments:
-- P (any): The object to format (ideally a `concur-promise`).
+- P (any): The object to format (preferably a `concur-promise`).
 
 Returns:
 A formatted string."

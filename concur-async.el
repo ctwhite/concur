@@ -11,12 +11,20 @@
 ;;
 ;; - `concur:defasync!`: Defines a function that is internally a coroutine but
 ;;   externally returns a promise, providing a seamless async/await pattern.
+;;
 ;; - `concur:async!`: A versatile function to run code asynchronously
-;;   with various execution modes (deferred, delayed, background process, thread).
+;;   with various execution modes (deferred, delayed, background process,
+;;   thread).
+;;
 ;; - `concur:let-promise*` & `concur:let-promise`: Async-aware `let` macros
 ;;   for managing multiple concurrent or sequential bindings.
+;;
 ;; - High-level concurrent iterators and coroutine combinators like
 ;;   `concur:parallel!`, `concur:coroutine-all`, and `concur:map-pool`.
+;;
+;; New additions include a promise inspector for debugging, `concur:unwind-protect!`
+;; for robust resource management, `concur:while!` for async loops, and
+;; `concur:any!` for finding the first resolved promise in a set.
 
 ;;; Code:
 
@@ -25,6 +33,7 @@
 (require 'backtrace)
 (require 'concur-promise)
 (require 'coroutines)
+(require 'tabulated-list)
 
 (eval-when-compile (require 'cl-lib))
 
@@ -45,6 +54,146 @@ EVENT is one of `:started`, `:succeeded`, `:failed`, `:cancelled`."
 
 (define-error 'concur-async-error "Concurrency async operation error.")
 (define-error 'concur-timeout "Concurrency timeout error.")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; NEW: Promise Registry & Inspector (for Debugging)
+
+(defcustom concur-enable-promise-registry t
+  "If non-nil, register all created promises for inspection.
+This is a powerful debugging tool but adds a small overhead.
+Use `concur:inspect-promises` to view the registry."
+  :type 'boolean
+  :group 'concur)
+
+(defvar concur--promise-registry (make-hash-table :test 'eq)
+  "A global registry of promises for introspection.
+The keys are promise objects and values are `concur--promise-info` structs.")
+
+(defvar concur--promise-id-counter 0
+  "A counter to assign unique IDs to promises for the registry.")
+
+(cl-defstruct (concur--promise-info (:type vector))
+  "A struct to hold debugging information about a promise.
+
+Fields:
+- id (integer): A unique identifier for the promise.
+- state (keyword): The current state (:pending, :resolved, :rejected).
+- name (string): The user-provided name or label for the promise.
+- created (time): The timestamp when the promise was created.
+- settled (time): The timestamp when the promise was settled.
+- value (any): The resolution value or rejection error.
+- backtrace (string): The stack trace at the point of creation."
+  (id 0 :type integer)
+  (state :pending :type keyword)
+  name
+  (created (current-time) :type (or null cons))
+  settled
+  value
+  (backtrace (backtrace-to-string (backtrace)) :type string))
+
+(defun concur--register-promise (promise name)
+  "Register a new PROMISE with NAME in the global registry.
+This function attaches a `tap` to the promise to automatically update
+its state upon settlement.
+
+Arguments:
+- PROMISE (`concur-promise`): The promise to register.
+- NAME (string): The name or label for this promise."
+  (when concur-enable-promise-registry
+    (let* ((id (cl-incf concur--promise-id-counter))
+           (info (make-concur--promise-info :id id :state :pending :name name)))
+      (puthash promise info concur--promise-registry)
+      ;; Use `concur:tap` to update the state upon settlement without
+      ;; affecting the promise chain.
+      (concur:tap promise
+                  (lambda (val err)
+                    (concur--update-promise-state promise val err))))))
+
+(defun concur--update-promise-state (promise val err)
+  "Update the state of a registered PROMISE when it settles.
+
+Arguments:
+- PROMISE (`concur-promise`): The promise that has settled.
+- VAL (any): The resolved value (if `err` is nil).
+- ERR (any): The rejected error (if non-nil)."
+  (when-let ((info (gethash promise concur--promise-registry)))
+    (setf (concur--promise-info-settled info) (current-time))
+    (if err
+        (setf (concur--promise-info-state info) :rejected
+              (concur--promise-info-value info) err)
+      (setf (concur--promise-info-state info) :resolved
+            (concur--promise-info-value info) val))))
+
+(defun concur--format-time-ago (start-time)
+  "Format the duration since START-TIME as a human-readable string.
+
+Arguments:
+- START-TIME (time): A time value, e.g., from `current-time`.
+
+Returns:
+A string like \"1.23s ago\"."
+  (if (null start-time)
+      "N/A"
+    (cl-destructuring-bind (_s _ms microsec . _tz) (time-since start-time)
+      (format "%.2fs ago" (+ (float _s) (/ (float microsec) 1000000.0))))))
+
+;;;###autoload
+(defun concur:inspect-promises ()
+  "Display a live, interactive list of all registered promises.
+This command opens a `tabulated-list-mode` buffer showing the ID,
+name, state, and age of all promises tracked by the registry.
+
+Commands in the inspector buffer:
+- `g`: Refresh the list.
+- `d`: Display detailed info for the promise on the current line.
+- `q`: Quit the inspector."
+  (interactive)
+  (let ((entries
+         (sort (--map-values
+                (lambda (info)
+                  (let* ((id (concur--promise-info-id info))
+                         (state (symbol-name (concur--promise-info-state info)))
+                         (name (format "%s" (concur--promise-info-name info)))
+                         (created (concur--promise-info-created info))
+                         (age (concur--format-time-ago created)))
+                    ;; The entry is the ID and a vector of displayable data.
+                    (list id (vector (format "%s" id) name state age info))))
+                concur--promise-registry)
+               ;; Sort entries by ID.
+               (lambda (a b) (< (car a) (car b))))))
+    (with-current-buffer (get-buffer-create "*Concur Inspector*")
+      (let ((inhibit-read-only nil))
+        (erase-buffer)
+        (concur-inspector-mode)
+        (setq tabulated-list-entries entries)
+        (tabulated-list-init-header)
+        (tabulated-list-print t)
+        (goto-char (point-min))
+        (setq-local inhibit-read-only t))
+      (display-buffer (current-buffer)))))
+
+(define-derived-mode concur-inspector-mode tabulated-list-mode "Concur Inspector"
+  "A mode for inspecting concurrent promises."
+  :group 'concur
+  (setq tabulated-list-format
+        [("ID" 4 t)
+         ("Name" 30 t)
+         ("State" 10 t)
+         ("Age" 15 t)])
+  (setq tabulated-list-sort-key (cons "ID" nil))
+  (define-key tabulated-list-mode-map (kbd "d")
+    (lambda ()
+      (interactive)
+      (when-let* ((line (tabulated-list-get-entry))
+                  (info (aref line 4)))
+        (with-help-window (help-buffer)
+          (with-current-buffer (help-buffer)
+            (princ "Promise Details:\n")
+            (pp info (current-buffer)))))))
+  (define-key tabulated-list-mode-map (kbd "g")
+    (lambda () (interactive) (revert-buffer)))
+  (define-key tabulated-list-mode-map (kbd "q")
+    (lambda () (interactive) (quit-window))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal State & Helpers
@@ -85,133 +234,275 @@ A new list of wrapped promises."
             ;; 1. Wait to acquire a slot in the semaphore.
             (concur:promise-semaphore-acquire semaphore)
             ;; 2. Once acquired, wait for the original task to complete.
-            (:then (lambda (_sem-acquired) (concur:then task-promise)))
+            (:then (lambda (_sem-acquired) task-promise))
             ;; 3. No matter what, release the semaphore when the task is done.
-            (:finally (lambda () (concur:semaphore-release semaphore)))))
+            (:finally (lambda (_v _e)
+                        (concur:semaphore-release semaphore)))))
          tasks))
+
+(eval-when-compile
+  ;; Helper function to parse keyword arguments from a list of forms for macros.
+  (defun concur--parse-macro-keywords (forms keywords)
+    "Parse KEYWORDS from FORMS list and return a property list.
+This is a macro-expansion-time helper. It assumes the first element
+of FORMS is the primary, non-keyword argument.
+
+Example: (concur--parse-macro-keywords '(my-items :fn #'foo) '(:fn))
+         => (:primary-form my-items :fn #'foo)"
+    (let ((primary-form (car forms))
+          (plist nil)
+          (remaining-args (cdr forms)))
+      (while remaining-args
+        (let ((key (pop remaining-args)))
+          (if (memq key keywords)
+              (progn
+                (unless remaining-args (error "Keyword %S lacks a value" key))
+                (setq plist (plist-put plist key (pop remaining-args))))
+            (error "Invalid keyword in macro form: %S" key))))
+      (plist-put plist :primary-form primary-form))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
-;;;###autoload
-(defun concur:async! (fn &optional mode name cancel-token)
+(cl-defun concur:async! (fn mode &key name cancel-token require form)
   "Run FN asynchronously according to MODE and return a `concur-promise`.
-The return value of FN will be the result of the promise.
 
 Arguments:
-- FN (function): The zero-argument function (thunk) to execute.
-- MODE (symbol or number, optional): The execution mode.
-  - `nil`, `t`, or `'deferred`: Schedule via `run-at-time` for next idle cycle.
-  - A `(number)`: Delay execution by that many seconds.
-  - `'async`: Run in a background Emacs process via `async-start`.
+- FN (function): The zero-argument function (thunk) to execute. This is
+  ignored if the `:form` keyword is used with `'async` mode.
+- MODE (symbol or number): The execution mode.
+  - `nil`, `t`, or `'deferred`: Schedule for the next idle cycle.
+  - A `number`: Delay execution by that many seconds.
+  - `'async`: Run in a background Emacs process. See `:require` and `:form`.
   - `'thread`: Run in a native Emacs thread (for CPU-bound tasks).
-- NAME (string, optional): A human-readable name for the operation.
-- CANCEL-TOKEN (`concur-cancel-token`): Optional token to interrupt execution.
+
+Keywords:
+- :NAME (string, optional): A human-readable name for the operation.
+- :CANCEL-TOKEN (`concur-cancel-token`): Token to interrupt execution.
+- :REQUIRE (list, optional): For `'async` mode only. A list of library
+  symbols to `require` in the background process before execution.
+- :FORM (sexp, optional): For `'async` mode only. The Lisp form to
+  evaluate. Using this is more robust than passing a closure `fn`.
 
 Returns:
-A `concur-promise` that will resolve with the result of FN, or reject if FN
-fails or is cancelled."
-  (let* ((label (or name (format "async-%S" (sxhash fn))))
-         (concur--current-async-stack (cons label concur--current-async-stack)))
-    (let ((task-wrapper
-           (lambda (resolve-fn reject-fn)
-             (concur-async--run-hooks :started label (concur:make-promise))
-             (condition-case err
-                 (let ((result (funcall fn)))
-                   (concur-async--run-hooks :succeeded label (concur:resolved! result))
-                   (funcall resolve-fn result))
-               (error
-                (let ((err-cond `(concur-async-error :original-error ,err)))
-                  (concur-async--run-hooks :failed label (concur:rejected! err-cond) err-cond)
-                  (funcall reject-fn err-cond)))))))
-
-      ;; CORRECTION: Restructure pcase to robustly handle the 'nil' case.
-      (pcase mode
-        ;; Case 1: Deferred execution (the default).
-        ((or 'deferred 't (pred null))
-         (concur:with-executor
-             (lambda (resolve reject)
-               (run-at-time 0 nil (lambda () (funcall task-wrapper resolve reject))))
-           cancel-token))
-
-        ;; Case 2: Delayed execution.
-        ((pred numberp)
-         (concur:with-executor
-             (lambda (resolve reject)
-               (run-at-time mode nil (lambda () (funcall task-wrapper resolve reject))))
-           cancel-token))
-
-        ;; Case 3: OS-level Process Execution.
-        ('async
-         (concur:from-callback
-          (lambda (cb)
-            (async-start `(lambda () (funcall ,task-wrapper #'identity #'identity)) cb))))
-
-        ;; Case 4: Native Emacs Thread Execution.
-        ('thread
-         (concur:with-executor
-             (lambda (resolve reject)
-               (let ((mailbox (list nil)) timer)
-                 (make-thread
-                  (lambda ()
+A `concur-promise` that will resolve with the result of FN or :FORM, or
+reject if the operation fails or is cancelled."
+  (let* ((label (or name (format "async-%S" (or form fn))))
+         ;; Dynamically bind the stack to trace nested async calls.
+         (concur-async--stack (cons label concur-async--stack)))
+    (let ((promise
+           (let ((task-wrapper
+                  ;; This wrapper handles execution, error handling, and hooks.
+                  (lambda (resolve-fn reject-fn)
+                    (concur-async--run-hooks :started label (concur:make-promise))
                     (condition-case err
-                        (setcar mailbox (cons :success (funcall fn)))
-                      (error (setcar mailbox (cons :failure err)))))
-                  (format "concur-thread-%s" label))
-                 (setq timer
-                       (run-with-timer 0.01 0.01
-                        (lambda ()
-                          (when-let ((result (car mailbox)))
-                            (cancel-timer timer)
-                            (pcase result
-                              (`(:success . ,val) (funcall resolve val))
-                              (`(:failure . ,err)
-                               (funcall reject `(concur-async-error :original-error ,err))))))))))
-           cancel-token))
+                        (let ((result (funcall fn)))
+                          (concur-async--run-hooks
+                           :succeeded label (concur:resolved! result))
+                          (funcall resolve-fn result))
+                      (error
+                       (let ((err-cond `(concur-async-error
+                                        :original-error ,err)))
+                         (concur-async--run-hooks
+                          :failed label (concur:rejected! err-cond) err-cond)
+                         (funcall reject-fn err-cond)))))))
+             (pcase mode
+               ;; Deferred: Run on the next idle cycle.
+               ((or 'deferred 't (pred null))
+                (concur:with-executor
+                    (lambda (resolve reject)
+                      (run-at-time
+                       0 nil (lambda () (funcall task-wrapper resolve reject))))
+                  :cancel-token cancel-token))
 
-        ;; Case 5: Unknown mode.
-        (_ (concur:rejected! `(concur-async-error "Unknown async mode" ,mode)))))))
-                
+               ;; Delayed: Run after a specific delay.
+               ((pred numberp)
+                (concur:with-executor
+                    (lambda (resolve reject)
+                      (run-at-time
+                       mode nil (lambda () (funcall task-wrapper resolve reject))))
+                  :cancel-token cancel-token))
+
+               ;; Background Process: Run in a separate Emacs process.
+               ('async
+                (let* ((require-forms
+                        (mapcar (lambda (lib) `(require ',lib)) require))
+                       (eval-form (or form `(funcall ,fn)))
+                       (lisp-form `(progn ,@require-forms ,eval-form)))
+                  (concur:from-callback
+                   (lambda (cb)
+                     ;; Wrap the lisp-form to inject the load-path
+                     ;; from the parent process into the child.
+                     (async-start ; `async-start` evaluates the form in a new Emacs.
+                      (async-inject-variables `((load-path . ,load-path))
+                                              lisp-form)
+                      cb)))))
+
+               ;; Native Thread: Run in a separate Lisp thread.
+               ('thread
+                (concur:with-executor
+                    (lambda (resolve reject)
+                      (let ((mailbox (list nil)) timer)
+                        (make-thread
+                         (lambda ()
+                           (condition-case err
+                               (setcar mailbox (cons :success (funcall fn)))
+                             (error (setcar mailbox (cons :failure err)))))
+                         (format "concur-thread-%s" label))
+                        (setq timer
+                              (run-with-timer
+                               0.01 0.01
+                               (lambda ()
+                                 (when-let ((result (car mailbox)))
+                                   (cancel-timer timer)
+                                   (pcase result
+                                     (`(:success . ,val) (funcall resolve val))
+                                     (`(:failure . ,err)
+                                      (funcall reject
+                                               `(concur-async-error
+                                                 :original-error ,err))))))))))
+                  :cancel-token cancel-token))
+
+               ;; Unknown mode: Reject immediately.
+               (_ (concur:rejected! `(concur-async-error
+                                      "Unknown async mode" ,mode)))))))
+      (concur--register-promise promise label)
+      promise)))
+
 ;;;###autoload
-(defun concur:deferred! (fn &optional name cancel-token)
+(defun concur:deferred! (fn &key name cancel-token)
   "Run FN asynchronously in a deferred manner and return a `concur-promise`.
 This is a convenience wrapper for `(concur:async! fn 'deferred ...)`.
 
 Arguments:
 - FN (function): The zero-argument function (thunk) to execute.
 - NAME (string, optional): A human-readable name for the operation.
-- CANCEL-TOKEN (`concur-cancel-token`): Optional token to interrupt execution.
+- CANCEL-TOKEN (`concur-cancel-token`): Token to interrupt execution.
 
 Returns:
 A `concur-promise` that resolves with the result of FN."
-  (concur:async! fn 'deferred name cancel-token))
+  (concur:async! fn 'deferred :name name :cancel-token cancel-token))
 
 ;;;###autoload
-(defmacro concur:defasync! (name args &rest body)
-  "Define an async function NAME that returns a promise, with an await-based body.
-This is the primary macro for creating asynchronous operations. It wraps
-`defcoroutine!` and `concur:from-coroutine` into a single definition.
+(defmacro concur:sequence! (&rest forms)
+  "Process ITEMS sequentially with async function FN.
+Each item is processed only after the previous one's promise resolves.
+
+Example:
+  (concur:sequence! (get-list-of-urls) :fn #'fetch-sequentially)
 
 Arguments:
-- NAME (symbol): The name of the async function.
-- ARGS (list): The argument list for the function.
-- BODY (forms): The asynchronous logic for the function.
+- forms: An `items-form` that evaluates to a list, followed by keywords.
+
+Keywords:
+- :fn (function): An async fn `(lambda (item))` that returns a promise.
+- :semaphore (`concur-semaphore`): Semaphore to acquire before each step."
+  (declare (indent 1) (debug t))
+  (let* ((parsed-args (concur--parse-macro-keywords forms '(:fn :semaphore)))
+         (items-form (plist-get parsed-args :primary-form))
+         (fn-form (plist-get parsed-args :fn))
+         (semaphore-form (plist-get parsed-args :semaphore)))
+    (unless fn-form (error "concur:sequence! requires the :fn keyword"))
+    `(let ((items ,items-form)
+           (fn ,fn-form)
+           (semaphore ,semaphore-form))
+       (if semaphore
+           ;; If there's a semaphore, wrap the original function `fn` with
+           ;; semaphore acquisition and release logic for each item.
+           (let ((sem-fn (lambda (item)
+                           (concur:chain
+                            (concur:promise-semaphore-acquire semaphore)
+                            (:then (lambda (_) (funcall fn item)))
+                            (:finally (lambda (_v _e)
+                                        (concur:semaphore-release semaphore)))))))
+             (concur:map-series items sem-fn))
+         ;; Otherwise, just use the original function directly.
+         (concur:map-series items fn)))))
+
+;;;###autoload
+(defmacro concur:parallel! (&rest forms)
+  "Process ITEMS in parallel with async function FN, with optional throttling.
+
+Example:
+  (concur:parallel! (get-list-of-files)
+                    :fn #'process-file-async
+                    :semaphore (concur:make-semaphore 4))
+
+Arguments:
+- forms: An `items-form` that evaluates to a list, followed by keywords.
+
+Keywords:
+- :fn (function): An async fn `(lambda (item))` that returns a promise.
+- :semaphore (`concur-semaphore`): A semaphore to limit concurrency."
+  (declare (indent 1) (debug t))
+  (let* ((parsed-args (concur--parse-macro-keywords forms '(:fn :semaphore)))
+         (items-form (plist-get parsed-args :primary-form))
+         (fn-form (plist-get parsed-args :fn))
+         (semaphore-form (plist-get parsed-args :semaphore)))
+    (unless fn-form (error "concur:parallel! requires the :fn keyword"))
+    `(let* ((items ,items-form)
+            (fn ,fn-form)
+            (semaphore ,semaphore-form)
+            ;; Eagerly create all promises.
+            (tasks (--map (funcall fn it) items)))
+       (if semaphore
+           ;; Let the semaphore wrapper control execution flow.
+           (concur:all (concur-async--apply-semaphore-to-tasks tasks semaphore))
+         (concur:all tasks)))))
+
+;;;###autoload
+(defmacro concur:race! (&rest forms)
+  "Race multiple asynchronous operations and settle with the first to finish.
+
+Arguments:
+- FORMS: A sequence of forms, each evaluating to a `concur-promise`.
+
+Keywords:
+- :SEMAPHORE (`concur-semaphore`, optional): A semaphore to apply to each
+  operation for throttling purposes.
 
 Returns:
-`nil`. Defines a function `NAME` as a side effect."
-  (declare (indent defun) (debug t))
-  (let* ((docstring (if (stringp (car body)) (pop body)
-                      (format "Asynchronous function %s." name)))
-         (coro-name (intern (format "%s--coro" name)))
-         (parsed-args (coroutines--parse-defcoroutine-args args))
-         (fn-args (car parsed-args)))
-    `(progn
-       (defcoroutine! ,coro-name ,args ,@body)
-       (defun ,name (,@fn-args &key cancel-token)
-         ,docstring
-         (concur:from-coroutine
-          (apply #',coro-name (list ,@fn-args))
-          cancel-token)))))
+A `concur-promise` that settles with the value or error of the first
+form to complete."
+  (declare (indent 1) (debug t))
+  (let* ((sem-key-pos (cl-position :semaphore forms))
+         (task-forms (if sem-key-pos (cl-subseq forms 0 sem-key-pos) forms))
+         (sem-form (when sem-key-pos (nth (1+ sem-key-pos) forms))))
+    `(let* ((awaitables (list ,@task-forms))
+            (semaphore ,sem-form))
+       (if semaphore
+           (concur:race
+            (concur-async--apply-semaphore-to-tasks awaitables semaphore))
+         (concur:race awaitables)))))
+
+;;;###autoload
+(defmacro concur:any! (&rest forms)
+  "Return a promise resolving with the first of FORMS to resolve successfully.
+If all FORMS reject, the returned promise rejects with an aggregate error.
+
+Example:
+  (concur:any!
+    (http-get \"mirror1\")
+    (http-get \"mirror2\"))
+
+Arguments:
+- FORMS: A sequence of forms, each evaluating to a `concur-promise`.
+
+Keywords:
+- :SEMAPHORE (`concur-semaphore`, optional): A semaphore for throttling.
+
+Returns:
+A `concur-promise` that resolves with the first successful result."
+  (declare (indent 1) (debug t))
+  (let* ((sem-key-pos (cl-position :semaphore forms))
+         (task-forms (if sem-key-pos (cl-subseq forms 0 sem-key-pos) forms))
+         (sem-form (when sem-key-pos (nth (1+ sem-key-pos) forms))))
+    `(let* ((awaitables (list ,@task-forms))
+            (semaphore ,sem-form))
+       (if semaphore
+           (concur:any
+            (concur-async--apply-semaphore-to-tasks awaitables semaphore))
+         (concur:any awaitables)))))
 
 ;;;###autoload
 (defmacro concur:let-promise (bindings &rest body)
@@ -258,106 +549,81 @@ A promise that resolves with the value of the last form in BODY."
                       (concur:let-promise* ,(cdr bindings) ,@body))))))
 
 ;;;###autoload
-(cl-defun concur:sequence! (items fn &key semaphore)
-  "Process ITEMS sequentially with async function FN.
-Each item is processed only after the previous one's promise resolves.
+(defmacro concur:unwind-protect! (body-form &rest cleanup-forms)
+  "Execute BODY-FORM and guarantee CLEANUP-FORMS run afterward.
+This is the asynchronous equivalent of `unwind-protect`.
+
+The BODY-FORM should evaluate to a promise. The returned promise will adopt
+the settlement (resolution or rejection) of the BODY-FORM's promise, but
+only after the promise generated by the CLEANUP-FORMS has completed.
 
 Arguments:
-- ITEMS (list): The list of items to process.
-- FN (function): An async fn `(lambda (item))` that returns a promise.
-- :SEMAPHORE (`concur-semaphore`): A semaphore to acquire before each step.
-
-Returns:
-A promise that resolves with a list of results, or rejects on first failure."
-  (let ((tasks (--map (funcall fn it) items)))
-    (if semaphore
-        (concur:map-series
-         (concur-async--apply-semaphore-to-tasks tasks semaphore)
-         #'identity)
-      (concur:map-series items fn))))
+- BODY-FORM: The main asynchronous operation; a single form that
+  evaluates to a promise.
+- CLEANUP-FORMS: One or more forms to execute for cleanup. These are
+  wrapped in a `(lambda () ...)` and executed by `concur:finally`."
+  (declare (indent 1) (debug t))
+  `(concur:finally ,body-form
+                   (lambda (_v _e) ,@cleanup-forms)))
 
 ;;;###autoload
-(cl-defun concur:parallel! (items fn &key semaphore)
-  "Process ITEMS in parallel with async function FN, with optional throttling.
+(defmacro concur:defasync! (name args &rest body)
+  "Define an async function NAME that returns a promise, with an await-based body.
+This is the primary macro for creating asynchronous operations. It wraps
+`defcoroutine!` and `concur:from-coroutine` into a single definition.
 
 Arguments:
-- ITEMS (list): The list of items to process.
-- FN (function): An async fn `(lambda (item))` that returns a promise.
-- :SEMAPHORE (`concur-semaphore`): A semaphore to limit concurrency.
+- NAME (symbol): The name of the async function.
+- ARGS (list): The argument list for the function.
+- BODY (forms): The asynchronous logic for the function.
 
 Returns:
-A promise that resolves with a list of results, or rejects on first failure."
-  (let ((tasks (--map (funcall fn it) items)))
-    (if semaphore
-        (concur:all (concur-async--apply-semaphore-to-tasks tasks semaphore))
-      (concur:all tasks))))
+`nil`. Defines a function `NAME` as a side effect."
+  (declare (indent defun) (debug t))
+  (let* ((docstring (if (stringp (car body)) (pop body)
+                      (format "Asynchronous function %s." name)))
+         (coro-name (intern (format "%s--coro" name)))
+         (parsed-args (coroutines--parse-defcoroutine-args args))
+         (fn-args (car parsed-args)))
+    `(progn
+       (defcoroutine! ,coro-name ,args ,@body)
+       (defun ,name (,@fn-args &key cancel-token)
+         ,docstring
+         (let ((promise (concur:from-coroutine
+                         (apply #',coro-name (list ,@fn-args))
+                         cancel-token)))
+           (concur--register-promise promise ',name)
+           promise)))))
 
 ;;;###autoload
-(defmacro concur:race! (&rest forms)
-  "Race multiple asynchronous operations and settle with the first to finish.
+(defmacro concur:while! (condition-form &rest body)
+  "Execute BODY asynchronously while CONDITION-FORM resolves to non-nil.
+Both CONDITION-FORM and BODY are forms that should evaluate to a promise.
+The loop waits for the condition promise to resolve. If its value is
+non-nil, it waits for the body promise to resolve, then repeats.
 
 Arguments:
-- FORMS: A sequence of forms, each evaluating to a `concur-promise` or
-  `concur-future`.
-- :SEMAPHORE (`concur-semaphore`, optional): A keyword argument specifying
-  a semaphore to apply to each operation for throttling purposes.
+- CONDITION-FORM: A form that returns a promise. The loop continues
+  as long as this promise resolves to a non-nil value.
+- BODY: One or more forms that return a promise, executed on each
+  iteration.
 
 Returns:
-A `concur-promise` that settles with the value or error of the first
-form to complete."
-  (declare (indent 0) (debug t))
-  ;; --- Manually parse keyword arguments from the &rest list ---
-  (let* ((semaphore-keyword-pos (cl-position :semaphore forms))
-         (task-forms (if semaphore-keyword-pos
-                         (cl-subseq forms 0 semaphore-keyword-pos)
-                       forms))
-         (semaphore-form (if semaphore-keyword-pos
-                             (nth (1+ semaphore-keyword-pos) forms)
-                           nil)))
-
-    ;; --- Generate the simplified runtime code ---
-    `(let* ((awaitables-list (list ,@task-forms))
-            (semaphore ,semaphore-form))
-       ;; The low-level `concur:race` will handle normalizing any futures
-       ;; in the list into promises automatically.
-       (if semaphore
-           (concur:race
-            (concur-async--apply-semaphore-to-tasks awaitables-list semaphore))
-         (concur:race awaitables-list)))))
+A promise that resolves to `nil` when the loop terminates."
+  (declare (indent 1) (debug t))
+  (let ((coro-name (gensym "while-coro-")))
+    `(let ((promise
+            (concur:from-coroutine
+             (defcoroutine! ,coro-name ()
+               "Internal coroutine for `concur:while!`."
+               (while (yield ,condition-form)
+                 (yield (progn ,@body)))
+               nil)))) ; while loop resolves to nil
+       (concur--register-promise promise 'while!)
+       promise)))
 
 ;;;###autoload
-(defun concur:coroutine-all (runners &key semaphore)
-  "Run a list of coroutine RUNNERS in parallel and wait for all to complete.
-
-Arguments:
-- RUNNERS (list): A list of coroutine runner functions.
-- :SEMAPHORE (`concur-semaphore`): A semaphore to limit concurrency.
-
-Returns:
-A promise that resolves with a list of all results, or rejects if any
-of the coroutines reject."
-  (let* ((promises (-map #'concur:from-coroutine runners)))
-    (if semaphore
-        (concur:all (concur-async--apply-semaphore-to-tasks promises semaphore))
-      (concur:all promises))))
-
-;;;###autoload
-(defun concur:coroutine-race (runners &key semaphore)
-  "Race a list of coroutine RUNNERS in parallel.
-
-Arguments:
-- RUNNERS (list): A list of coroutine runner functions.
-- :SEMAPHORE (`concur-semaphore`): A semaphore to limit concurrency.
-
-Returns:
-A promise that settles with the first coroutine to settle."
-  (let* ((promises (-map #'concur:from-coroutine runners)))
-    (if semaphore
-        (concur:race (concur-async--apply-semaphore-to-tasks promises semaphore))
-      (concur:race promises))))
-
-;;;###autoload
-(cl-defun concur:map-pool (items fn &key (size 4))
+(cl-defun concur:map-pool (items fn &key (size 4) (cancel-token nil))
   "Process ITEMS using async FN, with a concurrency limit of SIZE.
 This function creates a pool of coroutines to process items in parallel,
 but limits the number of concurrently running coroutines to SIZE.
@@ -365,6 +631,8 @@ but limits the number of concurrently running coroutines to SIZE.
 Arguments:
 - ITEMS (list): The list of items to process.
 - FN (function): An async fn `(lambda (item))` that returns a coroutine runner.
+
+Keywords:
 - :SIZE (integer): The maximum number of coroutines to run at once.
 
 Returns:
@@ -376,27 +644,74 @@ order of ITEMS."
                (results (make-vector total nil))
                (item-queue (copy-sequence items))
                (in-flight 0)
-               (completed 0))
+               (completed 0)
+               (error-occured nil))
           (cl-labels
               ((process-next ()
-                 (while (and (< in-flight size) item-queue)
-                   (let* ((item (pop item-queue))
-                          (runner (funcall fn item))
-                          ;; Calculate index before item-queue is modified.
-                          (index (- total (length item-queue) 1)))
-                     (cl-incf in-flight)
-                     (concur:then
-                      (concur:from-coroutine runner)
-                      (lambda (res)
-                        (aset results index res)
-                        (cl-decf in-flight)
-                        (cl-incf completed)
-                        (if (= completed total)
-                            (funcall resolve-executor (cl-coerce results 'list))
-                          (process-next)))
-                      (lambda (err)
-                        (funcall reject-executor err)))))))
-            (process-next))))))
+                 (when (not error-occured)
+                   (while (and (< in-flight size) item-queue)
+                     (let* ((item (pop item-queue))
+                            ;; `runner` must be a coroutine.
+                            (runner (funcall fn item))
+                            (index (- total (length item-queue) 1)))
+                       (cl-incf in-flight)
+                       (concur:then
+                        (concur:from-coroutine runner)
+                        (lambda (res)
+                          (aset results index res)
+                          (cl-decf in-flight)
+                          (cl-incf completed)
+                          (if (= completed total)
+                              (funcall resolve-executor
+                                       (cl-coerce results 'list))
+                            (process-next)))
+                        (lambda (err)
+                          (unless error-occured
+                            (setq error-occured t)
+                            (funcall reject-executor err)))))))))
+            (if (null items)
+                (funcall resolve-executor nil)
+              (process-next))))) 
+        :cancel-token cancel-token))
+
+;;;###autoload
+(defun concur:coroutine-all (runners &key semaphore)
+  "Run a list of coroutine RUNNERS in parallel and wait for all to complete.
+
+Arguments:
+- RUNNERS (list): A list of coroutine runner functions.
+
+Keywords:
+- :SEMAPHORE (`concur-semaphore`): A semaphore to limit concurrency.
+
+Returns:
+A promise that resolves with a list of all results, or rejects if any
+of the coroutines reject."
+  (let* ((promises (--map (concur:from-coroutine it) runners)))
+    (if semaphore
+        (concur:all (concur-async--apply-semaphore-to-tasks promises semaphore))
+      (concur:all promises))))
+
+;;;###autoload
+(defun concur:coroutine-race (runners &key semaphore)
+  "Race a list of coroutine RUNNERS in parallel.
+
+Arguments:
+- RUNNERS (list): A list of coroutine runner functions.
+
+Keywords:
+- :SEMAPHORE (`concur-semaphore`): A semaphore to limit concurrency.
+
+Returns:
+A promise that settles with the first coroutine to settle."
+  (let* ((promises (--map (concur:from-coroutine it) runners)))
+    (if semaphore
+        (concur:race (concur-async--apply-semaphore-to-tasks promises semaphore))
+      (concur:race promises))))
 
 (provide 'concur-async)
 ;;; concur-async.el ends here
+
+
+
+

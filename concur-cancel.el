@@ -92,7 +92,7 @@ Returns:
     t))
 
 ;;;###autoload
-(defun concur:cancel-token-cancel! (token)
+(defun concur:cancel-token-cancel (token)
   "Cancel TOKEN, mark it inactive, and invoke all registered callbacks.
 This function is idempotent; it does nothing if the token is already inactive.
 The callbacks are invoked once and then cleared for the token.
