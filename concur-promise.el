@@ -9,10 +9,9 @@
 
 ;;; Code:
 
-(require 'concur-promise-core)
-(require 'concur-promise-chain)
-(require 'concur-promise-combinators)
-(require 'concur-promise-utils)
+(require 'concur-core)
+(require 'concur-chain)
+(require 'concur-combinators)
 
 (provide 'concur-promise)
 ;;; concur-promise.el ends here

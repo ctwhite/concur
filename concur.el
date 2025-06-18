@@ -37,11 +37,6 @@
 (defconst concur-version "1.0.0"
   "The version number of the concur.el library.")
 
-;;;###autoload
-(defgroup concur nil
-  "Asynchronous programming library for Emacs."
-  :group 'lisp)
-
 (require 'concur-hooks)
 
 ;; Load the main building blocks of the library.

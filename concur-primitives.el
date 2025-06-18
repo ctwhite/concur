@@ -16,7 +16,7 @@
 
 (define-error 'concur:timeout-error "A concurrency operation timed out.")
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Once Execution Primitives
 
 ;;;###autoload
@@ -33,7 +33,7 @@ Arguments:
 
 Returns:
 The result of executing either the BODY or the FALLBACK forms."
-  (declare (indent 2) (debug t))
+  (declare (indent 1) (debug t))
   (let ((fallback-forms (if (and (consp fallback) (eq (car fallback) :else))
                             (cdr fallback)
                           (list fallback))))
@@ -43,7 +43,7 @@ The result of executing either the BODY or the FALLBACK forms."
            (progn ,@body)
          (setf ,place t)))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Lock (Mutex) Primitives
 
 (eval-and-compile
@@ -72,7 +72,6 @@ A new `concur-lock` object, initialized to an unlocked state."
 ;;;###autoload
 (defun concur:lock-acquire (lock &optional owner)
   "Try to acquire LOCK non-blockingly.
-In Emacs's single-threaded environment, this is a cooperative mechanism.
 
 Arguments:
 - LOCK (`concur-lock`): A lock object created by `concur:make-lock`.
@@ -81,7 +80,7 @@ Arguments:
 Returns:
 `t` if the lock was successfully acquired, `nil` otherwise."
   (unless (concur-lock-p lock)
-    (error "Invalid lock object provided to concur:lock-acquire"))
+    (error "Invalid lock object to concur:lock-acquire"))
   (unless (concur-lock-locked-p lock)
     (setf (concur-lock-locked-p lock) t)
     (setf (concur-lock-owner lock) owner)
@@ -97,12 +96,9 @@ Arguments:
   matches the current lock owner.
 
 Returns:
-`t` if the lock was successfully released.
-
-Errors:
-If `OWNER` is provided and does not match the current lock owner."
+`t` if the lock was successfully released."
   (unless (concur-lock-p lock)
-    (error "Invalid lock object provided to concur:lock-release"))
+    (error "Invalid lock object to concur:lock-release"))
   (when (and owner (concur-lock-owner lock)
              (not (eq owner (concur-lock-owner lock))))
     (error "Task %S cannot release lock owned by %S"
@@ -114,9 +110,8 @@ If `OWNER` is provided and does not match the current lock owner."
 ;;;###autoload
 (defmacro concur:with-mutex! (lock-obj fallback &rest body)
   "Execute BODY within a critical section guarded by LOCK-OBJ.
-This macro attempts to acquire `LOCK-OBJ`. If successful, it executes BODY and
-guarantees the lock is released afterward. If the lock is already held, it
-executes the FALLBACK forms instead.
+If the lock is acquired, executes BODY and guarantees release.
+If the lock is already held, executes FALLBACK instead.
 
 Arguments:
 - LOCK-OBJ: A `concur-lock` object.
@@ -126,7 +121,7 @@ Arguments:
 
 Returns:
 The result of BODY or FALLBACK."
-  (declare (indent 2) (debug t))
+  (declare (indent 1) (debug t))
   (let ((fallback-forms (if (and (consp fallback) (eq (car fallback) :else))
                             (cdr fallback)
                           (list fallback)))
@@ -141,8 +136,7 @@ The result of BODY or FALLBACK."
 ;;;###autoload
 (defmacro concur:with-lock! (place fallback &rest body)
   "A simplified mutex using a variable (PLACE) as the lock.
-This macro uses any non-nil value in PLACE to signify a locked state. It's
-less robust than object-based locks but useful for simple cases.
+Uses any non-nil value in PLACE to signify a locked state.
 
 Arguments:
 - PLACE: A variable or place to use as the lock.
@@ -151,7 +145,7 @@ Arguments:
 
 Returns:
 The result of BODY or FALLBACK."
-  (declare (indent 2) (debug t))
+  (declare (indent 1) (debug t))
   (let ((fallback-forms (if (and (consp fallback) (eq (car fallback) :else))
                             (cdr fallback)
                           (list fallback))))
@@ -163,7 +157,7 @@ The result of BODY or FALLBACK."
              ,@body)
          (setf ,place nil)))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Blocking Primitives
 
 ;;;###autoload
@@ -172,17 +166,16 @@ The result of BODY or FALLBACK."
           &key timeout interval label error-function timeout-callback
           (start-time (float-time)))
   "Block cooperatively until TEST returns non-nil, then run SUCCESS-CALLBACK.
-This function does not block Emacs's main thread. Instead, it uses a timer
-to periodically re-check the `TEST` function.
+This uses a timer to periodically re-check the `TEST` function.
 
 Arguments:
-- TEST (function): A zero-argument function. Blocking stops when it returns non-nil.
+- TEST (function): A zero-argument function; stops when it returns non-nil.
 - SUCCESS-CALLBACK (function): A zero-argument function called upon success.
 - :TIMEOUT (float): Optional maximum seconds to wait.
 - :INTERVAL (float): Optional seconds between checks. Defaults to 0.1.
 - :LABEL (any): Optional metadata for logging/tracking.
-- :ERROR-FUNCTION (function): A function `(lambda (label))` called on timeout.
-- :TIMEOUT-CALLBACK (function): A zero-argument function called on timeout.
+- :ERROR-FUNCTION (function): Function `(lambda (label))` called on timeout.
+- :TIMEOUT-CALLBACK (function): Zero-arg function called on timeout.
   Takes precedence over `:error-function`.
 - :START-TIME (float, internal): Do not set manually.
 
@@ -206,7 +199,7 @@ Returns:
                            :timeout-callback timeout-callback
                            :start-time start-time))))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Semaphore Primitives
 
 (eval-and-compile
@@ -243,7 +236,6 @@ A new `concur-semaphore` object."
 ;;;###autoload
 (defun concur:semaphore-try-acquire (sem)
   "Try to acquire SEM without blocking.
-Immediately attempts to acquire one slot from the semaphore.
 
 Arguments:
 - SEM (`concur-semaphore`): The semaphore to acquire.
@@ -262,7 +254,9 @@ Returns:
 ;;;###autoload
 (defun concur:semaphore-release (sem)
   "Release one slot in SEM.
-Increments the semaphore's available slots count, up to its maximum.
+Increments the semaphore's available slots count. Signals an error if the
+semaphore is already at its maximum capacity, which indicates a logic
+error (releasing more than was acquired).
 
 Arguments:
 - SEM (`concur-semaphore`): The semaphore to release.
@@ -273,31 +267,19 @@ The new count of the semaphore."
   (concur:with-mutex! (concur-semaphore-lock sem)
       (:else (error "Semaphore %S lock contention on release"
                     (concur-semaphore-name sem)))
-    (cl-incf (concur-semaphore-count sem))
-    (when (> (concur-semaphore-count sem) (concur-semaphore-max-count sem))
-      (setf (concur-semaphore-count sem) (concur-semaphore-max-count sem)))
-    (concur-semaphore-count sem)))
+    ;; The fix for the design flaw is here.
+    (if (>= (concur-semaphore-count sem) (concur-semaphore-max-count sem))
+        (error "Cannot release semaphore '%s': already at maximum capacity (%d)"
+               (concur-semaphore-name sem) (concur-semaphore-max-count sem))
+      (cl-incf (concur-semaphore-count sem)))))
 
 ;;;###autoload
 (cl-defun concur:semaphore-acquire (sem success-callback
-                                 &key timeout timeout-callback)
-  "Acquire a slot from SEM, blocking cooperatively if necessary.
-If no slots are available, it will wait cooperatively using
-`concur:block-until` for a slot to be freed.
-
-Arguments:
-- SEM (`concur-semaphore`): The semaphore to acquire.
-- SUCCESS-CALLBACK (function): A zero-argument function called upon success.
-- :TIMEOUT (float): Optional maximum seconds to wait for a slot.
-- :TIMEOUT-CALLBACK (function): A zero-argument function called on timeout.
-
-Returns:
-`nil`. The result is delivered via the success or timeout callback."
+                                       &key timeout timeout-callback)
+  "Acquire a slot from SEM, blocking cooperatively if necessary."
   (unless (concur-semaphore-p sem) (error "Not a valid semaphore: %S" sem))
-  ;; First, try a quick, non-blocking acquire.
   (if (concur:semaphore-try-acquire sem)
       (funcall success-callback)
-    ;; If that fails, start the cooperative blocking process.
     (concur:block-until
      #'(lambda () (concur:semaphore-try-acquire sem))
      success-callback
@@ -310,18 +292,18 @@ Returns:
   "Execute BODY after acquiring a slot from SEM-OBJ.
 Wraps `concur:semaphore-acquire` for a convenient block-based syntax. It
 acquires a semaphore slot and executes BODY, always releasing the semaphore
-afterward. The process is fully asynchronous and cooperative.
+afterward. This process is fully asynchronous and cooperative.
 
 Arguments:
 - SEM-OBJ: The semaphore object to acquire.
 - FALLBACK: Code to execute if acquiring the semaphore times out.
   Can be a single form or `(:else ...)` forms.
-- BODY: The forms to execute. Can contain keyword arguments like `:timeout`
+- BODY: The forms to execute, optionally with `:timeout` as a keyword arg
   for the underlying acquire operation.
 
 Returns:
 `nil`. BODY is executed asynchronously within a callback."
-  (declare (indent 2) (debug t))
+  (declare (indent 1) (debug t))
   (let* ((params (cl-loop for (key val) on body by #'cddr
                           while (keywordp key)
                           collect key and collect val))

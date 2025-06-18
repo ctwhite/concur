@@ -40,6 +40,15 @@ Arguments:
   :type 'hook
   :group 'concur-hooks)
 
+(defcustom concur-normalize-awaitable-hook nil
+  "Hook run to normalize arbitrary awaitable objects into `concur-promise`s.
+Functions added to this hook should accept one argument (the awaitable object)
+and return a `concur-promise` if they can normalize it, or `nil` otherwise.
+Handlers are run in order until one succeeds.
+Example: `(add-hook 'concur-normalize-awaitable-hook #'concur-future-normalize-future)`."
+  :type 'hook
+  :group 'concur-hooks)
+
 (defcustom concur-log-hook nil
   "Hook run for logging messages within the Concur library.
 

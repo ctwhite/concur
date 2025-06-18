@@ -1,40 +1,30 @@
-;;; concur-future.el --- Concurrency primitives for lazy asynchronous tasks -*-
+;;; concur-future.el --- Concurrency primitives for lazy async tasks -*-
 ;;; lexical-binding: t; -*-
 
 ;;; Commentary:
-;;
 ;; This file provides primitives for working with "futures" in Emacs Lisp.
-;;
-;; Futures represent the result of a computation that may not have completed
-;; yet. They are a key concept in asynchronous programming, allowing you to
-;; define a long-running task and defer its execution until the result is
-;; actually needed.
+;; Futures represent a deferred computation evaluated lazily when needed.
 ;;
 ;; Key Concepts:
+;; - Future: A `concur-future` object, holding a thunk (zero-arg fn).
+;; - Lazy Evaluation: Thunk runs only when future is "forced".
+;; - Promises: Futures use promises internally to manage async result.
 ;;
-;; - Future: A `concur-future` object represents a deferred computation.
-;;   It holds a "thunk" (a zero-argument function) that is evaluated only
-;;   when the future's value is requested.
-;;
-;; - Lazy Evaluation: Futures are evaluated lazily. The computation is not
-;;   performed when `concur:make-future` is called, but only when the future
-;;   is "forced" via `concur:force` or `concur:future-get`.
-;;
-;; - Promises: Futures use promises (`concur-promise`) internally to manage the
-;;   asynchronous result. Forcing a future returns its underlying promise.
+;; Enhancements in this module include:
+;; - `concur:future-resolved!` and `concur:future-rejected!` for pre-settled futures.
+;; - `concur:future-delay` for futures that resolve after a delay.
+;; - `concur:future-race` and `concur:future-all` for compositing futures.
+;; - `concur:future-then` and `concur:future-catch` as semantic aliases.
+;; - Integration with `concur-normalize-awaitable-hook` for extensibility.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'dash)
-(require 'concur-promise) 
 (require 'concur-ast)
+(require 'concur-promise)
 
-;; Forward declarations to satisfy the byte-compiler.
-(declare-function yield--internal-throw-form "" '(value tag))
-(declare-function concur-ast-lift-lambda-form "concur-ast")
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definition
 
 (cl-defstruct (concur-future (:constructor %%make-future))
@@ -50,264 +40,201 @@ Fields:
   thunk
   evaluated?)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Public API - Future Creation & Forcing
 
-;; Replace concur:make-future with this final version.
+;;;###autoload
 (cl-defmacro concur:make-future (thunk-form &environment env)
-  "Create a `concur-future` from a zero-argument function THUNK-FORM."
-  (declare (indent 1))
-  (let* (;; Use the public API for AST analysis, which handles internal macro-expansion
-         ;; and correctly identifies free variables based on lexical scope.
-         (analysis-result (concur-ast-analysis thunk-form env)) ; NEW: Use the public analysis API
-         ;; Extract the expanded callable form (the thunk itself) from the analysis result.
-         (original-thunk (concur-ast-analysis-result-expanded-callable-form analysis-result)) ; NEW
-         ;; Extract the list of identified free variables from the analysis result.
-         (free-vars (concur-ast-analysis-result-free-vars-list analysis-result)) ; NEW
-         ;; Generate the Lisp code that captures the values of the identified
-         ;; free variables into a hash table. This uses the dedicated helper.
-         (context-form (concur-ast-make-captured-vars-form free-vars))) ; NEW
-    ;; The outer `let` captures the `context` hash table when `concur:make-future`
-    ;; is expanded. This `context` will contain the values of the free variables
-    ;; at the time the future is created.
+  "Create a `concur-future` from THUNK-FORM.
+The returned future represents a computation that is performed lazily when
+`concur:force` is called. Lexical variables are captured correctly.
+
+Arguments:
+- `thunk-form`: (lambda-form) A zero-argument lambda `(lambda () ...)`
+  that performs the computation.
+
+Returns:
+- (`concur-future`) A new `concur-future` object."
+  (declare (indent 1) (debug t))
+  (let* ((analysis (concur-ast-analysis thunk-form env))
+         (thunk (concur-ast-analysis-result-expanded-callable-form analysis))
+         (free-vars (concur-ast-analysis-result-free-vars-list analysis))
+         (context-form (concur-ast-make-captured-vars-form free-vars)))
+    ;; The outer `let` captures the `context` hash table when the future is
+    ;; created, preserving the values of the free variables.
     `(let ((context ,context-form))
        (%%make-future
-        ;; The `:thunk` field of the `concur-future` struct becomes a new lambda.
-        ;; This lambda forms a closure over the `context` hash table.
         :thunk (lambda ()
-                 ;; When the thunk is finally executed (which might be later, asynchronously),
-                 ;; it first unpacks the captured variable values from the `context` hash table
-                 ;; into its own lexical environment via a `let` binding.
+                 ;; When the thunk finally executes, it unpacks the captured
+                 ;; variable values into its own lexical environment.
                  (let ,(cl-loop for var in free-vars
-                                collect `(,var (concur--safe-ht-get context ',var))) ; Use assumed safe helper
-                   ;; Finally, it calls the user's original thunk with the re-established
-                   ;; lexical environment, allowing it to access the captured variables.
-                   (funcall ,original-thunk)))))))
-                   
-;; ;; Replace concur:make-future with this final version.
-;; (cl-defmacro concur:make-future (thunk-form &environment env)
-;;   "Create a `concur-future` from a zero-argument function THUNK-FORM."
-;;   (declare (indent 1))
-;;   (let* ((expanded-thunk (macroexpand-all thunk-form env))
-;;          (lift-info (concur-ast-lift-lambda-form expanded-thunk))
-;;          (original-thunk (car lift-info))
-;;          (free-vars (cdr lift-info))
-;;          ;; Generate code that captures variable values into a hash table
-;;          ;; at the moment `concur:make-future` is called.
-;;          (context-form
-;;           (if (null free-vars) 'nil
-;;             (let ((ht-sym (gensym "context-ht-")))
-;;               `(let ((,ht-sym (make-hash-table :test 'eq)))
-;;                  ,@(mapcar (lambda (v) `(setf (ht-get ,ht-sym ',v) ,v))
-;;                            free-vars)
-;;                  ,ht-sym)))))
-;;     ;; The outer `let` captures the context when `make-future` is called.
-;;     `(let ((context ,context-form))
-;;        (%%make-future
-;;         ;; The :thunk becomes a closure over that `context` hash table.
-;;         :thunk (lambda ()
-;;                  ;; When the thunk is finally run, it unpacks the context...
-;;                  (let ,(cl-loop for var in free-vars
-;;                                 collect `(,var (ht-get context ',var)))
-;;                    ;; ...and calls the user's original code.
-;;                    (funcall ,original-thunk)))))))
-                   
-;; ;;;###autoload
-;; (cl-defmacro concur:make-future (thunk-form &environment env)
-;;   "Create a `concur-future` from a zero-argument function THUNK-FORM.
-;; The returned future represents a computation that is performed lazily when
-;; `concur:force` is called. When forced, THUNK-FORM is executed. If it returns a
-;; value, the future's internal promise resolves with it. If it signals an
-;; error, the promise rejects.
-
-;; Arguments:
-;; - THUNK-FORM (lambda-form): A zero-argument lambda form `(lambda () ...)`
-;;   that performs the computation.
-
-;; Returns:
-;; A new `concur-future` object."
-;;   (declare (indent 1))
-
-;;   (unless (and (consp thunk-form) (eq (car thunk-form) 'lambda))
-;;     (error "concur:make-future: THUNK-FORM must be a lambda form, got %S" thunk-form))
-
-;;   (let* ((expanded-thunk (macroexpand-all thunk-form env))
-;;          (unwrapped-thunk (concur--unwrap-handler-form expanded-thunk))
-;;          (lifted-info (concur-ast-lift-lambda-form unwrapped-thunk))
-;;          (lifted-thunk (car lifted-info))
-;;          (free-vars-list (cdr lifted-info))
-;;          (runtime-context-alist-form
-;;           `(list ,@(cl-loop for var-sym in free-vars-list
-;;                             collect `(cons ',var-sym ,var-sym)))))
-
-;;     `(%%make-future
-;;       :thunk (lambda ()
-;;                (funcall ,lifted-thunk ,runtime-context-alist-form)))))
+                                collect `(,var (concur-safe-ht-get context ',var)))
+                   (funcall ,thunk)))))))
 
 ;;;###autoload
 (defun concur:force (future)
   "Force FUTURE's thunk to run if not already evaluated.
-This function is idempotent; calling it multiple times on the same future will
-only run the thunk once. It correctly handles thunks that may themselves
+This function is idempotent. It correctly handles thunks that may themselves
 return a `concur-promise`.
 
 Arguments:
-- FUTURE (`concur-future`): The future object to force.
+- `future`: (`concur-future`) The future object to force.
 
 Returns:
-The `concur-promise` associated with the future."
-  (when (concur-future-p future)
-    (unless (concur-future-evaluated? future)
-      (setf (concur-future-evaluated? future) t)
-      (let ((outer-promise (concur:make-promise)))
-        (setf (concur-future-promise future) outer-promise)
-        (condition-case err
-            (let ((thunk-result (funcall (concur-future-thunk future))))
-              (if (concur-promise-p thunk-result)
-                  (concur:then thunk-result
-                               (lambda (val) (concur:resolve outer-promise val))
-                               (lambda (e) (concur:reject outer-promise e)))
-                (concur:resolve outer-promise thunk-result)))
-          (error
-           (concur:reject outer-promise err)))))
-    (concur-future-promise future)))
+- (`concur-promise`) The promise associated with the future."
+  (unless (concur-future-p future)
+    (error "Invalid future object to concur:force: %S" future))
+
+  (when (concur-future-evaluated? future)
+    (cl-return-from concur:force (concur-future-promise future)))
+
+  ;; Mark as evaluated immediately to prevent re-entrancy.
+  (setf (concur-future-evaluated? future) t)
+
+  ;; Create and store the promise that will hold the future's result.
+  (setf (concur-future-promise future) (concur:make-promise))
+
+  (let ((promise (concur-future-promise future)))
+    (concur--log :debug "[FUTURE:force] Forcing future, created promise %S."
+                 (concur:format-promise promise))
+    (condition-case err
+        (let ((thunk-result (funcall (concur-future-thunk future))))
+          (if (concur-promise-p thunk-result)
+              ;; If thunk returns a promise, chain our promise to it.
+              (concur:then thunk-result
+                           (lambda (val) (concur:resolve promise val))
+                           (lambda (e) (concur:reject promise e)))
+            ;; Otherwise, resolve our promise directly.
+            (concur:resolve promise thunk-result)))
+      (error
+       ;; If thunk signals an error, reject our promise.
+       (concur--log :error "[FUTURE:force] Thunk failed with error: %S." err)
+       (concur:reject promise err))))
+  (concur-future-promise future))
 
 ;;;###autoload
 (defun concur:future-get (future &optional timeout)
   "Force FUTURE and get its result, blocking cooperatively until available.
-This function is synchronous and will block the Emacs UI until the future's
-promise settles or the `TIMEOUT` is reached. It behaves identically to
-`concur:await`. **Use with caution in interactive code.**
+This function is synchronous and behaves identically to `concur:await`.
+**Use with caution in interactive code.**
 
 Arguments:
-- FUTURE (`concur-future`): The future to get the result from.
-- TIMEOUT (float, optional): Maximum seconds to wait.
+- `future`: (`concur-future`) The future to get the result from.
+- `timeout`: (float, optional) Maximum seconds to wait.
 
 Returns:
-The resolved value of the future's promise.
-
-Errors:
-- Signals a `concur:timeout-error` if the timeout is reached.
-- Signals the error from the promise if the future rejects."
+- (any) The resolved value of the future's promise."
   (let ((promise (concur:force future)))
-    (unless (concur-promise-p promise)
-      (error "Invalid future object provided to future-get: %S" future))
     (concur:await promise timeout)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Future Chaining & Composition
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Public API - Future Creation (Pre-settled & Delayed)
 
 ;;;###autoload
-(cl-defmacro concur:map-future (future transform-fn &environment env)
+(cl-defun concur:future-resolved! (value)
+  "Return a new `concur-future` that is already resolved with VALUE."
+  (concur--log :debug "[FUTURE:resolved!] Creating pre-resolved future.")
+  (let ((promise (concur:resolved! value)))
+    (%%make-future :promise promise :evaluated? t :thunk (lambda () value))))
+
+;;;###autoload
+(cl-defun concur:future-rejected! (error)
+  "Return a new `concur-future` that is already rejected with ERROR."
+  (concur--log :debug "[FUTURE:rejected!] Creating pre-rejected future.")
+  (let ((promise (concur:rejected! error)))
+    (%%make-future :promise promise :evaluated? t :thunk (lambda () (error error)))))
+
+;;;###autoload
+(cl-defun concur:future-delay (seconds &optional value)
+  "Create a `concur-future` that resolves with VALUE after SECONDS."
+  (concur--log :debug "[FUTURE:delay] Creating delayed future for %s seconds." seconds)
+  (concur:make-future (lambda () (concur:delay seconds value))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Public API - Future Chaining & Composition
+
+;;;###autoload
+(cl-defmacro concur:future-then (future transform-fn &environment env)
   "Apply TRANSFORM-FN to the result of a future, creating a new future.
 When the new future is forced, it first forces the original `FUTURE`.
 Once the original future resolves, `TRANSFORM-FN` is applied to its result.
 
 Arguments:
-- FUTURE (`concur-future`): The original future object.
-- TRANSFORM-FN (lambda-form): A lambda form `(lambda (value))` that receives the
-  resolved value of `FUTURE`. It can return a regular value or a promise.
+- `future`: (`concur-future`) The original future object.
+- `transform-fn`: (lambda-form) A lambda `(lambda (value) ...)` that receives
+  the resolved value of `FUTURE`.
 
 Returns:
-A new `concur-future` representing the transformed computation."
-  (declare (indent 1))
-  ;; By using `cl-defmacro` here, we ensure that the `concur:make-future`
-  ;; call inside this expansion happens in the correct lexical context
-  ;; captured from the user's call site.
+- (`concur-future`) A new `concur-future` representing the transformed task."
+  (declare (indent 1) (debug t))
   `(concur:make-future
     (lambda ()
-      (concur:then (concur:force ,future)
-                   ,transform-fn))))
+      (concur:then (concur:force ,future) ,transform-fn))))
 
 ;;;###autoload
-(cl-defmacro concur:then-future (future callback-fn &environment env)
-  "Alias for `concur:map-future`.
-Provided for semantic clarity, aligning with `concur:then`.
-
-Arguments:
-- FUTURE (`concur-future`): The original future object.
-- CALLBACK-FN (lambda-form): The lambda form to apply to the future's result.
-
-Returns:
-A new `concur-future`."
-  (declare (indent 1))
-  `(concur:map-future ,future ,callback-fn))
-
-;;;###autoload
-(cl-defmacro concur:catch-future (future error-handler-fn &environment env)
+(cl-defmacro concur:future-catch (future error-handler-fn &environment env)
   "Attach an error handler to a future.
-
-Creates a new future that, when forced, will execute the original
-`FUTURE`. If the original future rejects, `ERROR-HANDLER-FN` is
-called with the error. The return value of the handler resolves
-the new future, allowing for recovery.
+Creates a new future that can recover from a rejection in the original.
 
 Arguments:
-- `FUTURE` (concur-future): The original future object.
-- `ERROR-HANDLER-FN` (lambda-form): A lambda form `(lambda (error))` to call
+- `future`: (`concur-future`) The original future object.
+- `error-handler-fn`: (lambda-form) A lambda `(lambda (error) ...)` to call
   if the original future rejects.
 
 Returns:
-A new `concur-future` with error handling."
-  (declare (indent 1))
+- (`concur-future`) A new `concur-future` with error handling."
+  (declare (indent 1) (debug t))
   `(concur:make-future
     (lambda ()
-      (concur:catch (concur:force ,future)
-                    ,error-handler-fn))))
+      (concur:catch (concur:force ,future) ,error-handler-fn))))
 
 ;;;###autoload
-(cl-defmacro concur:all-futures (futures &environment env)
+(cl-defun concur:future-all (futures)
   "Run a list of FUTURES concurrently and collect their results.
-This function forces all futures in the `FUTURES` list and returns a new
-promise that resolves when all of them have resolved. If any future rejects,
-the returned promise immediately rejects.
+This function forces all futures in the `FUTURES` list and returns a promise
+that resolves when all have resolved. If any future rejects, the returned
+promise immediately rejects.
 
 Arguments:
-- FUTURES (list-of-futures-or-lambda-forms): A list of `concur-future`
-  objects or lambda forms. Lambda forms are automatically wrapped in futures.
+- `futures`: (list of `concur-future`) A list of `concur-future` objects.
 
 Returns:
-A `concur-promise` that resolves with a list of all results in order, or
-rejects with the first error."
-  (declare (indent 1))
-  `(concur:all (--map (lambda (it)
-                        (if (concur-future-p it)
-                            (concur:force it)
-                          (if (and (consp it) (eq (car it) 'lambda))
-                              (concur:force (concur:make-future it))
-                            (error "concur:all-futures: Invalid thunk or future: %S" it))))
-                      ,futures)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Utility Functions
+- (`concur-promise`) A promise that resolves with a list of all results."
+  (concur:all (--map (concur:force it) futures)))
 
 ;;;###autoload
-(defun concur:future-from-promise (promise)
-  "Create a `concur-future` from an existing PROMISE.
-This is useful for integrating an existing promise into a future-based
-workflow. The created future is immediately considered `evaluated` and simply
-wraps the provided promise.
+(cl-defun concur:future-race (futures)
+  "Race a list of FUTURES concurrently.
+This function forces all futures in the `FUTURES` list and returns a promise
+that settles with the result of the first one to settle.
 
 Arguments:
-- PROMISE (`concur-promise`): The promise object to wrap.
+- `futures`: (list of `concur-future`) A list of `concur-future` objects.
 
 Returns:
-A new, evaluated `concur-future`."
-  (unless (concur-promise-p promise)
-    (error "Argument must be a concur-promise object, got %S" promise))
-  (%%make-future :promise promise :evaluated? t))
+- (`concur-promise`) A promise that settles with the value or error
+  of the first future to settle."
+  (concur:race (--map (concur:force it) futures)))
 
-;; --- Plug into the core promise system ---
-;; Set the normalizer hook so that core functions like `concur:then`
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Core Integration
+
+(defun concur-future-normalize-awaitable (awaitable)
+  "Normalizes an AWAITABLE into a promise if it's a `concur-future`.
+This function is added to `concur-normalize-awaitable-hook`.
+
+Arguments:
+- `awaitable`: (any) The object to potentially normalize.
+
+Returns:
+- (`concur-promise` or nil): The promise from forcing the future, or nil."
+  (if (concur-future-p awaitable)
+      (concur:force awaitable)
+    nil))
+
+;; Plug into the core promise system so that core functions like `concur:then`
 ;; can transparently accept futures.
-(setq concur--normalize-awaitable-fn
-      (lambda (awaitable)
-        (if (concur-future-p awaitable)
-            (concur:force awaitable)
-          awaitable)))
-              
+(add-hook 'concur-normalize-awaitable-hook #'concur-future-normalize-awaitable)
+
 (provide 'concur-future)
 ;;; concur-future.el ends here
-
-
-
