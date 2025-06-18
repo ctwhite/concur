@@ -38,7 +38,8 @@
     tracking lexical variable bindings and usage.
 
     Fields:
-    - `identified-free-vars`: A list of unique *original symbols* that have been
+    - `identified-free-vars`: A list of unique *original symbols* that have 
+    been
       identified as free variables during this pass.
     - `known-bindings`: A list of symbols that are lexically bound in the
       *current* scope and should therefore not be treated as free variables

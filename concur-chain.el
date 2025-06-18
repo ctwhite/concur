@@ -184,8 +184,8 @@ Returns:
 ;;; Public API - Promise Chaining and Flow Control
 
 (cl-defmacro concur:then (source-promise-form
-                         &optional on-resolved-form on-rejected-form
-                         &environment env)
+                             &optional on-resolved-form on-rejected-form
+                             &environment env)
   "Chain a new promise from `SOURCE-PROMISE-FORM`, transforming its result.
 This is the fundamental promise chaining primitive, analogous to `.then()`
 in JavaScript. It allows attaching success (`ON-RESOLVED-FORM`) and

@@ -29,7 +29,7 @@
 ;;
 ;; - Debugging and Introspection: An integrated promise inspector
 ;;   (`concur:inspect-promises`) provides a live view of all active and
--;;   settled promises, an invaluable tool for debugging concurrent systems.
+;;   settled promises, an invaluable tool for debugging concurrent systems.
 ;;
 ;; - Advanced Features: Includes automatic dependency derivation for
 ;;   background processes, task batching (`concur:batch!`), and adaptive
@@ -183,8 +183,8 @@ Returns:
 - nil."
   (interactive)
   (let ((entries
-         (sort (--map-values
-                (lambda (info)
+         (sort (--map
+                (-lambda (_ info)
                   (let* ((id (concur--promise-info-id info))
                          (state (symbol-name (concur--promise-info-state info)))
                          (name (format "%s" (concur--promise-info-name info)))
@@ -1053,7 +1053,7 @@ Returns:
           ;; Now, find which one(s) settled and process them.
           (let (still-pending settled)
             (dolist (p pending)
-              (if (concur-promise-resolved-p p) (push p settled) (push p still-pending)))
+              (if (concur:resolved-p p) (push p settled) (push p still-pending)))
             (setq pending (nreverse still-pending))
             ;; Yield all results from promises that just finished.
             (dolist (p-ready settled)

@@ -18,7 +18,7 @@
 (require 'concur-promise)
 
 ;; This constant is used by coroutines to signal awaiting an external promise.
-(declare-function yield--await-external-status-key "concur-core")
+(declare-function yield--await-external-status-key "yield")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API

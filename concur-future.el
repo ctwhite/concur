@@ -24,6 +24,9 @@
 (require 'concur-ast)
 (require 'concur-promise)
 
+;; Satisfy the byte-compiler
+(defvar yield-internal-throw-form nil)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definition
 
@@ -85,32 +88,33 @@ Returns:
   (unless (concur-future-p future)
     (error "Invalid future object to concur:force: %S" future))
 
-  (when (concur-future-evaluated? future)
-    (cl-return-from concur:force (concur-future-promise future)))
+  (cl-block concur:force
+    (when (concur-future-evaluated? future)
+      (cl-return-from concur:force (concur-future-promise future)))
 
-  ;; Mark as evaluated immediately to prevent re-entrancy.
-  (setf (concur-future-evaluated? future) t)
+    ;; Mark as evaluated immediately to prevent re-entrancy.
+    (setf (concur-future-evaluated? future) t)
 
-  ;; Create and store the promise that will hold the future's result.
-  (setf (concur-future-promise future) (concur:make-promise))
+    ;; Create and store the promise that will hold the future's result.
+    (setf (concur-future-promise future) (concur:make-promise))
 
-  (let ((promise (concur-future-promise future)))
-    (concur--log :debug "[FUTURE:force] Forcing future, created promise %S."
-                 (concur:format-promise promise))
-    (condition-case err
-        (let ((thunk-result (funcall (concur-future-thunk future))))
-          (if (concur-promise-p thunk-result)
-              ;; If thunk returns a promise, chain our promise to it.
-              (concur:then thunk-result
-                           (lambda (val) (concur:resolve promise val))
-                           (lambda (e) (concur:reject promise e)))
-            ;; Otherwise, resolve our promise directly.
-            (concur:resolve promise thunk-result)))
-      (error
-       ;; If thunk signals an error, reject our promise.
-       (concur--log :error "[FUTURE:force] Thunk failed with error: %S." err)
-       (concur:reject promise err))))
-  (concur-future-promise future))
+    (let ((promise (concur-future-promise future)))
+      (concur--log :debug "[FUTURE:force] Forcing future, created promise %S."
+                  (concur:format-promise promise))
+      (condition-case err
+          (let ((thunk-result (funcall (concur-future-thunk future))))
+            (if (concur-promise-p thunk-result)
+                ;; If thunk returns a promise, chain our promise to it.
+                (concur:then thunk-result
+                            (lambda (val) (concur:resolve promise val))
+                            (lambda (e) (concur:reject promise e)))
+              ;; Otherwise, resolve our promise directly.
+              (concur:resolve promise thunk-result)))
+        (error
+        ;; If thunk signals an error, reject our promise.
+        (concur--log :error "[FUTURE:force] Thunk failed with error: %S." err)
+        (concur:reject promise err))))
+    (concur-future-promise future)))
 
 ;;;###autoload
 (defun concur:future-get (future &optional timeout)
@@ -219,6 +223,26 @@ Returns:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Core Integration
 
+;;;###autoload
+(defun concur:future-from-promise (promise)
+  "Wrap an existing PROMISE in a `concur-future`.
+
+This creates a future that is already evaluated and whose `thunk` simply
+returns the value of the promise when called.
+
+Arguments:
+- `promise`: (`concur-promise`) A resolved or pending concur-promise object.
+
+Returns:
+- (`concur-future`) A future that wraps the given promise."
+  (unless (concur-promise-p promise)
+    (error "Expected a concur-promise, got: %S" promise))
+  (concur--log :debug "[FUTURE:from-promise] Wrapping promise: %S."
+               (concur:format-promise promise))
+  (%%make-future
+   :promise promise
+   :evaluated? t))
+   
 (defun concur-future-normalize-awaitable (awaitable)
   "Normalizes an AWAITABLE into a promise if it's a `concur-future`.
 This function is added to `concur-normalize-awaitable-hook`.

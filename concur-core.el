@@ -41,6 +41,14 @@
 (require 'concur-priority-queue)
 (require 'concur-microtask)
 
+;; Forward declarations for byte-compiler
+(declare-function concur:then "concur-chain" (promise 
+      &optional on-resolved-form on-rejected-form
+      &environment env))
+(declare-function concur:race "concur-combinators" (promise-list))
+
+(defvar yield--await-external-status-key)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Constants and Customization
 
@@ -78,10 +86,7 @@ latency for `await` to unblock."
   "A dynamically-scoped list of labels for the current async call stack.
 High-level functions like `concur:async!` manage this stack to provide
 richer debugging information on promise rejection.")
-
-(defvar yield--await-external-status-key nil
-  "Internal key used by the `yield` library for awaiting external events.")
-
+  
 (define-error 'concur-unhandled-rejection "A promise was rejected with no handler.")
 (define-error 'concur-await-error "An error occurred while awaiting a promise." 'concur-error)
 (define-error 'concur-cancel-error "A promise was cancelled." 'concur-error)
@@ -108,13 +113,13 @@ Fields:
 - `proc` (process): An optional external process to kill on cancel.
 - `lock` (`concur-lock`): A mutex to protect internal state."
     (id nil :type symbol)
-    result
-    error
+    (result nil)
+    (error nil)
     (state :pending :type (member :pending :resolved :rejected))
     (callbacks '() :type list)
-    cancel-token
+    (cancel-token nil :type (or concur-cancel-token null))
     (cancelled-p nil :type boolean)
-    proc
+    (proc nil)
     (lock (concur:make-lock) :type concur-lock)))
 
 (eval-and-compile
@@ -144,7 +149,7 @@ Fields:
   indicate higher priority."
     (type nil :type (member :resolved :rejected :finally :tap :await-latch))
     (fn nil :type function)
-    (promise nil :type (or concur-promise null))
+    (promise nil :type concur-promise)
     (context nil :type (or hash-table null))
     (priority 50 :type integer)))
 
@@ -168,7 +173,7 @@ Fields:
   "A global `concur-priority-queue` of callbacks scheduled for deferred
 execution (macrotasks). This processes higher-priority callbacks first.")
 
-(defvar concur--callback-processing-lock (concur:make-lock)
+(defvar concur--callback-processing-lock (concur:make-lock "concur--callback-processing-lock")
   "A global lock to protect both `concur--scheduled-callbacks-pq` and
 `concur--idle-timer` to ensure atomic scheduling operations.")
 
@@ -197,43 +202,6 @@ Returns:
     (if (> (length str) concur-log-value-max-length)
         (concat (substring str 0 concur-log-value-max-length) "...")
       str)))
-
-;;;###autoload
-(defun concur-process-scheduled-callbacks-batch (promise callbacks)
-  "Executes a batch of scheduled promise callbacks.
-This is a core utility used by macrotask and microtask queues.
-
-Arguments:
-- PROMISE (`concur-promise`): The promise that settled, triggering these callbacks.
-- CALLBACKS (list of `concur-callback`): The list of callbacks to execute.
-
-Returns:
-- nil."
-  (dolist (callback callbacks)
-    (let* ((handler (concur-callback-fn callback))
-           (type (concur-callback-type callback))
-           (target-promise (concur-callback-promise callback))
-           ;; Crucial: Evaluate the `context` to bring lexical vars into scope.
-           (context (eval (concur-callback-context callback)))
-           (result (concur-promise-result promise))
-           (error (concur-promise-error promise)))
-      (condition-case err
-          (pcase type
-            (:resolved
-             (when (not error) (funcall handler result context)))
-            (:rejected
-             (when error (funcall handler error context)))
-            (:finally
-             (funcall handler result error))
-            (:tap
-             (funcall handler result error context))
-            ;; This case is handled by the microtask queue's specific logic.
-            (:await-latch
-             (when-let (latch (cdr (assoc 'latch context)))
-               (setf (concur-await-latch-signaled-p latch) t))))
-        ('error
-         (concur--log :error "[CORE] Callback failed in %S for %s: %S"
-                      type (concur:format-promise promise) err))))))
 
 (defun concur--schedule-callbacks (callbacks-list)
   "Schedules a list of callbacks for deferred processing by the executor."
@@ -363,7 +331,7 @@ Returns:
         (when-let ((proc (concur-promise-proc promise)))
           (when (process-live-p proc)
             (delete-process proc))
-          (setf (concur-promise-proc promise) nil))))))
+          (setf (concur-promise-proc promise) nil)))))
   promise)
 
 (defun concur--run-callbacks (promise)
@@ -533,6 +501,45 @@ Returns:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API (Promise Construction and Basic Operations)
 
+;;;###autoload
+(defun concur-process-scheduled-callbacks-batch (promise callbacks)
+  "Executes a batch of scheduled promise callbacks.
+This is a core utility used by macrotask and microtask queues.
+
+Arguments:
+- PROMISE (`concur-promise`): The promise that settled, triggering these 
+callbacks.
+- CALLBACKS (list of `concur-callback`): The list of callbacks to execute.
+
+Returns:
+- nil."
+  (dolist (callback callbacks)
+    (let* ((handler (concur-callback-fn callback))
+           (type (concur-callback-type callback))
+           (target-promise (concur-callback-promise callback))
+           ;; Crucial: Evaluate the `context` to bring lexical vars into scope.
+           (context (eval (concur-callback-context callback)))
+           (result (concur-promise-result promise))
+           (error (concur-promise-error promise)))
+      (condition-case err
+          (pcase type
+            (:resolved
+             (when (not error) (funcall handler result context)))
+            (:rejected
+             (when error (funcall handler error context)))
+            (:finally
+             (funcall handler result error))
+            (:tap
+             (funcall handler result error context))
+            ;; This case is handled by the microtask queue's specific logic.
+            (:await-latch
+             (when-let (latch (cdr (assoc 'latch context)))
+               (setf (concur-await-latch-signaled-p latch) t))))
+        ('error
+         (concur--log :error "[CORE] Callback failed in %S for %s: %S"
+                      type (concur:format-promise promise) err))))))
+
+;;;###autoload
 (defun concur:make-promise (&rest slots)
   "Create a new, deferrable `concur-promise`.
 This is a low-level constructor. Prefer using `concur:with-executor`
@@ -553,6 +560,7 @@ Returns:
        (lambda () (concur:cancel p))))
     p))
 
+;;;###autoload
 (defun concur:resolve (target-promise result)
   "Resolve a `TARGET-PROMISE` with a `RESULT`.
 
@@ -568,6 +576,7 @@ Returns:
   (concur--resolve-with-maybe-promise target-promise result)
   target-promise)
 
+;;;###autoload
 (defun concur:reject (target-promise error &optional is-cancellation)
   "Reject a `TARGET-PROMISE` with an `ERROR`.
 
@@ -590,6 +599,7 @@ Returns:
                                         "\n↳ ")))))
     (concur--settle-promise target-promise nil final-error is-cancellation)))
 
+;;;###autoload
 (defun concur:resolved! (value)
   "Return a new promise that is already resolved with `VALUE`.
 
@@ -602,6 +612,7 @@ Returns:
     (concur:resolve p value)
     p))
 
+;;;###autoload
 (defun concur:rejected! (error)
   "Return a new promise that is already rejected with `ERROR`.
 
@@ -614,6 +625,7 @@ Returns:
     (concur:reject p error)
     p))
 
+;;;###autoload
 (defun concur:cancel (cancellable-promise &optional reason)
   "Cancel a PROMISE by rejecting it with a cancellation reason.
 If the promise has an associated process, this also kills that process.
@@ -667,6 +679,7 @@ Signals:
      ;; Outside a coroutine, use the cooperative blocking helper.
      (concur--await-blocking ,promise-form ,timeout)))
 
+;;;###autoload
 (defun concur:status (promise)
   "Return the current status of a PROMISE without blocking.
 
@@ -679,22 +692,27 @@ Returns:
     (error "Invalid promise object: %S" promise))
   (concur-promise-state promise))
 
+;;;###autoload
 (defun concur:pending-p (promise)
   "Return non-nil if PROMISE is currently pending."
   (eq (concur:status promise) :pending))
 
+;;;###autoload
 (defun concur:resolved-p (promise)
   "Return non-nil if PROMISE has been resolved successfully."
   (eq (concur:status promise) :resolved))
 
+;;;###autoload
 (defun concur:rejected-p (promise)
   "Return non-nil if PROMISE has been rejected."
   (eq (concur-promise-state promise) :rejected))
 
+;;;###autoload
 (defun concur:cancelled-p (promise)
   "Return non-nil if PROMISE has been cancelled."
   (concur-promise-cancelled-p promise))
 
+;;;###autoload
 (defun concur:value (promise)
   "Return the resolved value of a PROMISE, or nil if not resolved.
 This function is non-blocking.
@@ -707,6 +725,7 @@ Returns:
   (when (eq (concur:status promise) 'resolved)
     (concur-promise-result promise)))
 
+;;;###autoload
 (defun concur:error-value (promise)
   "Return the error value of a PROMISE if rejected, else nil.
 This function is non-blocking.
@@ -719,6 +738,7 @@ Returns:
   (when (eq (concur-promise-state promise) :rejected)
     (concur-promise-error promise)))
 
+;;;###autoload
 (defun concur:error-message (promise-or-error)
   "Return a human-readable message from a promise's error or an error object.
 
@@ -736,6 +756,7 @@ Returns:
           (err (format "%S" err))
           (t "Unknown error"))))
 
+;;;###autoload
 (defun concur:format-promise (p)
   "Return a human-readable string representation of a promise.
 Intended for logging/debugging to provide a concise summary.
@@ -817,7 +838,8 @@ Arguments:
   takes one argument: a callback of the form `(lambda (result error) ...)`.
 
 Returns:
-- (`concur-promise`): A promise that resolves with `result` or rejects with `error`."
+- (`concur-promise`): A promise that resolves with `result` or rejects with 
+`error`."
   (declare (indent 1) (debug t))
   `(concur:with-executor
        (lambda (resolve reject)
@@ -929,13 +951,3 @@ Returns:
 
 (provide 'concur-core)
 ;;; concur-core.el ends here
-
-
-
-
-
-
-
-
-
-

@@ -49,9 +49,9 @@ Returns:
             ;; on-resolved:
             (lambda (res)
               (concur:with-mutex! lock
-                ;; The check `concur-promise-resolved-p` is functionally
+                ;; The check `concur:resolved-p` is functionally
                 ;; equivalent to a `settled-p` check in this library.
-                (unless (concur-promise-resolved-p aggregate-promise)
+                (unless (concur:resolved-p aggregate-promise)
                   (aset results i res)
                   (cl-incf resolved-count)
                   (when (= resolved-count total)
@@ -60,7 +60,7 @@ Returns:
             ;; on-rejected:
             (lambda (err)
               (concur:with-mutex! lock
-                (unless (concur-promise-resolved-p aggregate-promise)
+                (unless (concur:resolved-p aggregate-promise)
                   (concur:reject aggregate-promise err)))))))
       aggregate-promise))))
 
@@ -84,11 +84,11 @@ Returns:
          promise
          (lambda (res)
            (concur:with-mutex! lock
-             (unless (concur-promise-resolved-p race-promise)
+             (unless (concur:resolved-p race-promise)
                (concur:resolve race-promise res))))
          (lambda (err)
            (concur:with-mutex! lock
-             (unless (concur-promise-resolved-p race-promise)
+             (unless (concur:resolved-p race-promise)
                (concur:reject race-promise err)))))))
     race-promise))
 
@@ -120,12 +120,12 @@ Returns:
             ;; on-resolved:
             (lambda (res)
               (concur:with-mutex! lock
-                (unless (concur-promise-resolved-p any-promise)
+                (unless (concur:resolved-p any-promise)
                   (concur:resolve any-promise res))))
             ;; on-rejected:
             (lambda (err)
               (concur:with-mutex! lock
-                (unless (concur-promise-resolved-p any-promise)
+                (unless (concur:resolved-p any-promise)
                   (aset errors i err)
                   (cl-incf rejected-count)
                   (when (= rejected-count total)
