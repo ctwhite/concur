@@ -1,38 +1,22 @@
-;;; concur-microtask.el --- Microtask queue for Concur Promises -*- lexical-binding: t; -*-
+;;; concur-microtask.el --- Microtask queue for Concur Promises -*-
+;;; lexical-binding: t; -*-
 
 ;;; Commentary:
+;; A self-scheduling microtask queue for Concur, designed for Promise/A+
+;; compliance. It manages a FIFO queue of microtasks, processes them
+;; in batches, and automatically reschedules draining to ensure responsiveness.
 ;;
-;; This module provides a microtask queue, a critical component for
-;; implementing Promise/A+ compliant behavior. Microtasks are callbacks
-;; that must run synchronously and immediately after a promise settles, but
-;; before control returns to the main event loop for macrotasks (like timers)
-;; or UI updates. This ensures promise reactions are processed predictably.
-;;
-;; This implementation encapsulates the queue's state within a dedicated
-;; struct (`concur-microtask-queue`) and uses Emacs's built-in `ring`
-;; library for an efficient circular buffer. It also includes a 'tick'
-;; counter for improved observability during debugging.
-;;
-;; To handle potential infinite loops of promise resolutions (which would
-;; otherwise freeze Emacs), the queue has a fixed capacity. If this
-;; capacity is exceeded, the promise that was meant to be settled is
-;; explicitly rejected with a `concur-microtask-queue-overflow` error.
+;; Microtasks are high-priority, short-lived tasks (like promise callbacks)
+;; that must execute as soon as possible after the current operation completes,
+;; but before returning control to the main event loop.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'dash)
-(require 'ring)
-(require 'concur-primitives)
+(require 'concur-core)
+(require 'concur-lock)
 (require 'concur-hooks)
-
-;; Forward declarations for byte-compiler (from concur-core)
-(declare-function concur-process-scheduled-callbacks "concur-core"
-                  (promise callbacks))
-(declare-function concur:reject "concur-core" (promise error))
-(declare-function concur--format-promise "concur-core" (promise))
-(declare-function concur-callback-promise "concur-core" (callback))
-(declare-function concur-callback-type "concur-core" (callback))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors & Customization
@@ -41,141 +25,135 @@
   "The microtask queue has exceeded its capacity." 'concur-error)
 
 (defcustom concur-microtask-queue-capacity 1024
-  "Maximum number of microtasks allowed in the queue at once.
-This acts as a safety limit to prevent runaway microtask creation from
-exhausting memory or freezing Emacs. When the queue is full, new microtasks
-will be rejected with a `concur-microtask-queue-overflow` error.
-A value of `nil` or 0 means no capacity limit (unbounded queue)."
-  :type '(choice (integer :tag "Bounded (tasks)" :min 0)
-                 (const :tag "Unbounded" nil))
+  "Maximum number of microtasks allowed in the queue.
+Setting to 0 or less disables capacity limits. This is not
+recommended as it can lead to memory exhaustion under load."
+  :type 'integer
+  :group 'concur)
+
+(defcustom concur-microtask-max-batch-size 128
+  "Maximum number of microtasks to process in a single tick.
+If the queue has more tasks than this, another drain tick will be
+scheduled immediately (via `run-with-timer 0`). This prevents
+any single microtask drain cycle from blocking Emacs for too long."
+  :type 'integer
   :group 'concur)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Struct Definition
+;;; Struct and Global Instance
 
-(cl-defstruct (concur-microtask-queue (:constructor concur--make-microtask-queue))
-  "Represents a microtask queue.
+(cl-defstruct (concur-microtask-queue (:constructor %%make-microtask-queue))
+  "Internal structure representing a microtask queue.
 
 Fields:
-- `ring`: (ring) The underlying Emacs `ring` buffer storing `concur-callback`s.
-- `lock`: (`concur-lock`) A mutex to protect queue access during concurrent
-  modifications (e.g., from multiple promise settlements).
-- `current-tick`: (integer) A counter incremented each time the queue is
-  drained, useful for debugging execution order across ticks."
-  (ring (make-ring (or concur-microtask-queue-capacity 1024)) :type ring)
-  (lock (concur:make-lock "microtask-queue-lock") :type concur-lock)
+- `queue` (list): A standard Emacs Lisp list serving as a FIFO queue of
+  `concur-callback` objects. New tasks are appended at the end.
+- `lock` (concur-lock): A mutex to synchronize access to the `queue` list.
+- `drain-scheduled-p` (boolean): `t` if a drain operation has already
+  been scheduled for the next Emacs tick. Prevents redundant scheduling.
+- `current-tick` (integer): A counter incremented for each drain cycle."
+  (queue '() :type list)
+  (lock nil :type (or null concur-lock))
+  (drain-scheduled-p nil :type boolean)
   (current-tick 0 :type integer))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global Queue Instance
-
-(defvar concur--global-microtask-queue nil
-  "The global microtask queue instance. Lazily initialized on first use.")
-
-(defun concur--init-global-microtask-queue ()
-  "Initialize the global microtask queue if it hasn't been already.
-This ensures `concur--global-microtask-queue` is always a valid struct
-before operations begin. It uses `concur-microtask-queue-capacity`
-to determine the initial size of the underlying ring buffer."
-  (unless concur--global-microtask-queue
-    (setq concur--global-microtask-queue
-          (concur--make-microtask-queue
-           :ring (make-ring (or concur-microtask-queue-capacity 1024))))))
-
-;; Ensure the global queue is initialized when the file is loaded.
-(concur--init-global-microtask-queue)
+(defvar concur--global-microtask-queue
+  (%%make-microtask-queue
+   :queue '()
+   :lock (concur:make-lock "microtask-queue-lock")
+   :drain-scheduled-p nil
+   :current-tick 0)
+  "Singleton instance of the global microtask queue.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; API (Internal to Concur Library)
+;;; Queue Manipulation Functions
 
-(cl-defun concur-microtask-queue-add (originating-promise callbacks-list)
-  "Add a list of callbacks to the global microtask queue.
-
-This function is called by the core promise logic when a promise settles.
-If `concur-microtask-queue-capacity` is set, this function will check
-for overflow. If the queue is full, the promise that a callback was
-meant to settle will be rejected with a `concur-microtask-queue-overflow`
-error. This prevents runaway resource consumption and ensures the error
-is propagated through the promise chain.
+(defun concur-microtask-queue-add (callbacks)
+  "Add CALLBACKS to the global microtask queue.
+Promises/A+ 2.2.4: Callbacks must be invoked asynchronously. This function
+enqueues callbacks and ensures a drain operation is scheduled for the next
+available moment in the Emacs event loop.
 
 Arguments:
-- `ORIGINATING-PROMISE` (`concur-promise`): The promise that just settled,
-  triggering these callbacks.
-- `CALLBACKS-LIST` (list of `concur-callback`): Callbacks to add.
+- `CALLBACKS` (list): A list of `concur-callback` structs to add.
 
 Returns:
-- `nil`."
+  nil. If the queue exceeds `concur-microtask-queue-capacity`, callbacks
+  causing the overflow are rejected."
   (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
-    (--each callbacks-list
-            (lambda (cb)
-              (let* ((queue-ring (concur-microtask-queue-ring concur--global-microtask-queue))
-                     (capacity (ring-capacity queue-ring)))
-                ;; Check if the queue is at capacity.
-                (if (and capacity (> capacity 0) (ring-full-p queue-ring))
-                    ;; --- Overflow Case ---
-                    ;; Instead of dropping the task, reject the promise it was
-                    ;; supposed to settle. This is a critical safety valve.
-                    (let* ((target-promise (concur-callback-promise cb))
-                           (error-msg (format
-                                       (concat "Microtask queue overflow (capacity: %d). "
-                                               "Potential infinite loop from promise: %s")
-                                       capacity
-                                       (concur--format-promise originating-promise))))
-                      (concur--log :error "[MICROTASK] %s" error-msg)
-                      (when target-promise
-                        (concur:reject target-promise
-                                       `(concur-microtask-queue-overflow ,error-msg))))
-                  ;; --- Normal Case ---
-                  ;; Add the callback to the tail of the ring buffer.
-                  (ring-insert queue-ring cb)))))
-    (concur--log :debug "[MICROTASK] %d callbacks added. Length: %d."
-                 (length callbacks-list)
-                 (ring-length (concur-microtask-queue-ring concur--global-microtask-queue)))))
+    (let* ((capacity concur-microtask-queue-capacity)
+           (overflowed-callbacks '()))
+      ;; Add callbacks one-by-one to check capacity.
+      (dolist (cb callbacks)
+        (if (and (> capacity 0)
+                 (>= (length (concur-microtask-queue-queue
+                              concur--global-microtask-queue))
+                     capacity))
+            (push cb overflowed-callbacks)
+          (setf (concur-microtask-queue-queue concur--global-microtask-queue)
+                (append (concur-microtask-queue-queue
+                         concur--global-microtask-queue)
+                        (list cb)))))
+      ;; Reject any promises associated with overflowed callbacks.
+      (when overflowed-callbacks
+        (let ((msg (format "Microtask queue overflow (capacity: %d)" capacity)))
+          (dolist (cb overflowed-callbacks)
+            (when-let (p (concur-callback-promise cb))
+              (concur:reject p (concur:make-error
+                                :type :microtask-queue-overflow
+                                :message msg))))))))
 
-(cl-defun concur-microtask-queue-drain ()
-  "Process all callbacks currently in the global microtask queue synchronously.
-This function should be called right after a promise settles, to ensure
-all microtasks (promise reactions) are completed before control yields
-to the main event loop for macrotasks or UI rendering. It increments
-the queue's `current-tick` counter for observability.
+  ;; Schedule a drain operation if one is not already pending. This
+  ;; check prevents multiple redundant timers from being created.
+  (unless (concur-microtask-queue-drain-scheduled-p
+           concur--global-microtask-queue)
+    (setf (concur-microtask-queue-drain-scheduled-p
+           concur--global-microtask-queue) t)
+    ;; `run-with-timer 0 nil ...` schedules for the next idle CPU cycle.
+    (run-with-timer 0 nil #'concur-microtask-queue-drain)))
 
-The implementation is careful to drain all tasks present at the start of
-the call, without processing new tasks that might be added during the
-drain itself. This prevents a single `drain` call from looping infinitely.
+(defun concur-microtask-queue-drain ()
+  "Process a batch of microtasks from the global queue.
+This function is designed to avoid deadlocks: it acquires the queue's
+lock only to pop a batch of tasks, then releases the lock *before*
+executing them. This ensures that a microtask can safely schedule
+more microtasks without deadlocking.
 
-Arguments: None.
-Returns: `nil`."
-  (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
-    (let* ((queue-ring (concur-microtask-queue-ring concur--global-microtask-queue))
-           (tasks-in-tick (ring-length queue-ring))
-           (tasks-to-drain '())) ; Use a list to collect popped items
+Returns:
+  nil. Automatically reschedules another tick if tasks remain."
+  ;; Reset scheduling flag. A new drain can now be scheduled by new tasks.
+  (setf (concur-microtask-queue-drain-scheduled-p concur--global-microtask-queue) nil)
+  (cl-incf (concur-microtask-queue-current-tick concur--global-microtask-queue))
 
-      ;; Only proceed if there are tasks to process.
-      (when (> tasks-in-tick 0)
-        ;; First, remove all current tasks from the queue. This is crucial.
-        ;; It ensures that any new microtasks queued by the tasks we are
-        ;; about to run will be processed in the *next* tick, not this one.
-        (dotimes (_ tasks-in-tick)
-          ;; **BUG FIX**: `ring-pop-front` is not a function. The correct
-          ;; function is `ring-remove`, which removes and returns the
-          ;; oldest element when called with one argument.
-          (push (ring-remove queue-ring) tasks-to-drain))
-        (setq tasks-to-drain (nreverse tasks-to-drain)) ; Restore FIFO order
+  (let (batch)
+    ;; Step 1: Acquire lock ONLY to pop tasks off the queue.
+    (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
+      (let* ((queue (concur-microtask-queue-queue concur--global-microtask-queue))
+             (batch-size (min (length queue) concur-microtask-max-batch-size)))
+        (setq batch (cl-subseq queue 0 batch-size))
+        ;; Update the queue with the remaining tasks.
+        (setf (concur-microtask-queue-queue concur--global-microtask-queue)
+              (cl-subseq queue batch-size))))
 
-        ;; Increment tick counter *before* processing, as per spec.
-        (cl-incf (concur-microtask-queue-current-tick concur--global-microtask-queue))
-        (concur--log :debug "[MICROTASK] Draining %d microtasks for tick %d."
-                     (length tasks-to-drain)
-                     (concur-microtask-queue-current-tick concur--global-microtask-queue))
+    ;; Step 2: Execute the callbacks outside the critical section (lock released).
+    (when batch
+      (dolist (cb batch)
+        (condition-case err
+            (concur--execute-callback cb)
+          (error
+           (message "Concur: Unhandled error in microtask callback: %s" err)))))
 
-        ;; Process the collected tasks.
-        (--each tasks-to-drain
-                (lambda (cb)
-                  ;; `concur-process-scheduled-callbacks` is the shared
-                  ;; function that knows how to execute a callback by `eval`ing
-                  ;; its context and calling its handler.
-                  (concur-process-scheduled-callbacks
-                   (concur-callback-promise cb) (list cb))))))))
+    ;; Step 3: Reschedule if more tasks remain.
+    (let ((remaining-queue-p nil))
+      (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
+        (setq remaining-queue-p
+              (concur-microtask-queue-queue concur--global-microtask-queue)))
+      (when (and remaining-queue-p
+                 (not (concur-microtask-queue-drain-scheduled-p
+                       concur--global-microtask-queue)))
+        (setf (concur-microtask-queue-drain-scheduled-p
+               concur--global-microtask-queue) t)
+        (run-with-timer 0 nil #'concur-microtask-queue-drain)))))
 
 (provide 'concur-microtask)
 ;;; concur-microtask.el ends here

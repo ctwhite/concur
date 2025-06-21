@@ -38,7 +38,7 @@
     tracking lexical variable bindings and usage.
 
     Fields:
-    - `identified-free-vars`: A list of unique *original symbols* that have 
+    - `identified-free-vars`: A list of unique *original symbols* that have
     been
       identified as free variables during this pass.
     - `known-bindings`: A list of symbols that are lexically bound in the
@@ -139,14 +139,10 @@
     The `ORIGINAL-SYM` itself. This function primarily performs
     side-effects on `ast-ctx` in this read-only analysis approach."
 
-    ;; If `original-sym` is a symbol and identified as a free variable candidate,
-    ;; add it to `identified-free-vars`.
     (let ((is-free-candidate (car (concur-ast--analyze-symbol ast-ctx original-sym))))
       (when (and (symbolp original-sym) is-free-candidate)
         (unless (memq original-sym
                       (concur-ast-context-identified-free-vars ast-ctx))
-          (message "concur-ast: Identifying free variable: %S (Known bindings: %S)"
-                   original-sym (concur-ast-context-known-bindings ast-ctx))
           (push original-sym
                 (concur-ast-context-identified-free-vars ast-ctx)))))
 
@@ -166,52 +162,68 @@
     Returns:
     The original `FORM` (unmodified)."
     (pcase form
-      ;; For atomic forms (e.g., symbols, numbers, strings, t, nil, keywords).
       ((pred atom)
        (cond
-        ;; For symbols, call `concur-ast--get-lifed-symbol` for its side-effects
-        ;; (identifying/tracking free variables) but return the original symbol.
         ((symbolp form)
          (concur-ast--get-lifed-symbol ast-ctx form)
          form)
-        ;; For non-symbol atoms (numbers, strings, keywords, etc.),
-        ;; they are always literals and returned as-is.
         (t form)))
 
-      ;; For lists, recurse on `car` and `cdr`.
       ((pred consp)
        (cons (concur-ast--analyze-substitute-bindings ast-ctx (car form))
              (concur-ast--analyze-substitute-bindings ast-ctx (cdr form))))
 
-      ;; For everything else (e.g., vectors), pass it through unmodified.
       (_ form)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; AST Traversal Helpers (private and renamed to --analyze-*)
 
   (defun concur-ast--unwrap-callable-form (callable-form)
-    "If `CALLABLE-FORM` is `#'(lambda ...)` or `'(lambda ...)`, unwrap it.
-    Returns the raw `(lambda ...)` form, otherwise returns the form as-is.
-
-    Arguments:
-    - `callable-form`: The form to unwrap.
-
-    Returns:
-    The unwrapped `(lambda ...)` form or the original `callable-form`."
+    "If `CALLABLE-FORM` is `#'(lambda ...)` or `'(lambda ...)`, unwrap it."
     (pcase callable-form
-      ;; This matches #'(lambda ...)
       (`(function ,(and body `(lambda . ,_))) body)
-      ;; This matches '(lambda ...)
       (`(quote ,(and body `(lambda . ,_))) body)
-      ;; Otherwise, return the form untouched
       (_ callable-form)))
+
+  (defun concur-ast--parse-lambda-list-for-analysis (lambda-list)
+    "Parse a standard or macro LAMBDA-LIST.
+This handles &optional, &rest, &key, &aux, and supplied-p variables.
+Returns a cons cell: (BOUND-VARS . INIT-FORMS)."
+    (let ((vars '())
+          (init-forms '())
+          (state 'required))
+      (dolist (item lambda-list)
+        (cond
+         ((eq item '&optional) (setq state '&optional))
+         ((eq item '&rest)     (setq state '&rest))
+         ((eq item '&key)      (setq state '&key))
+         ((eq item '&aux)      (setq state '&aux))
+         ((eq item '&allow-other-keys) nil)
+         (t
+          (pcase state
+            ((or 'required '&rest)
+             (when (symbolp item) (push item vars)))
+            ('&aux
+             (if (consp item)
+                 (progn (push (car item) vars)
+                        (when (cadr item) (push (cadr item) init-forms)))
+               (push item vars)))
+            ((or '&optional '&key)
+             (cond
+              ((symbolp item) (push item vars))
+              ((consp item)
+               (let* ((var-spec (car item))
+                      (init-form (cadr item))
+                      (s-p-var (caddr item))
+                      (var-name (if (consp var-spec) (cadr var-spec) var-spec)))
+                 (push var-name vars)
+                 (when init-form (push init-form init-forms))
+                 (when s-p-var (push s-p-var vars))))))))))
+    (cons (nreverse vars) (nreverse init-forms))))
 
   (defun concur-ast--analyze-body-sequence (ast-ctx body-forms)
     "Traverses a sequence of forms for analysis.
     Each form in the sequence is processed in order by the main dispatcher.
-
-    In read-only mode, this function just walks the forms and returns them
-    unchanged; it primarily performs side-effects on `ast-ctx`.
 
     Arguments:
     - `ast-ctx`: The current `concur-ast-context` instance.
@@ -226,60 +238,65 @@
   (defun concur-ast--analyze-lambda (ast-ctx form)
     "Traverses a lambda form for analysis, handling its local parameter scope.
 
-    In read-only mode, this function walks the lambda's body but does not
-    rewrite the lambda form itself. It performs side-effects on `ast-ctx`.
+      [Parent CTX]
+          │
+          ├─> Copy CTX for new LAMBDA scope
+          │       ├─> Add lambda params to copied CTX's known-bindings
+          │       └─> Analyze Body (recursive calls use copied CTX)
+          │
+          └─> Merge identified free vars from copied CTX back to Parent CTX,
+              excluding vars bound locally in the lambda.
 
-        [Parent CTX]
-            │
-            ├─> Copy CTX for new LAMBDA scope
-            │       ├─> Add lambda params to copied CTX's known-bindings
-            │       └─> Analyze Body (recursive calls use copied CTX)
-            │
-            └─> Merge identified free vars from copied CTX back to Parent CTX
+  Arguments:
+  - `ast-ctx`: The current `concur-ast-context` instance.
+  - `form`: The `lambda` form to analyze.
 
-    Arguments:
-    - `ast-ctx`: The current `concur-ast-context` instance.
-    - `form`: The `lambda` form to analyze.
+  Returns:
+  The original `lambda` form (unmodified)."
+    (let* ((lambda-list (cadr form))
+          (body-forms (cddr form))
+          ;; Create a context to isolate free vars from the body
+          (body-ctx (copy-concur-ast-context ast-ctx))
+          ;; Parse arguments and any initialization forms
+          (parsed (concur-ast--parse-lambda-list-for-analysis lambda-list))
+          (params (car parsed))
+          (inits  (cdr parsed)))
 
-    Returns:
-    The original `lambda` form (unmodified)."
-    (let* ((original-args (cadr form))
-           (original-body (cddr form))
-           (sub-ast-ctx (copy-concur-ast-context ast-ctx))) ; Key: Copy parent context
+      ;; Bind parameters in inner context
+      (dolist (param params)
+        (push param (concur-ast-context-known-bindings body-ctx)))
 
-      ;; Add lambda parameters to the `known-bindings` of the sub-context.
-      (let ((arg-list (if (listp original-args) original-args
-                        (if original-args (list original-args) nil))))
-        (-each arg-list
-               (-lambda (arg-sym)
-                 (when (symbolp arg-sym)
-                   (push arg-sym
-                         (concur-ast-context-known-bindings sub-ast-ctx))))))
+      ;; Analyze init forms (like destructured defaults)
+      (dolist (init inits)
+        (concur-ast--analyze-form-recursively body-ctx init))
 
-      ;; Only traverse the body; do not modify it in read-only mode.
-      (concur-ast--analyze-body-sequence sub-ast-ctx original-body)
+      ;; Analyze lambda body
+      (concur-ast--analyze-body-sequence body-ctx body-forms)
 
-      ;; Merge identified free variables from sub-context back to parent context.
-      (setf (concur-ast-context-identified-free-vars ast-ctx)
-            (cl-union (concur-ast-context-identified-free-vars ast-ctx)
-                      (concur-ast-context-identified-free-vars sub-ast-ctx)))
+      ;; Merge discovered free vars upward, filtering out locally bound vars
+      (let ((local-bindings (concur-ast-context-known-bindings body-ctx)))
+        (setf (concur-ast-context-identified-free-vars ast-ctx)
+              (cl-union (concur-ast-context-identified-free-vars ast-ctx)
+                        (cl-set-difference
+                        (concur-ast-context-identified-free-vars body-ctx)
+                        local-bindings))))
       form))
 
   (defun concur-ast--analyze-let (ast-ctx form)
-    "Traverses a `let` or `let*` form for analysis in read-only mode.
-    It walks the body but does not rewrite the form.
+    "Traverses a `let` or `let*` form for AST analysis, identifying free variables.
+    This version correctly models `let` vs `let*` scoping for init forms and body,
+    and properly merges identified free variables back to the parent context.
+    It also normalizes binding forms for robust processing.
 
         [Parent CTX]
             │
-            ├─> Save Parent CTX state
+            ├─> Analyze init-forms in current or new context depending on let/let*
             │
-            ├─> For each binding:
-            │       ├─> Analyze init-form (using current CTX)
-            │       └─> Add var to current CTX's known-bindings
+            ├─> Create sub-context for body with new bindings
             │
-            └─> Analyze Body (using final CTX)
+            ├─> Analyze Body in sub-context
             │
-            └─> Restore Parent CTX state
+            └─> Merge free vars from sub-context back to Parent CTX
 
     Arguments:
     - `ast-ctx`: The current `concur-ast-context` instance.
@@ -288,55 +305,41 @@
     Returns:
     The original `let` or `let*` form (unmodified)."
     (let* ((let-type (car form))
-           (bindings (cadr form))
-           (body (cddr form))
-           (original-bindings
-            (-map (lambda (b) (if (symbolp b) `(,b nil) b)) bindings))
-           ;; Save context to restore later.
-           (saved-identified-free-vars
-            (copy-sequence (concur-ast-context-identified-free-vars ast-ctx)))
-           (saved-known-bindings
-            (copy-sequence (concur-ast-context-known-bindings ast-ctx))))
-
-      (unwind-protect
-          (pcase let-type
-            ('let ;; Parallel Scoping
-             (let* (;; Traverse init forms first; these might identify free vars
-                    ;; in the outer scope (from `ast-ctx`).
-                    (analyzed-inits
-                     (mapcar (lambda (b)
-                               (concur-ast--analyze-form-recursively ast-ctx (cadr b)))
-                             original-bindings)))
-
-               ;; Add local variables to `known-bindings` for the body.
-               (dolist (binding original-bindings)
-                 (push (car binding) (concur-ast-context-known-bindings ast-ctx)))
-
-               ;; Traverse the body.
-               (concur-ast--analyze-body-sequence ast-ctx body)))
-
-            ('let* ;; Sequential Scoping
-             (let ((analyzed-bindings '()))
-               (dolist (binding original-bindings)
-                 (let* ((var (car binding))
-                        (init-form (cadr binding)))
-                   ;; Analyze init-form using the CURRENT context (which might
-                   ;; have new `known-bindings` from previous `let*` vars).
-                   (concur-ast--analyze-form-recursively ast-ctx init-form)
-                   ;; Add the variable to `known-bindings` for subsequent
-                   ;; bindings and body.
-                   (push var (concur-ast-context-known-bindings ast-ctx))))
-               ;; Traverse body using the final, fully-updated context.
-               (concur-ast--analyze-body-sequence ast-ctx body))))
-
-        ;; Cleanup: always restore the context.
-        (setf (concur-ast-context-identified-free-vars ast-ctx) saved-identified-free-vars)
-        (setf (concur-ast-context-known-bindings ast-ctx) saved-known-bindings))
+          (bindings (cadr form))
+          (body (cddr form))
+          ;; NEW: Normalize bindings. (var) -> (var nil) for consistent processing.
+          (normalized-bindings (-map (lambda (b) (if (symbolp b) (list b nil) b)) bindings))
+          (sub-ast-ctx (copy-concur-ast-context ast-ctx)))
+      (pcase let-type
+        ('let
+        ;; Analyze init-forms in the PARENT context (evaluated in outer scope).
+        ;; Use `normalized-bindings` to consistently get the init form (`cadr b`).
+        (dolist (b normalized-bindings) ; Iterate over normalized bindings
+          (when (cadr b) ; Check if init form exists (i.e., not nil)
+            (concur-ast--analyze-form-recursively ast-ctx (cadr b)))) ; Analyze init form
+        ;; Add local variables to `known-bindings` in the SUB-CONTEXT (for the body).
+        ;; Use `normalized-bindings` to consistently get the variable symbol (`car b`).
+        (dolist (b normalized-bindings)
+          (push (car b) (concur-ast-context-known-bindings sub-ast-ctx))))
+        ('let*
+        ;; Analyze init-forms sequentially in the SUB-CONTEXT (reflecting sequential binding).
+        ;; Use `normalized-bindings` for consistent (var init) structure.
+        (dolist (b normalized-bindings) ; Iterate over normalized bindings
+          (let* ((var (car b))
+                  (init (cadr b)))
+            (when init (concur-ast--analyze-form-recursively sub-ast-ctx init))
+            (push var (concur-ast-context-known-bindings sub-ast-ctx))))))
+      ;; Analyze the body in the sub-context, as before.
+      (concur-ast--analyze-body-sequence sub-ast-ctx body)
+      ;; Merge identified free variables from sub-context back to parent, as before.
+      (setf (concur-ast-context-identified-free-vars ast-ctx)
+            (cl-union (concur-ast-context-identified-free-vars ast-ctx)
+                      (concur-ast-context-identified-free-vars sub-ast-ctx)))
       form))
-
+      
   (defun concur-ast--analyze-scoped-functions (ast-ctx form)
     "Traverses `flet` or `cl-labels` for analysis in read-only mode.
-    It walks the bodies but does not rewrite the form.
+    This version corrects a bug by properly handling scope and merging variables.
 
     Arguments:
     - `ast-ctx`: The current `concur-ast-context` instance.
@@ -344,49 +347,22 @@
 
     Returns:
     The original `flet` or `cl-labels` form (unmodified)."
-    (pcase-let* ((`(,op ,bindings . ,body) form))
-      (let* ((main-body-ctx (copy-concur-ast-context ast-ctx))
-             (saved-identified-free-vars
-              (copy-sequence (concur-ast-context-identified-free-vars ast-ctx)))
-             (saved-known-bindings
-              (copy-sequence (concur-ast-context-known-bindings ast-ctx))))
-
-        (unwind-protect
-            (progn
-              ;; Add local function names to `known-bindings` in the main-body-ctx.
-              (dolist (binding bindings)
-                (push (car binding) (concur-ast-context-known-bindings main-body-ctx)))
-
-              ;; Traverse the body of each local function.
-              (cl-loop for binding in bindings
-                       do
-                       (pcase-let* ((`(,fn-name ,args . ,fn-body) binding)
-                                    ;; Create a unique context for THIS function's body.
-                                    (func-body-ctx (copy-concur-ast-context
-                                                    main-body-ctx)))
-                         ;; Add the function's own arguments to its `known-bindings`.
-                         (dolist (arg-sym args)
-                           (when (symbolp arg-sym)
-                             (push arg-sym
-                                   (concur-ast-context-known-bindings
-                                    func-body-ctx))))
-
-                         ;; Traverse the function's body.
-                         (concur-ast--analyze-body-sequence func-body-ctx fn-body)
-
-                         ;; Merge identified free variables from function's body
-                         ;; back into the `main-body-ctx`.
-                         (setf (concur-ast-context-identified-free-vars main-body-ctx)
-                               (cl-union (concur-ast-context-identified-free-vars main-body-ctx)
-                                         (concur-ast-context-identified-free-vars func-body-ctx)))))
-
-              ;; Traverse the main body of the flet/cl-labels form.
-              (concur-ast--analyze-body-sequence main-body-ctx body))
-
-          ;; Cleanup: always restore the context.
-          (setf (concur-ast-context-identified-free-vars ast-ctx) saved-identified-free-vars)
-          (setf (concur-ast-context-known-bindings ast-ctx) saved-known-bindings))
-      form)))
+    (pcase-let* ((`(,op ,bindings . ,body) form)
+                 (main-body-ctx (copy-concur-ast-context ast-ctx)))
+      (dolist (b bindings)
+        (push (car b) (concur-ast-context-known-bindings main-body-ctx)))
+      (cl-loop for binding in bindings do
+               (pcase-let* ((`(,fn-name ,args . ,fn-body) binding)
+                            (func-body-ctx (copy-concur-ast-context main-body-ctx)))
+                 (concur-ast--analyze-lambda func-body-ctx `(lambda ,args ,@fn-body))
+                 (setf (concur-ast-context-identified-free-vars main-body-ctx)
+                       (cl-union (concur-ast-context-identified-free-vars main-body-ctx)
+                                 (concur-ast-context-identified-free-vars func-body-ctx)))))
+      (concur-ast--analyze-body-sequence main-body-ctx body)
+      (setf (concur-ast-context-identified-free-vars ast-ctx)
+            (cl-union (concur-ast-context-identified-free-vars ast-ctx)
+                      (concur-ast-context-identified-free-vars main-body-ctx)))
+      form))
 
   (defun concur-ast--analyze-setf (ast-ctx form)
     "Traverses a `setf` form for analysis in read-only mode.
@@ -401,7 +377,6 @@
     (pcase-let ((`(setf ,place ,value-form) form))
       (unless (symbolp place)
         (error "concur-ast: `setf` only supports symbol places, got %S" place))
-      ;; Trigger analysis for `place` and `value-form`
       (concur-ast--get-lifed-symbol ast-ctx place)
       (concur-ast--analyze-form-recursively ast-ctx value-form)
       form))
@@ -420,26 +395,43 @@
       (when (/= 0 (% 2 (length setq-args)))
         (error "concur-ast: Odd number of arguments to setq: %S" form))
       (while setq-args
-        ;; Trigger analysis for var and value
         (concur-ast--get-lifed-symbol ast-ctx (car setq-args))
-        (concur-ast--analyze-form-recursively ast-ctx (cadr setq-args)) 
+        (concur-ast--analyze-form-recursively ast-ctx (cadr setq-args))
         (setq setq-args (cddr setq-args)))
       form))
 
   (defun concur-ast--analyze-funcall (ast-ctx form)
-    "Traverses a generic function call for analysis in read-only mode.
-    It walks the function and arguments but does not rewrite the form.
+    "Traverse a generic function call for analysis, handling keyword arguments safely.
 
-    Arguments:
-    - `ast-ctx`: The current `concur-ast-context` instance.
-    - `form`: The function call form to analyze.
+  Arguments:
+  - `ast-ctx`: The current `concur-ast-context` instance.
+  - `form`: The function call form to analyze.
 
-    Returns:
-    The original function call form (unmodified)."
-    ;; Trigger analysis for function and arguments recursively.
-    (concur-ast--analyze-form-recursively ast-ctx (car form))
-    (cl-loop for arg in (cdr form)
-             do (concur-ast--analyze-form-recursively ast-ctx arg))
+  Returns:
+  The original function call form (unmodified)."
+    (let ((fn (car form))
+          (args (cdr form)))
+      ;; Analyze function position if it's an expression
+      (when (consp fn)
+        (concur-ast--analyze-form-recursively ast-ctx fn))
+
+      ;; Analyze the argument list
+      (while args
+        (let ((current-arg (car args)))
+          (if (keywordp current-arg)
+              ;; --- It's a Keyword-Value Pair ---
+              (progn
+                ;; 1. Move past the keyword itself (we don't analyze it).
+                (setq args (cdr args))
+                ;; 2. If a value exists for the keyword, analyze that value.
+                (when args
+                  (concur-ast--analyze-form-recursively ast-ctx (car args))
+                  ;; 3. Move past the value, so the next loop starts after it.
+                  (setq args (cdr args))))
+            ;; --- It's a Positional Argument ---
+            (progn
+              (concur-ast--analyze-form-recursively ast-ctx current-arg)
+              (setq args (cdr args)))))))
     form)
 
   (defun concur-ast--analyze-cond (ast-ctx form)
@@ -494,22 +486,14 @@
     Returns:
     The original `condition-case` form (unmodified)."
     (pcase-let* ((`(condition-case ,error-var ,body-form . ,handlers) form))
-      ;; 1. Traverse the main body form (in the current context).
-      (concur-ast--analyze-form-recursively ast-ctx body-form) ; Use new main recursive function
-
-      ;; 2. Traverse each error handler clause. Each handler creates a new scope.
+      (concur-ast--analyze-form-recursively ast-ctx body-form)
       (cl-loop for handler in handlers
                do
                (pcase-let* ((`(,condition . ,handler-body) handler)
                             (handler-ctx (copy-concur-ast-context ast-ctx)))
-                 ;; The `error-var` is locally bound within this handler's scope.
                  (when (symbolp error-var)
                    (push error-var (concur-ast-context-known-bindings handler-ctx)))
-                 ;; Traverse the handler's body within its new scope.
                  (concur-ast--analyze-body-sequence handler-ctx handler-body)
-
-                 ;; Merge identified free variables from handler's body back to
-                 ;; parent context.
                  (setf (concur-ast-context-identified-free-vars ast-ctx)
                        (cl-union (concur-ast-context-identified-free-vars ast-ctx)
                                  (concur-ast-context-identified-free-vars handler-ctx)))))
@@ -526,7 +510,7 @@
           ├─> Quoted Form?    -> Skip (literal)
           ├─> Macro Reader?   -> Recurse on inner form
           ├─> Special Form?
-          │   (`let`, `lambda`, `condition-case`, etc.)
+          │   (`let`, `lambda`, `cl-defun`, etc.)
           │       └─> Call specific `concur-ast--analyze-*` handler
           └─> List (function call)? -> `concur-ast--analyze-funcall`
 
@@ -582,8 +566,6 @@
 
     Arguments:
     - `ast-ctx`: The `concur-ast-context` instance for this callable.
-                 It might be a fresh context (for top-level analysis)
-                 or a copy inheriting from an outer scope.
     - `expanded-callable-form`: The callable form after macro-expansion.
     - `initial-param-alist`: An alist of `(original-arg . original-arg)`
       for parameters of this callable that should not be lifted.
@@ -592,146 +574,107 @@
     - `env`: The lexical environment from macro expansion.
 
     Returns:
-    A cons cell `(EXPANDED-CALLABLE-FORM . FREE-VARS-LIST)`, where `FREE-VARS-LIST`
-    is a list of original free variable symbols."
-    (pcase expanded-callable-form
-      ;; --- CASE 1: The form is a literal lambda. ---
-      ((or `(lambda . ,_) `(function (lambda . ,_)) `(quote (lambda . ,_)))
-       (let* ((raw-lambda (concur-ast--unwrap-callable-form expanded-callable-form)))
+    A cons cell `(EXPANDED-CALLABLE-FORM . FREE-VARS-LIST)`."
+  (pcase expanded-callable-form
+    ;; --- CASE 1: The form is a literal lambda. ---
+    ((or `(lambda . ,_) `(function (lambda . ,_)) `(quote (lambda . ,_)))
+     (let* ((raw-lambda (concur-ast--unwrap-callable-form expanded-callable-form))
+            (arglist (nth 1 raw-lambda))
+            (original-body (cddr raw-lambda))
+            (docstring (when (stringp (car original-body)) (car original-body)))
+            (body-to-transform (if docstring (cdr original-body) original-body))
+            (parsed (concur-ast--parse-lambda-list-for-analysis arglist))
+            (bound-vars (car parsed))
+            (init-forms (cdr parsed)))
+       
+       ;; Register lambda arguments as known bindings
+       (dolist (param bound-vars)
+         (push param (concur-ast-context-known-bindings ast-ctx)))
 
-         ;; Add lambda's own parameters to the `known-bindings` of the provided ast-ctx.
-         ;; This ast-ctx is already a copy or fresh for this analysis unit.
-         (dolist (param (mapcar #'car initial-param-alist))
-           (push param (concur-ast-context-known-bindings ast-ctx)))
+       ;; Analyze body
+       (concur-ast--analyze-body-sequence ast-ctx body-to-transform)
 
-         ;; Now, analyze the lambda's body using the main recursive function
-         ;; with the updated ast-ctx.
-         (let* ((original-body (cddr raw-lambda))
-                (docstring (when (stringp (car original-body)) (car original-body)))
-                (body-to-transform (if docstring (cdr original-body) original-body)))
+       ;; Identify free variables
+       (let* ((implicit-free-vars
+               (cl-set-difference (concur-ast-context-identified-free-vars ast-ctx)
+                                  (concur-ast-context-known-bindings ast-ctx)
+                                  :test #'eq))
+              (final-free-var-list
+               (cl-delete-duplicates
+                (append (mapcar #'car additional-capture-vars)
+                        implicit-free-vars)
+                :test #'eq)))
+         (cons expanded-callable-form final-free-var-list))))
 
-           (concur-ast--analyze-body-sequence ast-ctx body-to-transform)
+    ;; --- CASE 2: The form is a function quote, e.g., #'my-func ---
+    (`(function ,name)
+     (cons expanded-callable-form '()))
 
-           ;; Identify free variables based on the final state of ast-ctx
-           (let* ((implicit-free-vars
-                    (cl-set-difference (concur-ast-context-identified-free-vars ast-ctx)
-                                       (concur-ast-context-known-bindings ast-ctx)
-                                       :test #'eq))
-                  (final-free-var-list
-                    (cl-delete-duplicates
-                     (append (mapcar #'car additional-capture-vars)
-                             implicit-free-vars) :test #'eq)))
-             (cons expanded-callable-form final-free-var-list)))))
+    ;; --- CASE 3: The form is a raw symbol, e.g., 'my-func ---
+    ((pred symbolp)
+     (concur-ast--lift-lambda-form ast-ctx `(function ,expanded-callable-form)
+                                   initial-param-alist additional-capture-vars env))
 
-      ;; --- CASE 2: The form is a function quote, e.g., #'my-func ---
-      (`(function ,name)
-       ;; For named functions, there are no lexically captured variables from
-       ;; the calling context that need to be "lifted" in the same way as
-       ;; closure variables.
-       (cons expanded-callable-form '()))
-
-      ;; --- CASE 3: The form is a raw symbol, e.g., 'my-func ---
-      ((pred symbolp)
-       ;; Treat as a named function, so no lexical captures.
-       ;; Normalize to `(function my-func)` and recurse to reuse logic.
-       (concur-ast--lift-lambda-form ast-ctx `(function ,expanded-callable-form)
-                                    initial-param-alist additional-capture-vars env))
-
-      ;; --- CASE 4: Unhandled form ---
-      (_ (error "concur-ast: Expected a lambda or function symbol, got %S"
-                expanded-callable-form))))
+    ;; --- CASE 4: Unhandled form ---
+    (_ (error "concur-ast: Expected a lambda or function symbol, got %S"
+              expanded-callable-form))))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Public API - Top-level Analysis Functions
 
   (cl-defun concur-ast-analyze-lambda-form (handler-raw-form &optional env)
     "Expand `HANDLER-RAW-FORM` and extract its actual lambda form and
-    parameter alist.
-
-    This function serves as a robust pre-processor for analyzing a lambda's
-    structure. It handles various lambda syntaxes (`(lambda ...)`,
-    `#'(lambda ...)`, `'(lambda ...)`) as well as named functions
-    (`#'symbol`, `'symbol`, or `symbol`).
-
-    Arguments:
-    - `handler-raw-form`: The original, unexpanded lambda or function form.
-    - `env`: The lexical environment captured by the calling macro, used for
-      `macroexpand-all`.
-
-    Returns:
-    A `concur-ast-lambda-info` struct containing the expanded form and its
     parameter alist."
     (let* ((expanded-form (macroexpand-all handler-raw-form env))
-            (params nil))
+           (params nil))
       (pcase-let* ((params-and-form
                     (pcase expanded-form
                       (`(lambda ,p . ,_)
-                      (list (if (listp p) p (list p)) expanded-form))
+                       (list (if (listp p) p (list p)) expanded-form))
                       (`(function (lambda ,p . ,_))
-                      (list (if (listp p) p (list p)) expanded-form))
+                       (list (if (listp p) p (list p)) expanded-form))
                       (`(quote (lambda ,p . ,_))
-                      (list (if (listp p) p (list p)) expanded-form))
+                       (list (if (listp p) p (list p)) expanded-form))
                       (`(function ,sym)
-                      (list nil expanded-form))
+                       (list nil expanded-form))
                       ((pred symbolp)
-                      (list nil expanded-form))
+                       (list nil expanded-form))
                       (_
-                      (error "concur-ast-analyze-lambda-form: Unhandled expanded form for analysis: %S" expanded-form)))))
+                       (error "concur-ast-analyze-lambda-form: Unhandled expanded form for analysis: %S" expanded-form)))))
         (let ((params (car params-and-form))
               (actual-expanded-form (cadr params-and-form)))
           (%%make-concur-ast-lambda-info
-          :expanded-form actual-expanded-form
-          :param-alist (cl-loop for p in params collect (cons p p)))))))
+           :expanded-form actual-expanded-form
+           :param-alist (cl-loop for p in params collect (cons p p)))))))
 
   (cl-defun concur-ast-analysis (raw-callable-form &optional env additional-capture-vars)
-    "Analyzes an *expanded* callable form to find free lexical variables.
-
-    This is an internal helper called by `concur-ast-analysis`. It sets up
-    the initial context for a top-level callable analysis, then delegates
-    to the main recursive walker (`concur-ast--analyze-form-recursively`).
-
-    Arguments:
-    - `ast-ctx`: The `concur-ast-context` instance for this callable.
-                 It might be a fresh context (for top-level analysis)
-                 or a copy inheriting from an outer scope.
-    - `expanded-callable-form`: The callable form after macro-expansion.
-    - `initial-param-alist`: An alist `(original-arg . original-arg)`
-      for parameters of this callable that should not be lifted.
-    - `additional-capture-vars`: An alist `(var . t)` to explicitly mark
-      as free variables that must be identified.
-    - `env`: The lexical environment from macro expansion.
-
-    Returns:
-    A cons cell `(EXPANDED-CALLABLE-FORM . FREE-VARS-LIST)`, where
-    `FREE-VARS-LIST` is a list of original free variable symbols."
-  (let* ((initial-ast-ctx (%%make-concur-ast-context)) ; Always start with a fresh context for top-level API calls
-         (lambda-info (concur-ast-analyze-lambda-form raw-callable-form env))
-         (expanded-callable-form (concur-ast-lambda-info-expanded-form lambda-info))
-         (param-alist (concur-ast-lambda-info-param-alist lambda-info))
-         ;; The actual lifting and traversal logic now happens within concur-ast--lift-callable-form,
-         ;; which will use the initial-ast-ctx and its recursive calls will manage sub-contexts.
-         (lift-result (concur-ast--lift-lambda-form initial-ast-ctx 
-                                                    expanded-callable-form 
-                                                    param-alist 
-                                                    additional-capture-vars env))
-         (free-vars-list (cdr lift-result)))
+    "Analyzes an *expanded* callable form to find free lexical variables."
+    (let* ((initial-ast-ctx (%%make-concur-ast-context))
+           (lambda-info (concur-ast-analyze-lambda-form raw-callable-form env))
+           (expanded-callable-form (concur-ast-lambda-info-expanded-form lambda-info))
+           (param-alist (concur-ast-lambda-info-param-alist lambda-info))
+           (lift-result (concur-ast--lift-lambda-form initial-ast-ctx
+                                                      expanded-callable-form
+                                                      param-alist
+                                                      additional-capture-vars env))
+           (free-vars-list (cdr lift-result)))
       (%%make-concur-ast-analysis-result
        :callable-form raw-callable-form
        :expanded-callable-form expanded-callable-form
        :free-vars-list free-vars-list)))
 
-(cl-defun concur-ast-make-captured-vars-form (all-vars)
-  "Generates the Lisp code to create a hash table containing captured variables.
-  ..."
-  (if (null all-vars) 'nil
+  (cl-defun concur-ast-make-captured-vars-form (all-vars)
+    "Generates the Lisp code to create a hash table containing captured variables.
+  Returns a form that evaluates to a hash table. If `all-vars` is empty,
+  it returns a form that evaluates to an empty hash table, ensuring
+  callers always receive a hash table context."
     (let ((ht-sym (gensym "context-ht-")))
       `(let ((,ht-sym (make-hash-table :test 'eq)))
-         ,@(cl-loop for var in all-vars
+        ,@(cl-loop for var in all-vars
                     collect `(setf (gethash ',var ,ht-sym) ,var))
-         ,ht-sym))))
+        ,ht-sym)))
 
 ) ; End of eval-and-compile block
 
 (provide 'concur-ast)
 ;;; concur-ast.el ends here
-

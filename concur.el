@@ -23,8 +23,9 @@
 ;; - `concur-promise`: Implements Promises/A+ for managing async results.
 ;; - `concur-future`: Provides lazily-evaluated asynchronous computations.
 ;; - `concur-cancel`: Defines cancellation tokens for cooperative cancellation.
-;; - `concur-primitives`: Offers locks, semaphores, and other low-level utilities.
-;; - `concur-exec`: Provides functions for running external commands asynchronously.
+;; - `concur-lock`: Offers locks,  and other low-level utilities.
+;; - `concur-semaphore`: Implements a semaphore for concurrency control.
+;; - `concur-process`: Provides functions for running external commands asynchronously.
 ;; - `concur-async`: High-level API (`async!`, `await!`, `let-promise*`, etc.)
 ;;   for running and managing asynchronous tasks.
 ;;
@@ -44,11 +45,17 @@
 (require 'concur-future)
 (require 'concur-cancel)
 (require 'concur-ast)
+(require 'concur-pool)
+(require 'concur-graph)
 
 ;; Load lower-level and higher-level utilities.
-(require 'concur-primitives)
-(require 'concur-exec)
+(require 'concur-lock)
+(require 'concur-semaphore)
+(require 'concur-process)
 (require 'concur-async)
+(require 'concur-nursery)
+(require 'concur-pipeline)
+(require 'concur-shell)
 
 (provide 'concur)
 ;;; concur.el ends here
