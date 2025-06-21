@@ -138,7 +138,7 @@ Returns:
        (concur--async-run-in-deferred
         (concur--async-create-task-wrapper fn) cancel-token))
       ('async
-       (concur-pool-submit-task (concur-pool-get-default) promise form
+       (concur:pool-submit-task (concur-pool-get-default) promise form
                                 (or require nil)
                                 :priority (or priority 50)
                                 :timeout timeout))

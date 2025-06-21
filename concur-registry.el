@@ -70,7 +70,7 @@ Fields:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Registry Management (Called from concur-core)
 
-(defun concur-register-promise (promise name &key parent-promise)
+(defun concur-registry-register-promise (promise name &key parent-promise)
   "Register a new `PROMISE` in the global registry.
 Creates metadata for the promise and handles parent-child links.
 
@@ -90,7 +90,7 @@ Arguments:
           (when-let ((parent-meta (gethash parent-promise concur--promise-registry)))
             (push promise (concur-promise-meta-children-promises parent-meta))))))))
 
-(defun concur-update-promise-state (promise)
+(defun concur-registry-update-promise-state (promise)
   "Update the state of `PROMISE` in the global registry when it settles.
 This function is called by `concur--settle-promise` in `concur-core.el`.
 
@@ -104,7 +104,7 @@ Arguments:
           (push (cons current-time (concur-promise-state promise))
                 (concur-promise-meta-status-history meta)))))))
 
-(defun concur-register-resource-hold (promise resource)
+(defun concur-registry-register-resource-hold (promise resource)
   "Record that `PROMISE` has acquired `RESOURCE`.
 Called by primitives like `concur:lock-acquire`.
 
@@ -116,7 +116,7 @@ Arguments:
       (when-let ((meta (gethash promise concur--promise-registry)))
         (pushnew resource (concur-promise-meta-resources-held meta))))))
 
-(defun concur-release-resource-hold (promise resource)
+(defun concur-registry-release-resource-hold (promise resource)
   "Record that `PROMISE` has released `RESOURCE`.
 
 Arguments:
@@ -130,6 +130,22 @@ Arguments:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public Registry Inspection API
+
+;;;###autoload
+(defun concur-registry-get-promise-name (promise &optional default)
+  "Return the registered name for PROMISE, or DEFAULT if not found.
+This function is thread-safe and respects `concur-enable-promise-registry`.
+
+Arguments:
+- `PROMISE` (concur-promise): The promise to look up.
+- `DEFAULT` (any, optional): The value to return if the promise or its
+  name is not found in the registry."
+  (if (not concur-enable-promise-registry)
+      default
+    (concur:with-mutex! concur--promise-registry-lock
+      (let* ((meta (gethash promise concur--promise-registry))
+             (name (and meta (concur-promise-meta-name meta))))
+        (or name default)))))
 
 ;;;###autoload
 (defun concur:list-promises (&optional status-filter name-filter)
@@ -148,7 +164,8 @@ Returns:
              when (and (or (null status-filter)
                            (eq (concur-promise-state promise) status-filter))
                        (or (null name-filter)
-                           (s-contains? name-filter (concur-promise-meta-name meta))))
+                           (and (concur-promise-meta-name meta)
+                                (s-contains? name-filter (concur-promise-meta-name meta)))))
              collect promise)))
 
 ;;;###autoload
@@ -164,7 +181,8 @@ Returns:
     (cl-loop for promise being the hash-keys of concur--promise-registry
              for meta being the hash-values of concur--promise-registry
              when (or (eq (concur-promise-id promise) id-or-name)
-                      (string= id-or-name (concur-promise-meta-name meta)))
+                      (and (stringp id-or-name)
+                           (string= id-or-name (concur-promise-meta-name meta))))
              return promise)))
 
 ;;;###autoload

@@ -8,7 +8,7 @@
 ;; for `concur-process.el`, minimizing overhead by reusing worker processes.
 ;;
 ;; It offers two main interfaces:
-;; 1. `concur-shell-submit-command`: For running independent, stateless
+;; 1. `concur:shell-submit-command`: For running independent, stateless
 ;;    commands concurrently, with output streamed via `concur-stream`.
 ;; 2. `concur:shell-session`: A macro that reserves a dedicated worker for
 ;;    stateful command sequences, ensuring they run in the same shell
@@ -321,7 +321,7 @@ Must be called from within the pool's lock."
 ;;; Public API
 
 ;;;###autoload
-(cl-defun concur-shell-submit-command (command &key cwd timeout)
+(cl-defun concur:shell-submit-command (command &key cwd timeout)
   "Submit a single COMMAND to the persistent shell pool asynchronously.
 
 Arguments:

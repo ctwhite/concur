@@ -24,7 +24,7 @@
 
 (require 'cl-lib)
 (require 'ht)
-(require 'concur-hooks)      ; For concur--log, if available
+(require 'concur-log)      ; For concur--log, if available
 (require 'concur-core)       ; For define-error
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

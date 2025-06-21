@@ -298,7 +298,7 @@ Must be called from within the pool's lock."
         (process-send-string (concur-worker-process worker) (concat json "\n"))))))
 
 ;;;###autoload
-(cl-defun concur-pool-submit-task (pool promise form require
+(cl-defun concur:pool-submit-task (pool promise form require
                                        &key (priority 50) timeout)
   "Submit a task to the worker POOL.
 Creates a task and enqueues it. Implements backpressure by rejecting
@@ -330,7 +330,7 @@ Returns:
         (concur--pool-dispatch-next-task pool))))))
 
 ;;;###autoload
-(defun concur-pool-shutdown! (&optional pool)
+(defun concur:pool-shutdown! (&optional pool)
   "Gracefully shut down a worker POOL.
 Terminates all worker processes and rejects any pending tasks.
 
@@ -347,7 +347,7 @@ Returns:
         (dolist (worker (concur-pool-workers p))
           (when-let (proc (concur-worker-process worker))
             (when (process-live-p proc)
-              ;; BUG FIX: Explicitly reject the task of a busy worker.
+              ;; Explicitly reject the task of a busy worker.
               (when-let (task (concur-worker-current-task worker))
                 (concur:reject (concur-pool-task-promise task)
                                (concur:make-error
@@ -360,7 +360,7 @@ Returns:
         (setf (concur-pool-workers p) nil)))))
 
 ;;;###autoload
-(defun concur-pool-status (&optional pool)
+(defun concur:pool-status (&optional pool)
   "Return a snapshot of the POOL's current status.
 
 Arguments:

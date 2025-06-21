@@ -23,7 +23,7 @@
 (require 'dash)
 (require 'macroexp)
 
-(require 'concur-hooks)
+(require 'concur-log)
 
 ;; All of these functions are helpers for macros and need to be available
 ;; to the byte-compiler.

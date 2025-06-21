@@ -16,7 +16,7 @@
 (require 'dash)
 (require 'concur-core)
 (require 'concur-lock)
-(require 'concur-hooks)
+(require 'concur-log)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors & Customization

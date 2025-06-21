@@ -32,7 +32,7 @@
 (require 'concur-core)
 (require 'concur-chain)
 (require 'concur-lock)
-(require 'concur-hooks)
+(require 'concur-log)
 (require 'concur-shell)
 (require 'concur-stream)
 
@@ -510,7 +510,7 @@ Returns:
         (let ((full-command
                (s-join " " (--map (shell-quote-argument it) (cons command args)))))
           (concur:chain
-              (concur-shell-submit-command full-command
+              (concur:shell-submit-command full-command
                                            :cwd (plist-get plist :cwd)
                                            :timeout (plist-get plist :timeout))
             (lambda (shell-result)
