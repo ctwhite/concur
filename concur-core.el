@@ -25,32 +25,21 @@
 
 ;;; Code:
 
-(require 'cl-lib)            ; Common Lisp extensions for struct, loop, etc.
-(require 'dash)              ; Utility functions like `--each`, `--map`, `-filter`
-(require 's)                  ; String manipulation functions
+(require 'cl-lib)            
+(require 'dash)              
+(require 's)                  
 
-(require 'concur-log)       ; Custom hooks for extensibility
-(require 'concur-cancel)      ; Cancellation token and related logic
+(require 'concur-log       
+(require 'concur-cancel)      
 (require 'concur-lock)
-(require 'concur-semaphore)   ; For semaphore integration
-(require 'concur-ast)         ; For analyzing and capturing lexical environments
-(require 'concur-scheduler)   ; Generalized task scheduler (for macrotasks)
-(require 'concur-microtask)   ; Microtask queue (for immediate execution)
-(require 'concur-registry)    ; Promise registry for introspection
+(require 'concur-semaphore)   
+(require 'concur-ast)         
+(require 'concur-scheduler)   
+(require 'concur-microtask)   
+(require 'concur-registry)    
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
-
-(declare-function concur:finally "concur-chain" (promise callback-form))
-(declare-function concur-registry-get-promise-name "concur-registry"
-                  (promise &optional default))
-(declare-function concur-registry-register-promise "concur-registry"
-                  (promise name &key parent-promise))
-(declare-function concur-registry-update-promise-state "concur-registry" (promise))
-(declare-function concur-registry-register-resource-hold "concur-registry"
-                  (promise resource))
-(declare-function concur-registry-release-resource-hold "concur-registry"
-                  (promise resource))
 
 (defvar yield--await-external-status-key nil)
 
@@ -234,6 +223,57 @@ Fields:
   (async-stack-trace nil :type (or null string)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; True Thread-Safe Signaling Mechanism
+
+(defvar concur--thread-callback-pipe nil
+  "A pipe used by background threads to send callbacks to the main thread.")
+
+(defvar concur--thread-callback-sentinel-process nil
+  "A dummy process whose sentinel listens to the pipe for thread callbacks.")
+
+(defun concur--thread-callback-dispatcher (callback-form)
+  "Send a function form to be executed on the main thread via a pipe.
+This is the core of the thread-safe signaling. A background thread calls
+this function, which writes the callback form to a pipe. A sentinel on the main
+thread reads from the pipe and executes the callback safely."
+  (when (and concur--thread-callback-pipe
+             (process-live-p concur--thread-callback-sentinel-process))
+    (let ((write-end (process-contact concur--thread-callback-sentinel-process)))
+      ;; The callback form is serialized to a string, sent through the pipe,
+      ;; and then `read` and `eval`d on the main thread.
+      (send-string-to-process (prin1-to-string callback-form) write-end)
+      (send-string-to-process "\n" write-end))))
+
+(defun concur--thread-callback-sentinel (process event)
+  "The sentinel that reads and executes callbacks from background threads."
+  (when (string-match "output" event)
+    (let ((output-buffer (process-buffer process)))
+      (with-current-buffer output-buffer
+        (dolist (line (s-split "\n" (buffer-string) t))
+          (when-let (callback-form (ignore-errors (read line)))
+            ;; The form is now running on the main Emacs thread.
+            (eval callback-form)))
+        (erase-buffer)))))
+
+(defun concur--init-thread-signaling ()
+  "Initialize the pipe and sentinel for cross-thread communication."
+  (when (and (fboundp 'make-thread) (not concur--thread-callback-pipe))
+    (setq concur--thread-callback-pipe (make-pipe-process
+                                        :name "concur-thread-pipe"))
+    (setq concur--thread-callback-sentinel-process
+          (make-process :name "concur-thread-sentinel"
+                        :command '("cat") ; Dummy command that stays alive.
+                        :connection-type 'pipe
+                        :noquery t 
+                        :coding 'utf-8
+                        :stderr (process-contact concur--thread-callback-pipe
+                                                 :stderr)
+                        :stdout (process-contact concur--thread-callback-pipe
+                                                 :stdin)))
+    (set-process-sentinel concur--thread-callback-sentinel-process
+                          #'concur--thread-callback-sentinel)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal State and Schedulers
 
 (defun concur--init-macrotask-queue ()
@@ -273,20 +313,36 @@ This function is idempotent and thread-safe.
 ;; pending, fulfilled, or rejected.
 ;; Promises/A+ Spec 2.1.2 & 2.1.3: When fulfilled or rejected, a promise
 ;; must not transition to any other state."
-  (let ((settled-now nil))
+  (let ((settled-now nil) (callbacks-to-run '()))
     (concur:with-mutex! (concur-promise-lock promise)
       ;; The core idempotency check: only proceed if still pending.
       (when (eq (concur-promise-state promise) :pending)
         (let ((new-state (if error :rejected :resolved)))
+          (setq callbacks-to-run (concur-promise-callbacks promise))
+          (setf (concur-promise-callbacks promise) nil) ; Clear callbacks.
           (setf (concur-promise-result promise) result)
           (setf (concur-promise-error promise) error)
           (setf (concur-promise-cancelled-p promise) is-cancellation)
           (setf (concur-promise-state promise) new-state)
-          (setq settled-now t)
-          (concur--trigger-callbacks-after-settle promise)
-          (when is-cancellation
-            (concur--kill-associated-process promise)))))
+          (setq settled-now t))))
     (when settled-now
+      ;; If settlement happens in a background thread, dispatch callback
+      ;; execution to the main thread to ensure safety.
+      (if (and (eq (concur-promise-mode promise) :thread)
+               (fboundp 'main-thread)
+               (not (equal (current-thread) (main-thread))))
+          (concur--thread-callback-dispatcher
+           `(let ((promise ,promise)
+                  (callbacks-to-run ',callbacks-to-run)
+                  (is-cancellation ,is-cancellation))
+              (concur--trigger-callbacks-after-settle promise callbacks-to-run)
+              (when is-cancellation
+                (concur--kill-associated-process promise))))
+        ;; Otherwise, execute directly in the current (main) thread.
+        (progn
+          (concur--trigger-callbacks-after-settle promise callbacks-to-run)
+          (when is-cancellation
+            (concur--kill-associated-process promise))))
       (when (fboundp 'concur-registry-update-promise-state)
         (concur-registry-update-promise-state promise))))
   promise)
@@ -298,14 +354,14 @@ This function is idempotent and thread-safe.
       (delete-process proc))
     (setf (concur-promise-proc promise) nil)))
 
-(defun concur--trigger-callbacks-after-settle (promise)
-  "Called once a promise settles to schedule its callbacks."
-  (let ((callback-links (concur-promise-callbacks promise)))
-    ;; Promises/A+ Spec 2.2.2.3 & 2.2.3.3: Callbacks must not be called more
-    ;; than once. Clearing the list ensures this.
-    (setf (concur-promise-callbacks promise) nil)
-    (concur--partition-and-schedule-callbacks callback-links)
-    (concur--handle-unhandled-rejection-if-any promise callback-links)))
+(defun concur--trigger-callbacks-after-settle (promise callback-links)
+  "Called once a promise settles to schedule its callbacks.
+This function now takes the list of callbacks explicitly to support
+being dispatched from a background thread."
+  ;; Promises/A+ Spec 2.2.2.3 & 2.2.3.3: Callbacks must not be called more
+  ;; than once. Clearing the list in `settle-promise` ensures this.
+  (concur--partition-and-schedule-callbacks callback-links)
+  (concur--handle-unhandled-rejection-if-any promise callback-links))
 
 (defun concur--partition-and-schedule-callbacks (callback-links)
   "Partitions callbacks into microtasks and macrotasks, then schedules them."
@@ -404,7 +460,6 @@ This function is idempotent and thread-safe.
             (concur:make-error :type :callback-error
                                :message (format "Callback failed: %S" err)
                                :cause err :promise origin-promise))))))))
-
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal `await` Implementation
@@ -510,7 +565,7 @@ Arguments:
   `:thread`: Safe for use across multiple Emacs threads. Settlement
     from a background thread will be safely dispatched to the main thread.
 - `:NAME` (string, optional): A descriptive name for debugging and registry.
-- `:CANCEL-TOKEN` (concur-cancel-token, optional): Token to link for cancellation.
+- `:CANCEL-TOKEN` (concur-cancel-token, optional): Token for cancellation.
 - `:PARENT-PROMISE` (concur-promise, optional): The promise that created this one.
 
 Returns:
@@ -970,5 +1025,8 @@ Returns:
                      :promise target-promise
                      :context `',final-context)))
 
+;; Initialize the thread signaling mechanism on load, if threads are available.
+(concur--init-thread-signaling)
+
 (provide 'concur-core)
-;;; concur-core.el ends here
+;;; concur-core.el ends h
