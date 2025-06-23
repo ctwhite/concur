@@ -397,8 +397,6 @@ the process state from the process's property list.
 
   Returns:
   - `nil` (side-effect: writes to streams, calls user callbacks)."
-  ;; Retrieve the state from the process's property list to avoid
-  ;; lexical closure issues.
   (when-let ((process-state (process-get process 'concur-process-state)))
     (let* ((is-stdout (eq (current-buffer) (process-buffer process)))
            (output-stream (if is-stdout
@@ -407,12 +405,13 @@ the process state from the process's property list.
            (user-cb (if is-stdout
                         (concur-process-state-on-stdout-user-cb process-state)
                       (concur-process-state-on-stderr-user-cb process-state))))
-      ;; Optionally call a user-provided callback for direct chunk access.
       (when user-cb (funcall user-cb chunk))
-      ;; Write to the stream, handling backpressure.
       (when output-stream
         (let ((write-promise (concur:stream-write output-stream chunk)))
-          (when write-promise
+          ;; FIX: Only chain if the write operation returned a promise.
+          ;; The value `t` indicates immediate success and requires no
+          ;; further action.
+          (when (concur-promise-p write-promise)
             (concur:then write-promise nil
                          (lambda (err)
                            (concur--reject-process-promise
@@ -944,4 +943,3 @@ This is a convenient way to create reusable, documented async commands.
 
 (provide 'concur-process)
 ;;; concur-process.el ends here
-
