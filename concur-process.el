@@ -386,37 +386,40 @@ process backend.
             process-state 'concur-process-cancelled
             (format "Command '%s' was cancelled." cmd))))))))
 
-(defun concur--process-filter (process chunk process-state)
+(defun concur--process-filter (process chunk)
   "Process filter to dispatch stdout/stderr chunks to the correct stream.
-This function is called by Emacs when process output is available.
+This function is called by Emacs when process output is available. It retrieves
+the process state from the process's property list.
 
   Arguments:
   - `process` (process): The Emacs process object.
   - `chunk` (string): The raw output chunk.
-  - `process-state` (concur-process-state): The state object for this process.
 
   Returns:
   - `nil` (side-effect: writes to streams, calls user callbacks)."
-  (let* ((is-stdout (eq (current-buffer) (process-buffer process)))
-         (output-stream (if is-stdout
-                           (concur-process-state-stdout-stream process-state)
-                         (concur-process-state-stderr-stream process-state)))
-         (user-cb (if is-stdout
-                      (concur-process-state-on-stdout-user-cb process-state)
-                    (concur-process-state-on-stderr-user-cb process-state))))
-    ;; Optionally call a user-provided callback for direct chunk access.
-    (when user-cb (funcall user-cb chunk))
-    ;; Write to the stream, handling backpressure.
-    (when output-stream
-      (let ((write-promise (concur:stream-write output-stream chunk)))
-        (when write-promise
-          (concur:then write-promise nil
-                       (lambda (err)
-                         (concur--reject-process-promise
-                          process-state 'concur-process-error
-                          (format "Output stream write failed: %s"
-                                  (concur:error-message err))
-                          :cause err))))))))
+  ;; Retrieve the state from the process's property list to avoid
+  ;; lexical closure issues.
+  (when-let ((process-state (process-get process 'concur-process-state)))
+    (let* ((is-stdout (eq (current-buffer) (process-buffer process)))
+           (output-stream (if is-stdout
+                             (concur-process-state-stdout-stream process-state)
+                           (concur-process-state-stderr-stream process-state)))
+           (user-cb (if is-stdout
+                        (concur-process-state-on-stdout-user-cb process-state)
+                      (concur-process-state-on-stderr-user-cb process-state))))
+      ;; Optionally call a user-provided callback for direct chunk access.
+      (when user-cb (funcall user-cb chunk))
+      ;; Write to the stream, handling backpressure.
+      (when output-stream
+        (let ((write-promise (concur:stream-write output-stream chunk)))
+          (when write-promise
+            (concur:then write-promise nil
+                         (lambda (err)
+                           (concur--reject-process-promise
+                            process-state 'concur-process-error
+                            (format "Output stream write failed: %s"
+                                    (concur:error-message err))
+                            :cause err)))))))))
 
 (defun concur--setup-stdin-streaming (process-state)
   "Initializes stdin streaming from a file or from a string via a temp file.
@@ -624,8 +627,7 @@ This function encapsulates the setup logic for the non-persistent backend.
                       :buffer (generate-new-buffer "*concur-stdout*")
                       :stderr (generate-new-buffer "*concur-stderr*")
                       :sentinel #'concur--process-sentinel
-                      :filter (lambda (p c)
-                                (concur--process-filter p c process-state))
+                      :filter #'concur--process-filter
                       :noquery t :connection-type 'pipe :coding-system 'utf-8
                       :current-directory cwd
                       :environment proc-env)))
@@ -942,3 +944,4 @@ This is a convenient way to create reusable, documented async commands.
 
 (provide 'concur-process)
 ;;; concur-process.el ends here
+

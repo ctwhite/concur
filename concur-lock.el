@@ -147,8 +147,6 @@ For other modes, it's a non-blocking attempt that returns `nil` if held.
     (when acquired-p
       (concur--log :debug (concur-lock-name lock) "Acquired lock by %S."
                    (concur-lock-owner lock))
-      ;; **FIX:** Prevent resource tracking on the registry's own lock
-      ;; to avoid infinite recursion.
       (when (and concur-resource-tracking-function
                  (not (and (boundp 'concur--promise-registry-lock)
                            (eq lock concur--promise-registry-lock))))
@@ -177,27 +175,29 @@ For other modes, it's a non-blocking attempt that returns `nil` if held.
                              (if (eq (concur-lock-mode lock) :thread)
                                  (current-thread)
                                (current-buffer)))))
+    ;; Perform pre-flight checks for ownership and state.
     (pcase (concur-lock-mode lock)
       (:thread
-       ;; For thread mode, the owner is implicitly the current thread.
-       ;; `mutex-unlock` will error if not owned, so we check first.
-       (unless (mutex-owner (concur-lock-native-mutex lock))
-         (user-error "concur:lock-release: Attempt to release an unlocked \
-                      :thread lock: %S" (concur-lock-name lock))))
+       ;; FIX: Check our own state tracking, not a non-existent function.
+       ;; `mutex-unlock` will signal its own error if not owned by the current
+       ;; thread, but we check our `owner` slot first for consistency.
+       (unless (eq (concur-lock-owner lock) effective-owner)
+         (user-error "concur:lock-release: Cannot release lock %S owned by %S (caller is %S)"
+                     (concur-lock-name lock)
+                     (concur-lock-owner lock)
+                     effective-owner)))
       ((or :async :deferred) ;; Cooperative modes
        (unless (concur-lock-locked-p lock)
-         (user-error "concur:lock-release: Attempt to release an unlocked \
-                      cooperative lock: %S" (concur-lock-name lock)))
+         (user-error "concur:lock-release: Attempt to release an unlocked cooperative lock: %S"
+                     (concur-lock-name lock)))
        (when (and (concur-lock-owner lock)
                   (not (eq (concur-lock-owner lock) effective-owner)))
-         (user-error "concur:lock-release: Cannot release lock %S owned by %S \
-                      (caller is %S)"
+         (user-error "concur:lock-release: Cannot release lock %S owned by %S (caller is %S)"
                      (concur-lock-name lock)
                      (concur-lock-owner lock)
                      effective-owner))))
 
     ;; Perform resource tracking cleanup before actual lock release.
-    ;; **FIX:** Prevent resource tracking on the registry's own lock.
     (when (and concur-resource-tracking-function
                (not (and (boundp 'concur--promise-registry-lock)
                          (eq lock concur--promise-registry-lock))))
