@@ -1,47 +1,44 @@
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; concur-chain.el --- Chaining and flow-control for Concur Promises -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
 ;; This file provides the primary user-facing API for composing and chaining
-;; promises. It contains the fundamental `concur:then` macro for attaching
-;; success and failure handlers, as well as higher-level convenience macros
-;; like `concur:catch`, `concur:finally`, and the powerful `concur:chain`
-;; for expressing complex asynchronous workflows in a clear, sequential manner.
-;;
-;; This module depends on `concur-ast.el` to correctly "lift" variables from
-;; lexical closures, making them available across asynchronous boundaries. This
-;; allows handlers to seamlessly use variables from their surrounding scope
-;; without manual capturing.
+;; promises. It contains the fundamental `concur:then` macro, convenience
+;; wrappers like `concur:catch` and `concur:finally`, and the powerful
+;; `concur:chain` macro for expressing complex asynchronous workflows in a
+;; clear, sequential style.
 ;;
 ;; Architectural Highlights:
-;;
-;; - `concur:then`: The fundamental chaining primitive, which uses AST
-;;   analysis to capture lexical environments, making asynchronous callbacks
-;;   feel like natural closures.
-;;
-;; - `concur:chain`: A powerful "threading" macro that provides a readable,
-;;   linear syntax for composing complex sequences of asynchronous operations,
-;;   complete with syntactic sugar for common patterns.
-;;
-;; - Block Syntax for Sub-chains: Keywords that take a sequence of steps
-;;   (like `:timeout`) support a natural, block-based syntax, improving
-;;   readability by removing the need for explicit `(list ...)` wrappers.
+;; - Simplified Primitives: `concur:then` is now built directly on
+;;   `concur:with-executor`, delegating complex lifecycle management to the
+;;   core library for improved robustness and simplicity.
+;; - Ergonomic Flow Control: The `concur:chain` macro provides a rich DSL
+;;   for writing sequential-style async code, now including a powerful `:let`
+;;   clause for binding results of async operations to variables.
+;; - Native Closures: The library fully relies on standard Emacs Lisp lexical
+;;   closures, ensuring robust and predictable behavior.
 
 ;;; Code:
 
-(require 'cl-lib)     ; For cl-loop, cl-delete-duplicates, cl-destructuring-bind
-(require 'dash)       ; For --map, -filter, -flatten, -drop-while, -some
+(require 'cl-lib)
+(require 'dash)
 
-(require 'concur-ast) ; For AST analysis and lexical context capture
-(require 'concur-core) ; For core promise types and functions (concur:make-promise,
-                       ; concur:resolved!, concur:rejected!, concur-attach-callbacks,
-                       ; concur-make-resolved-callback, concur-make-rejected-callback)
-(require 'concur-log)  ; For concur--log
+(require 'concur-core)
+(require 'concur-log)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Forward Declarations for Combinators (from concur-combinators.el)
+;;; Customization
 
+(defcustom concur-chain-anaphoric-symbol '<>
+  "The anaphoric symbol to use in `concur:chain` steps.
+This symbol will be bound to the resolved value of the previous step."
+  :type 'symbol
+  :group 'concur)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Forward Declarations
+
+;; These functions from `concur-combinators.el` are used in `concur:chain`.
 (declare-function concur:all "concur-combinators")
 (declare-function concur:race "concur-combinators")
 (declare-function concur:timeout "concur-combinators")
@@ -49,368 +46,360 @@
 (declare-function concur:retry "concur-combinators")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Internal Macro Helpers (Compile-Time)
+;;; Internal Macro Helpers
 
+;; `eval-and-compile` is necessary here because the `concur:chain` macro
+;; needs these helper functions to be available at compile time to perform
+;; its expansion.
 (eval-and-compile
-  (defun concur--then-analyze-handlers (on-resolved-form on-rejected-form env)
-    "Use the AST analyzer to prepare lexical context for `concur:then` handlers.
+  (defun concur--chain-expand-let-step (binding-form body-forms short-circuit-p)
+    "Expand a `:let` clause within a `concur:chain` macro.
+This function creates a nested chain. It takes a BINDING-FORM, executes it,
+binds its result to a variable, and then executes the BODY-FORMS within the
+lexical scope of that binding.
 
-    This function analyzes the provided `on-resolved-form` and
-    `on-rejected-form` (which are typically lambda expressions) to identify
-    free variables. It then constructs forms to capture these variables
-    from the lexical environment `ENV` at macro expansion time.
+Arguments:
+- `BINDING-FORM` (form): A single binding `(VAR FORM)`.
+- `BODY-FORMS` (list): The remaining steps of the `concur:chain`.
+- `SHORT-CIRCUIT-P` (boolean): If non-nil, short-circuit on nil values.
 
-    Arguments:
-    - `on-resolved-form` (form or nil): The success handler form.
-    - `on-rejected-form` (form or nil): The rejection handler form.
-    - `env` (environment): The lexical environment at the macro call site.
+Returns:
+- `(form)`: The expanded Lisp form for this `:let` step."
+    (let ((var (car binding-form))
+          (form (cadr binding-form)))
+      `(concur:then
+        ,form
+        (lambda (,var)
+          ,(if short-circuit-p
+               `(concur:chain-when ,var ,@body-forms)
+             `(concur:chain ,var ,@body-forms))))))
 
-    Returns:
-    - (plist): A plist containing:
-      - `:resolved-lambda`: The callable form for the resolved handler.
-      - `:resolved-vars`: List of free variables in the resolved handler.
-      - `:rejected-lambda`: The callable form for the rejected handler.
-      - `:rejected-vars`: List of free variables in the rejected handler.
-      - `:context-form`: A form that, when evaluated, provides a map of
-        captured variables and their values."
-    (-let* ((resolved-analysis
-             (concur-ast-analysis (or on-resolved-form '(lambda (val) val)) env))
-            (rejected-analysis
-             (concur-ast-analysis (or on-rejected-form
-                                      '(lambda (err) (concur:rejected! err)))
-                                  env))
-            (all-vars
-             (cl-delete-duplicates
-              (append (concur-ast-analysis-result-free-vars-list
-                       resolved-analysis)
-                      (concur-ast-analysis-result-free-vars-list
-                       rejected-analysis))))
-            (captured-vars-form
-             (concur-ast-make-captured-vars-form all-vars)))
-      `(:resolved-lambda
-        ,(concur-ast-analysis-result-expanded-callable-form resolved-analysis)
-        :resolved-vars
-        ,(concur-ast-analysis-result-free-vars-list resolved-analysis)
-        :rejected-lambda
-        ,(concur-ast-analysis-result-expanded-callable-form rejected-analysis)
-        :rejected-vars
-        ,(concur-ast-analysis-result-free-vars-list rejected-analysis)
-        :context-form ,captured-vars-form)))
+  (defun concur--chain-expand-sugar (steps)
+    "Transform syntactic sugar keywords in `concur:chain` into canonical clauses.
+This function preprocesses the list of steps, converting keywords like
+`:sleep`, `:log`, etc., into their equivalent `(:then ...)` or `(:tap ...)` forms.
 
-    (defun concur--expand-sugar (steps)
-      "Transform syntactic sugar keywords in `concur:chain` into canonical clauses.
+Arguments:
+- `STEPS` (list): The list of forms from a `concur:chain` macro call.
 
-    This function takes a list of chain steps (which may contain special
-    keywords like `:timeout`, `:log`, `:map`) and expands them into the
-    underlying `:then`, `:catch`, `:finally`, or `:tap` clauses that the
-    chain macro understands. It also handles block syntax (e.g.,
-    `:timeout <sec> <forms...>).
+Returns:
+- `(list)`: A new list of steps with all sugar expanded."
+    (let (processed)
+      (while steps
+        (let ((key (pop steps)) arg1)
+          (pcase key
+            (:log
+             (let ((fmt (if (and steps (stringp (car steps)))
+                            (pop steps) "chain: %S")))
+               (push `(:tap (lambda (val err)
+                              (concur--log :info nil ,fmt (or val err))))
+                     processed)))
+            (:sleep
+             (setq arg1 (pop steps))
+             (push `(:then (lambda (val)
+                             (concur:then (concur:delay (/ ,arg1 1000.0))
+                                          (lambda (_) val))))
+                   processed))
+            (:retry
+             (setq arg1 (pop steps))
+             (let ((retry-form (pop steps)))
+               (push `(:then (lambda (val)
+                               (concur:retry (lambda () ,retry-form)
+                                             :retries ,arg1)))
+                     processed)))
+            (_
+             (push key processed)
+             (when steps (push (pop steps) processed))))))
+      (nreverse processed)))
 
-    Arguments:
-    - `steps` (list): A list of raw chain step forms.
+  (defun concur--chain-expand-steps (promise-form steps short-circuit-p)
+    "Recursively expand `concur:chain` steps into nested `concur:then` calls.
 
-    Returns:
-    - (list): A list of expanded chain step forms."
-      (let (processed)
-        (while steps
-          (let ((key (pop steps)) arg1 sub-chain)
-            (pcase key
-              ;; Keywords that take a block of steps (e.g., :timeout).
-              (:timeout
-                (setq arg1 (pop steps))
-                ;; Greedily consume all subsequent non-keyword forms as the sub-chain.
-                (setq sub-chain (cl-loop for form in steps
-                                          while (and form (not (keywordp form)))
-                                          collect form))
-                (setq steps (nthcdr (length sub-chain) steps))
-                ;; If the sub-chain was wrapped in `(list ...)` for clarity,
-                ;; unwrap it.
-                (when (and (= 1 (length sub-chain))
-                            (eq 'list (car-safe (car sub-chain))))
-                  (setq sub-chain (cdr (car sub-chain))))
-                (pcase key
-                  (:timeout
-                    (push `(:then (lambda (<>)
-                                    (concur:timeout (concur:chain <> ,@sub-chain)
-                                                    ,arg1)))
-                          processed))))
+Arguments:
+- `PROMISE-FORM` (form): Form evaluating to the promise from the previous step.
+- `STEPS` (list): The remaining steps to expand.
+- `SHORT-CIRCUIT-P` (boolean): If non-nil, short-circuit on nil values.
 
-              ;; Keywords that take a single argument.
-              ((or :await-all :await-race :if-then :map :filter :each
-                  :sleep :retry) 
-                (setq arg1 (pop steps))
-                (pcase key
-                  (:await-all
-                    (push `(:then (lambda (<>) (concur:all ,arg1))) processed))
-                  (:await-race
-                    (push `(:then (lambda (<>) (concur:race ,arg1))) processed))
-                  (:if-then
-                    (let* ((then-form arg1)
-                          (else-form (when (and steps (not (keywordp (car steps))))
-                                        (pop steps))))
-                      (push `(:then (lambda (<>)
-                                      (if <> ,then-form ,(or else-form '<>))))
-                            processed)))
-                  (:map (push `(:then (lambda (list) (--map ,arg1 list)))
-                              processed))
-                  (:filter (push `(:then (lambda (list) (--filter ,arg1 list)))
-                                processed))
-                  (:each (push `(:then (lambda (list) (prog1 list (--each ,arg1 list))))
-                              processed))
-                  (:sleep (push `(:then (lambda (val)
-                                          (concur:then (concur:delay (/ ,arg1 1000.0))
-                                                        (lambda (_) val))))
-                              processed))
-                  (:retry
-                    (let ((retry-form (pop steps)))
-                      (push `(:then (lambda (<>)
-                                      (concur:retry (lambda () ,retry-form)
-                                                    :retries ,arg1)))
-                            processed)))))
+Returns:
+- `(form)`: The fully expanded Lisp form for the promise chain."
+    (if (null steps)
+        promise-form
+      (let* ((step (car steps))
+             (rest-steps (cdr steps))
+             (anaphor (intern (symbol-name concur-chain-anaphoric-symbol))))
+        (pcase step
+          (`(:let ,binding)
+           ;; Let binding takes over the rest of the chain recursively.
+           (let ((binding-form (if (consp (car-safe binding)) binding (list binding))))
+             `(concur:then
+               ,promise-form
+               (lambda (,anaphor)
+                 ,(concur--chain-expand-let-step
+                   (car binding-form) rest-steps short-circuit-p)))))
 
-              ;; Keywords with optional arguments.
-              (:log
-                (let ((fmt (if (and steps (stringp (car steps))) (pop steps) "%S")))
-                  (push `(:tap (lambda (val err)
-                                  (concur--log :info nil ,fmt (or val err)))) ; Using concur--log
-                        processed)))
+          ((or `(:then ,_) `(:catch ,_) `(:finally ,_) `(:tap ,_))
+           ;; For explicit clauses, wrap and recurse.
+           (let ((next-promise `(,(car step) ,promise-form ,(cadr step))))
+             (concur--chain-expand-steps next-promise rest-steps short-circuit-p)))
 
-              ;; Default case for standard chain steps or implicit :then steps.
-              (_ (push key processed)
-                (when steps (push (pop steps) processed))))))
-        (nreverse processed)))
-
-  (defun concur--chain-process-single-step (current-promise-form step
-                                             short-circuit-on-nil-p)
-    "Generate the code for a single step in a `concur:chain` expansion.
-
-    This helper function takes the promise form representing the result of
-    the previous step (`current-promise-form`) and a `step` definition,
-    then returns the Lisp form that performs the chaining for that step.
-    It applies an anaphoric wrapper for `<>` if short-circuiting is enabled.
-
-    Arguments:
-    - `current-promise-form` (form): The promise form from the previous step.
-    - `step` (form): A single step definition from `concur--expand-sugar`.
-    - `short-circuit-on-nil-p` (boolean): If `t`, wrap `BODY` in `(when <> ...)`.
-
-    Returns:
-    - (form): A Lisp form representing the chained step."
-    (let ((anaphoric-wrapper
-           (lambda (body)
-             `(lambda (<>)
-                ,(if short-circuit-on-nil-p `(when <> ,body) body)))))
-      (pcase step
-        (`(:then ,handler)
-         `(concur:then ,current-promise-form ,handler))
-        (`(:catch ,handler)
-         `(concur:catch ,current-promise-form ,handler))
-        (`(:finally ,handler)
-         `(concur:finally ,current-promise-form ,handler))
-        (`(:tap ,handler)
-         `(concur:tap ,current-promise-form ,handler))
-        (_ (if (listp step)
-               `(concur:then ,current-promise-form
-                             ,(funcall anaphoric-wrapper step))
-             (user-error "Invalid concur:chain step: %S" step))))))
-
-  (defmacro concur--expand-chain-internal (initial-promise-expr steps
-                                            short-circuit-on-nil-p)
-    "Internal helper to expand `concur:chain` and `concur:chain-when`.
-
-    This macro iteratively builds the promise chain by processing each
-    step. It starts with an initial promise (or value converted to a
-    resolved promise) and applies subsequent steps.
-
-    Arguments:
-    - `initial-promise-expr` (form): The initial promise or value.
-    - `steps` (list): A list of step definitions.
-    - `short-circuit-on-nil-p` (boolean): If `t`, subsequent `:then` steps
-      will short-circuit if the previous promise resolves to `nil`.
-
-    Returns:
-    - (form): The final expanded promise chain form."
-    (let ((result-form `(concur:resolved! ,initial-promise-expr)))
-      (dolist (step (concur--expand-sugar steps))
-        (setq result-form
-              (concur--chain-process-single-step result-form step
-                                                 short-circuit-on-nil-p)))
-      result-form)))
+          ;; Default case: implicit `:then` with an anaphoric variable.
+          (_
+           (let ((next-promise
+                  `(concur:then
+                    ,promise-form
+                    (lambda (,anaphor)
+                      ,(if short-circuit-p
+                           `(when ,anaphor ,step)
+                         step)))))
+             (concur--chain-expand-steps
+              next-promise rest-steps short-circuit-p))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Public API - Promise Chaining Primitives
+;;; Public API: Core Chaining Primitives
 
 ;;;###autoload
-(cl-defmacro concur:then (source-promise-form
-                          &optional on-resolved-form on-rejected-form
-                          &environment env)
-  "Chain a new promise from `SOURCE-PROMISE-FORM`, transforming its result.
+(defmacro concur:then (source-promise-form
+                       &optional on-resolved-form on-rejected-form)
+  "Attach success and failure handlers to a promise, returning a new promise.
+This is the fundamental operation for chaining, compliant with the
+Promise/A+ specification. The returned promise is settled based on
+the outcome of the executed handler:
+- If a handler returns a value, the new promise is resolved with that value.
+- If a handler returns another promise, the new promise 'assimilates' its
+  state, eventually settling with the same outcome.
+- If a handler signals an error, the new promise is rejected.
 
-  This is the fundamental promise chaining primitive, analogous to `.then()`
-  in JavaScript. It attaches success and failure handlers that execute
-  asynchronously when the source promise settles. Lexical variables from the
-  surrounding scope are automatically captured via AST analysis.
+Arguments:
+- `SOURCE-PROMISE-FORM` (form): A form evaluating to a `concur-promise`.
+- `ON-RESOLVED-FORM` (form, optional): A lambda `(lambda (value) ...)` for
+  the success case. Defaults to an identity function.
+- `ON-REJECTED-FORM` (form, optional): A lambda `(lambda (error) ...)` for
+  the failure case. Defaults to a function that re-throws the error.
 
-  Arguments:
-  - `SOURCE-PROMISE-FORM` (form): A form that evaluates to a `concur-promise`.
-  - `ON-RESOLVED-FORM` (form, optional): A lambda `(lambda (value) ...)` or a
-    function to handle success. The value it returns determines the resolution
-    of the new promise. Defaults to an identity function `(lambda (v) v)`.
-  - `ON-REJECTED-FORM` (form, optional): A lambda `(lambda (error) ...)` or a
-    function to handle failure. It can recover from an error by returning a
-    normal value. Defaults to re-rejecting the original error.
-  - `ENV` (environment, implicit): The lexical environment at the macro call site.
-
-  Returns:
-  - (concur-promise): A new promise that resolves or rejects based on the
-    outcome of the executed handler."
+Returns:
+- `(concur-promise)`: A new promise representing the outcome of the handler."
   (declare (indent 1) (debug t))
-  (unless source-promise-form
-    (user-error "concur:then: SOURCE-PROMISE-FORM cannot be nil"))
-  (-let* (((&plist :resolved-lambda resolved-lambda
-                   :resolved-vars resolved-vars
-                   :rejected-lambda rejected-lambda
-                   :rejected-vars rejected-vars
-                   :context-form context-form)
-           (concur--then-analyze-handlers on-resolved-form on-rejected-form env))
-          (new-promise (gensym "new-promise")))
-    `(let ((,new-promise
-            (concur:make-promise :parent-promise ,source-promise-form)))
-       (concur--log :debug (concur-promise-id ,new-promise)
-                    "Attaching handlers to promise %S."
-                    (concur-promise-id ,source-promise-form))
-       (concur-attach-callbacks
-        ,source-promise-form
-        ;; Create the success callback.
-        (concur-make-resolved-callback
-         ,resolved-lambda ,new-promise :captured-vars ,resolved-vars
-         :context ,context-form)
-        ;; Create the failure callback.
-        (concur-make-rejected-callback
-         ,rejected-lambda ,new-promise :captured-vars ,rejected-vars
-         :context ,context-form))
-       ,new-promise)))
+  `(concur:with-executor (resolve reject)
+     (let* ((on-resolved-handler
+             (or ,on-resolved-form (lambda (value) value)))
+            (on-rejected-handler
+             (or ,on-rejected-form (lambda (err) (concur:rejected! err))))
+            (source-promise ,source-promise-form))
+       (unless (concur-promise-p source-promise)
+         (error "concur:then expected a promise, but got %S" source-promise))
+
+       (concur-attach-then-callbacks
+        source-promise source-promise ; Source and target are the same here.
+        ;; on-resolved: execute handler and resolve the new promise with its result.
+        (lambda (value)
+          (condition-case err
+              (funcall resolve (funcall on-resolved-handler value))
+            (error (funcall reject (concur:make-error :type :callback-error
+                                                      :cause err)))))
+        ;; on-rejected: execute handler and resolve the new promise with its result.
+        (lambda (err)
+          (condition-case err
+              (funcall resolve (funcall on-rejected-handler err))
+            (error (funcall reject (concur:make-error :type :callback-error
+                                                      :cause err)))))))))
 
 ;;;###autoload
 (defmacro concur:catch (promise-form handler-form)
   "Attach an error `HANDLER-FORM` to a promise.
+This is a convenience alias for `(concur:then promise nil handler)`.
+The handler can 'recover' from the error by returning a normal value,
+which will resolve the new promise and allow the chain to continue.
 
-  This is a convenience alias for `(concur:then promise nil handler)`. It is
-  useful for handling failures without needing to provide a success case.
-  The `HANDLER-FORM` can 'recover' from the error by returning a regular value,
-  which will resolve the new promise.
+Arguments:
+- `PROMISE-FORM` (form): A form that evaluates to a promise.
+- `HANDLER-FORM` (form): A lambda `(lambda (error) ...)` to run on failure.
 
-  Arguments:
-  - `PROMISE-FORM` (form): A form that evaluates to a promise.
-  - `HANDLER-FORM` (form): A lambda `(lambda (error) ...)` or function symbol
-    that will be executed if the promise is rejected.
-
-  Returns:
-  - (concur-promise): A new promise."
+Returns:
+- `(concur-promise)`: A new promise."
   (declare (indent 1) (debug t))
   `(concur:then ,promise-form nil ,handler-form))
 
 ;;;###autoload
 (defmacro concur:finally (promise-form callback-form)
-  "Attach `CALLBACK-FORM` to run after `PROMISE-FORM` settles.
+  "Attach a `CALLBACK-FORM` to run after a promise settles.
+The callback executes regardless of whether the source promise resolved
+or rejected, making it ideal for cleanup operations. The promise
+returned by `concur:finally` will adopt the outcome of the original
+promise, unless the callback itself fails.
 
-  The callback executes regardless of whether the source promise resolved or
-  rejected, making it ideal for cleanup operations (e.g., closing files,
-  releasing locks). The returned promise adopts the state of the original
-  promise, unless the `CALLBACK-FORM` itself errors.
+Arguments:
+- `PROMISE-FORM` (form): A form that evaluates to a promise.
+- `CALLBACK-FORM` (form): A nullary lambda `(lambda () ...)` to execute.
 
-  Arguments:
-  - `PROMISE-FORM` (form): A form that evaluates to a promise.
-  - `CALLBACK-FORM` (form): A nullary lambda `(lambda () ...)` or function
-    symbol to execute upon settlement.
-
-  Returns:
-  - (concur-promise): A new promise."
+Returns:
+- `(concur-promise)`: A new promise."
   (declare (indent 1) (debug t))
   `(concur:then
     ,promise-form
-    ;; on-resolved: run callback, then pass original value through.
+    ;; on-resolved: run callback, then resolve with original value.
     (lambda (val)
-      (concur:then (concur:resolved! (funcall ,callback-form))
-                   (lambda (_) val)))
-    ;; on-rejected: run callback, then re-throw original error.
+      (concur:then (funcall ,callback-form) (lambda (_) val)))
+    ;; on-rejected: run callback, then reject with original error.
     (lambda (err)
-      (concur:then (concur:resolved! (funcall ,callback-form))
+      (concur:then (funcall ,callback-form)
                    (lambda (_) (concur:rejected! err))))))
 
 ;;;###autoload
 (defmacro concur:tap (promise-form callback-form)
-  "Attach `CALLBACK-FORM` for side effects, without altering the promise chain.
+  "Attach a `CALLBACK-FORM` for side effects, without altering the chain.
+This is useful for inspecting a promise's value or error (e.g., for
+logging) without modifying the outcome. The returned promise will
+resolve or reject with the exact same value or error as the original.
 
-  This is useful for inspecting a promise's value or error at a certain
-  point in a chain without modifying it (e.g., for logging). The return
-  value of `CALLBACK-FORM` is ignored.
+Arguments:
+- `PROMISE-FORM` (form): A form that evaluates to a promise.
+- `CALLBACK-FORM` (form): A lambda `(lambda (value error) ...)`. It is
+  called with `(value, nil)` on success or `(nil, error)` on failure.
 
-  Arguments:
-  - `PROMISE-FORM` (form): A form that evaluates to a promise.
-  - `CALLBACK-FORM` (form): A lambda `(lambda (value error) ...)` or function
-    symbol. It is called with `(value, nil)` on success or `(nil, error)` on failure.
-
-  Returns:
-  - (concur-promise): A new promise that resolves or rejects with the
-    exact same value or error as the original promise."
+Returns:
+- `(concur-promise)`: A new promise with the same outcome as the original."
   (declare (indent 1) (debug t))
   `(concur:then
     ,promise-form
-    ;; on-resolved: run callback, pass original value through.
-    (lambda (val)
-      (funcall ,callback-form val nil)
-      val)
-    ;; on-rejected: run callback, re-throw original error.
-    (lambda (err)
-      (funcall ,callback-form nil err)
-      (concur:rejected! err))))
+    (lambda (val) (funcall ,callback-form val nil) val)
+    (lambda (err) (funcall ,callback-form nil err) (concur:rejected! err))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Public API: High-Level Flow Control
+;;; Public API: High-Level Flow Control
 
 ;;;###autoload
-(defmacro concur:chain (initial-promise-expr &rest steps)
-  "Thread `INITIAL-PROMISE-EXPR` through a series of asynchronous steps.
+(defmacro concur:chain (initial-value-expr &rest steps)
+  "Thread `INITIAL-VALUE-EXPR` through a series of asynchronous steps.
+This macro provides a powerful, readable way to compose complex
+asynchronous workflows. It starts with an initial value and passes
+it through a series of `STEPS`.
 
-  This macro provides a readable, linear syntax for composing promises,
-  avoiding deeply nested `concur:then` calls ('callback hell').
-  The anaphoric variable `<>` holds the result of the previous step.
+Each step can be a form which is implicitly wrapped in a `:then`
+handler, or it can be a keyword-based clause. The anaphoric
+variable (default `<>`) refers to the resolved value of the previous step.
 
-  Arguments:
-  - `INITIAL-PROMISE-EXPR` (form): The promise or value to start the chain.
-  - `STEPS` (list): A list of step clauses. Supported clauses include:
-    - `:then (lambda (<>) ...)`: Standard `then` handler.
-    - `:catch (lambda (err) ...)`: Standard rejection handler.
-    - `:finally (lambda () ...)`: Cleanup handler.
-    - `:tap (lambda (val err) ...)`: Inspection handler.
-    - `:await-all <form>`: `concur:all` on the result of `<form>`.
-    - `:await-race <form>`: `concur:race` on the result of `<form>`.
-    - `:sleep <ms>`: Delays the chain for <ms> milliseconds.
-    - `:log [\"format\"]`: Logs the current value or error using `concur--log`.
-    - `:timeout <sec> <steps...>`: Applies a timeout to a sub-chain.
-    - Any other form is treated as an implicit `:then` step.
+Available Clauses:
+- `(some-form ...)`: An S-expression to execute. Handled by `:then`.
+- `(:let (VAR FORM))`: Await `FORM` and bind its result to `VAR` for
+  subsequent steps. This is the preferred way to write sequential logic.
+- `(:then (lambda (val) ...))`: Attach a standard resolve handler.
+- `(:catch (lambda (err) ...))`: Attach a standard rejection handler.
+- `(:finally (lambda () ...))`: Attach a cleanup handler.
+- `(:tap (lambda (val err) ...))`: Inspect the chain without altering it.
+- `(:log \"format-string\")`: A shortcut to tap and log the current value/error.
+- `(:sleep MS)`: Pause the chain for `MS` milliseconds.
+- `(:retry N FORM)`: Retry `FORM` up to `N` times on failure.
 
-  Returns:
-  - (concur-promise): A promise representing the final outcome of the chain."
+Arguments:
+- `INITIAL-VALUE-EXPR` (form): The value or promise to start the chain.
+- `STEPS` (list): A list of step clauses.
+
+Returns:
+- `(concur-promise)`: A promise for the final outcome of the chain."
   (declare (indent 1) (debug t))
-  `(concur--expand-chain-internal ,initial-promise-expr ,steps nil))
+  (let ((sugared-steps (concur--chain-expand-sugar steps)))
+    (concur--chain-expand-steps
+     `(concur:resolved! ,initial-value-expr) sugared-steps nil)))
 
 ;;;###autoload
-(defmacro concur:chain-when (initial-promise-expr &rest steps)
-  "Like `concur:chain` but short-circuits on `nil` resolved values.
+(defmacro concur:chain-when (initial-value-expr &rest steps)
+  "Like `concur:chain`, but short-circuits if a step resolves to `nil`.
+If any anaphoric step in the chain resolves to a `nil` value, all
+subsequent anaphoric steps are skipped. Explicit clauses like `:then`,
+`:catch`, and `:finally` will still execute.
 
-  If any promise in the chain resolves with a `nil` or `false` value,
-  subsequent value-transforming steps are skipped. Error and cleanup
-  handlers (`:catch`, `:finally`) will still execute.
+Arguments:
+- `INITIAL-VALUE-EXPR` (form): The value or promise to start the chain.
+- `STEPS` (list): A list of step clauses.
 
-  Arguments:
-  - `INITIAL-PROMISE-EXPR`, `STEPS`: See `concur:chain`.
-
-  Returns:
-  - (concur-promise): A promise representing the final outcome of the chain."
+Returns:
+- `(concur-promise)`: A promise for the final outcome of the chain."
   (declare (indent 1) (debug t))
-  `(concur--expand-chain-internal ,initial-promise-expr ,steps t))
+  (let ((sugared-steps (concur--chain-expand-sugar steps)))
+    (concur--chain-expand-steps
+     `(concur:resolved! ,initial-value-expr) sugared-steps t)))
 
 (provide 'concur-chain)
 ;;; concur-chain.el ends here
+
+
+;; ;;;###autoload
+;; (defmacro concur:then (source-promise-form
+;;                        &optional on-resolved-form on-rejected-form)
+;;   "Attaches success and failure handlers to a promise, returning a new promise.
+;; This is the fundamental operation for promise chaining, compliant with
+;; the Promise/A+ specification.
+
+;; The `on-resolved-form` and `on-rejected-form` are handler functions. The new
+;; promise returned by `concur:then` is settled based on the outcome of
+;; whichever handler is executed:
+;; - If a handler returns a regular value, the new promise is resolved with
+;;   that value.
+;; - If a handler returns a promise (a 'thenable'), the new promise will
+;;   'assimilate' its state, eventually resolving or rejecting with the same
+;;   outcome.
+;; - If a handler signals a Lisp error, the new promise is rejected with a
+;;   `concur-callback-error`.
+
+;; Arguments:
+;; - `SOURCE-PROMISE-FORM` (form): A form that evaluates to a `concur-promise`.
+;; - `ON-RESOLVED-FORM` (form, optional): A lambda `(lambda (value) ...)` for
+;;   the success case. If nil, defaults to an identity function that passes
+;;   the value through to the next promise in the chain.
+;; - `ON-REJECTED-FORM` (form, optional): A lambda `(lambda (error) ...)` for
+;;   the failure case. If nil, defaults to a function that re-jects the
+;;   promise, propagating the error down the chain.
+
+;; Returns:
+;; - `(concur-promise)`: A new promise representing the outcome of the handler."
+;;   (declare (indent 1) (debug t))
+;;   (let* ((p-sym (gensym "source-promise-"))
+;;          (new-p-sym (gensym "new-promise-"))
+;;          ;; Gensyms for the handler arguments to prevent variable capture.
+;;          (target-p-arg (gensym "target-p-"))
+;;          (val-arg (gensym "val-"))
+;;          (err-arg (gensym "err-")))
+
+;;     ;; The macro will expand into this single `let*` block.
+;;     `(let* ((,p-sym ,source-promise-form)
+;;             (,new-p-sym (concur:make-promise :parent-promise ,p-sym)))
+
+;;        ;; This function passes the source and *target* promises along with
+;;        ;; the handler functions to the core system.
+;;        (concur-attach-then-callbacks
+;;         ,p-sym
+;;         ,new-p-sym ;; Pass the newly created promise explicitly.
+
+;;         ;; === ON-RESOLVED HANDLER ===
+;;         ;; This is now a TWO-ARGUMENT lambda. When executed, the core will call
+;;         ;; it with the target promise and the resolved value.
+;;         (lambda (,target-p-arg ,val-arg)
+;;           (condition-case err
+;;               (let ((res (if ,on-resolved-form
+;;                              (funcall ,on-resolved-form ,val-arg)
+;;                            ,val-arg)))
+;;                 ;; We use `target-p-arg`, the promise passed in at runtime.
+;;                 (concur:resolve ,target-p-arg res))
+;;             (error
+;;              (concur:reject ,target-p-arg
+;;                             (concur:make-error
+;;                              :type :callback-error
+;;                              :message (format "Resolved handler failed: %S" err)
+;;                              :cause err :promise ,target-p-arg)))))
+
+;;         ;; === ON-REJECTED HANDLER ===
+;;         ;; This is also a TWO-ARGUMENT lambda.
+;;         (lambda (,target-p-arg ,err-arg)
+;;           (condition-case handler-err
+;;               (if ,on-rejected-form
+;;                   (let ((res (funcall ,on-rejected-form ,err-arg)))
+;;                     (concur:resolve ,target-p-arg res))
+;;                 ;; Default behavior: propagate rejection to the target promise.
+;;                 (concur:reject ,target-p-arg ,err-arg))
+;;             (error
+;;              (concur:reject ,target-p-arg
+;;                             (concur:make-error
+;;                              :type :callback-error
+;;                              :message (format "Rejected handler failed: %S" handler-err)
+;;                              :cause handler-err :promise ,target-p-arg))))))
+;;        ,new-p-sym)))

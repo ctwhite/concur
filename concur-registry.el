@@ -1,354 +1,281 @@
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; concur-registry.el --- Concur Promise Registry for Introspection -*- lexical-binding: t; -*-
 
 ;;; Commentary:
+;;
 ;; This module provides a global registry for `concur-promise` objects.
 ;; When enabled, it tracks all promises created and their state changes,
-;; offering powerful introspection and debugging capabilities for complex
-;; asynchronous workflows.
+;; offering powerful introspection and debugging capabilities for Concur-based
+;; applications, particularly via the `concur-ui.el` library.
 ;;
 ;; Architectural Highlights:
-;; - Global Hash Table: `concur--promise-registry` stores promises by ID.
+;; - Capped Size: To prevent memory leaks, the registry is capped by
+;;   `concur-registry-max-size`. It automatically evicts the oldest
+;;   *settled* promises when full.
+;; - O(1) ID Lookup: Uses a secondary index to allow for instantaneous
+;;   retrieval of promises by their unique ID, critical for performance.
 ;; - State Metadata: `concur-promise-meta` captures rich context like
 ;;   parent/child relationships, status history, and resources held.
-;; - Lifecycle Hooks: Integrates with `concur-core.el` for seamless updates.
-;; - Debugging Aids: Provides functions to list, filter, and inspect promises,
-;;   as well as monitor the registry's overall status.
-;; - **Robust Shutdown**: On Emacs exit, pending promises can be automatically
-;;   rejected to prevent orphaned operations.
 
 ;;; Code:
 
-(require 'cl-lib)    ; For cl-defstruct, cl-loop, cl-delete, cl-remove, cl-incf
-(require 'dash)      ; For dash functions (e.g., --map, -find-if, s-contains?)
-(require 's)         ; For string utilities (e.g., s-contains?)
-(require 'concur-log)  ; For `concur--log`
-(require 'concur-lock) ; For `concur-lock`, `concur:make-lock`, `concur:with-mutex!`
+(require 'cl-lib)
+(require 's)
+(require 'concur-core)
+(require 'concur-lock)
+(require 'concur-log)
+(require 'concur-queue)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Forward-Declarations
+;;; Errors & Customization
 
-(declare-function concur:make-error "concur-core")
-(declare-function concur:format-promise "concur-core")
-(declare-function concur:status "concur-core")
-(declare-function concur-promise-state "concur-core")
-(declare-function concur:reject "concur-core")
-(declare-function concur:pending-p "concur-core")
-(declare-function concur-promise-p "concur-core") ; Ensure concur-promise-p is declared
-(declare-function concur-promise-id "concur-core")
-(declare-function concur-promise-mode "concur-core")
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Customization and Global State
+(define-error 'concur-registry-error
+  "A generic error related to the promise registry."
+  'concur-error)
 
 (defcustom concur-enable-promise-registry t
-  "If non-nil, enable the global promise registry.
-When enabled, all promises created will be tracked, allowing for
-introspection and debugging via functions like `concur:dump-registry`.
-Disabling this saves memory and minor processing overhead."
+  "If non-nil, enable the global promise registry for introspection."
   :type 'boolean
   :group 'concur)
 
 (defcustom concur-registry-shutdown-on-exit-p t
-  "If non-nil, automatically reject all pending promises on Emacs exit.
-This ensures a cleaner shutdown of asynchronous operations and prevents
-orphaned promises or resource leaks that rely on promises resolving."
+  "If non-nil, automatically reject all pending promises on Emacs exit."
   :type 'boolean
   :group 'concur)
 
+(defcustom concur-registry-max-size 2048
+  "Maximum number of *settled* promises to keep in the registry.
+This prevents the registry from growing indefinitely. When the number of
+settled promises exceeds this limit, the oldest ones are evicted."
+  :type 'integer
+  :group 'concur)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Data Structures & Internal State
+
+(cl-defstruct (concur-promise-meta (:constructor %%make-promise-meta))
+  "Metadata for a promise in the global registry."
+  promise name status-history (creation-time (float-time)) settlement-time
+  parent-promise children-promises resources-held tags)
+
 (defvar concur--promise-registry (make-hash-table :test 'eq)
-  "Global hash table mapping promise objects to `concur-promise-meta` data.
-This registry is protected by `concur--promise-registry-lock`.")
+  "Global hash table mapping promise objects to `concur-promise-meta` data.")
+
+(defvar concur--promise-id-to-promise-map (make-hash-table :test 'eq)
+  "Secondary index mapping a promise's unique ID to the promise object.
+This provides O(1) lookup performance for `get-promise-by-id`.")
 
 (defvar concur--promise-registry-lock
   (concur:make-lock "promise-registry-lock")
-  "Mutex protecting `concur--promise-registry` for thread-safety.
-All access to `concur--promise-registry` must be guarded by this lock.")
+  "Mutex protecting all registry data structures for thread-safety.")
+
+(defvar concur--promise-registry-fifo-queue (concur-queue-create)
+  "A FIFO queue of settled promise objects, used for efficient eviction.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Struct Definitions
+;;; Internal Registry Management
 
-(eval-and-compile
-  (cl-defstruct (concur-promise-meta (:constructor %%make-promise-meta))
-    "Metadata for a promise in the global registry.
-This struct stores additional, non-core information about a promise
-that is useful for debugging, without bloating the `concur-promise` struct.
+(defun concur--registry-evict-oldest-settled ()
+  "Evict the oldest settled promise if the registry exceeds its max size.
+This must be called from within the `concur--promise-registry-lock`."
+  (while (> (concur-queue-length concur--promise-registry-fifo-queue)
+            concur-registry-max-size)
+    (let ((oldest-promise (concur-queue-dequeue
+                           concur--promise-registry-fifo-queue)))
+      (when oldest-promise
+        (concur--log :debug nil "Registry full. Evicting oldest promise: %S"
+                     (concur-promise-id oldest-promise))
+        (remhash (concur-promise-id oldest-promise)
+                 concur--promise-id-to-promise-map)
+        (remhash oldest-promise concur--promise-registry)))))
 
-  Arguments:
-  - `promise` (concur-promise): The promise object this metadata describes.
-  - `name` (string or nil): A human-readable name for the promise,
-    if provided. Defaults to `nil`.
-  - `status-history` (list): A list of status changes `(timestamp . status)`.
-    Defaults to `nil`.
-  - `creation-time` (float): The time the promise was created (Emacs
-    `float-time`). Defaults to `(float-time)`.
-  - `settlement-time` (float or nil): The time the promise settled.
-    Defaults to `nil`.
-  - `parent-promise` (concur-promise or nil): The promise that created
-    this one (e.g., in a chain). Defaults to `nil`.
-  - `children-promises` (list): Promises created by this promise (e.g.,
-    in a chain via `concur:then`). Defaults to `nil`.
-  - `resources-held` (list): External resources currently held by this
-    promise (e.g., locks, semaphores). Defaults to `nil`.
-  - `tags` (list): A list of keyword tags associated with the promise,
-    for filtering and categorization. Defaults to `nil`."
-    (promise nil :type (satisfies concur-promise-p))
-    (name nil :type (or string null))
-    (status-history nil :type list)
-    (creation-time (float-time) :type float)
-    (settlement-time nil :type (or float null))
-    (parent-promise nil :type (or null (satisfies concur-promise-p)))
-    (children-promises nil :type list)
-    (resources-held nil :type list)
-    (tags nil :type list)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Internal Registry Management (Called from concur-core)
-
-(cl-defun concur-registry-register-promise (promise name &key parent-promise tags)
+(defun concur-registry-register-promise (promise name &key parent-promise tags)
   "Register a new `PROMISE` in the global registry.
-Creates metadata for the promise and handles parent-child links.
-This function is typically called by `concur:make-promise`.
 
-  Arguments:
-  - `PROMISE` (concur-promise): The promise to register.
-  - `NAME` (string): A human-readable name for the promise.
-  - `:PARENT-PROMISE` (concur-promise, optional): The promise that
-    caused the creation of this `PROMISE`.
-  - `:TAGS` (list, optional): A list of keywords to tag this promise.
-
-  Returns:
-  - `nil` (side-effect: registers promise, updates parent-child links)."
+Arguments:
+- `PROMISE` (concur-promise): The promise object to register.
+- `NAME` (string): A human-readable name for the promise.
+- `:PARENT-PROMISE` (concur-promise, optional): The promise that created this one.
+- `:TAGS` (list, optional): A list of keyword tags for filtering."
   (when concur-enable-promise-registry
     (unless (concur-promise-p promise)
-      (user-error "concur-registry-register-promise: Invalid promise: %S"
-                  promise))
+      (error "Argument to register must be a promise: %S" promise))
     (concur:with-mutex! concur--promise-registry-lock
       (let ((meta (%%make-promise-meta :promise promise :name name
                                        :parent-promise parent-promise
-                                       :tags (cl-delete-duplicates tags)))) ; Store and deduplicate tags
+                                       :tags (cl-delete-duplicates tags))))
+        ;; Add to primary registry and secondary ID-based index.
         (puthash promise meta concur--promise-registry)
+        (puthash (concur-promise-id promise) promise
+                 concur--promise-id-to-promise-map)
         (push (cons (float-time) (concur-promise-state promise))
               (concur-promise-meta-status-history meta))
-        (concur--log :debug (concur-promise-id promise)
-                     "Registered promise '%s' (State: %S). Parent: %S. Tags: %S."
-                     (concur-promise-meta-name meta)
-                     (concur-promise-state promise)
-                     (and parent-promise (concur-promise-id parent-promise))
-                     (concur-promise-meta-tags meta))
-
-        ;; Link as child to parent promise.
+        (concur--log :debug (concur-promise-id promise) "Registered promise '%s'."
+                     (or name "--unnamed--"))
         (when (and parent-promise (concur-promise-p parent-promise))
-          (when-let ((parent-meta (gethash parent-promise
-                                           concur--promise-registry)))
-            (push promise (concur-promise-meta-children-promises parent-meta))
-            (concur--log :debug (concur-promise-id parent-promise)
-                         "Added child %S to parent %S."
-                         (concur-promise-id promise)
-                         (concur-promise-id parent-promise))))))))
+          (when-let ((parent-meta (gethash parent-promise concur--promise-registry)))
+            (push promise (concur-promise-meta-children-promises parent-meta))))))))
 
 (defun concur-registry-update-promise-state (promise)
-  "Update the state of `PROMISE` in the global registry when it settles.
-This function is called by `concur--settle-promise` in `concur-core.el`.
+  "Update the state of `PROMISE` in the registry when it settles.
 
-  Arguments:
-  - `PROMISE` (concur-promise): The promise whose state has changed.
-
-  Returns:
-  - `nil` (side-effect: updates promise metadata)."
+Arguments:
+- `PROMISE` (concur-promise): The promise that has just settled."
   (when concur-enable-promise-registry
     (unless (concur-promise-p promise)
-      (user-error "concur-registry-update-promise-state: Invalid promise: %S"
-                  promise))
+      (error "Argument must be a promise: %S" promise))
     (concur:with-mutex! concur--promise-registry-lock
       (when-let ((meta (gethash promise concur--promise-registry)))
         (let ((current-time (float-time)))
           (setf (concur-promise-meta-settlement-time meta) current-time)
           (push (cons current-time (concur-promise-state promise))
                 (concur-promise-meta-status-history meta))
+          (concur-queue-enqueue concur--promise-registry-fifo-queue promise)
+          (concur-registry--evict-oldest-settled)
           (concur--log :debug (concur-promise-id promise)
                        "Updated promise '%s' to state %S."
-                       (concur-promise-meta-name meta)
+                       (or (concur-promise-meta-name meta) "--unnamed--")
                        (concur-promise-state promise)))))))
 
 (defun concur-registry-register-resource-hold (promise resource)
   "Record that `PROMISE` has acquired `RESOURCE`.
-Called by primitives like `concur:lock-acquire`.
 
-  Arguments:
-  - `PROMISE` (concur-promise): The promise holding the resource.
-  - `RESOURCE` (any): The resource object (e.g., `concur-lock`).
-
-  Returns:
-  - `nil` (side-effect: updates promise metadata)."
+Arguments:
+- `PROMISE` (concur-promise): The promise acquiring the resource.
+- `RESOURCE` (any): The resource being held (e.g., a lock)."
   (when concur-enable-promise-registry
-    (unless (concur-promise-p promise)
-      (user-error "concur-registry-register-resource-hold: Invalid promise: %S"
-                  promise))
     (concur:with-mutex! concur--promise-registry-lock
       (when-let ((meta (gethash promise concur--promise-registry)))
         (cl-pushnew resource (concur-promise-meta-resources-held meta))
         (concur--log :debug (concur-promise-id promise)
-                     "Promise '%s' acquired resource %S."
-                     (concur-promise-meta-name meta) resource)))))
+                     "Promise acquired resource %S." (type-of resource))))))
 
 (defun concur-registry-release-resource-hold (promise resource)
   "Record that `PROMISE` has released `RESOURCE`.
-Called by primitives like `concur:lock-release`.
 
-  Arguments:
-  - `PROMISE` (concur-promise): The promise that released the resource.
-  - `RESOURCE` (any): The resource object.
-
-  Returns:
-  - `nil` (side-effect: updates promise metadata)."
+Arguments:
+- `PROMISE` (concur-promise): The promise releasing the resource.
+- `RESOURCE` (any): The resource being released."
   (when concur-enable-promise-registry
-    (unless (concur-promise-p promise)
-      (user-error "concur-registry-release-resource-hold: Invalid promise: %S"
-                  promise))
     (concur:with-mutex! concur--promise-registry-lock
       (when-let ((meta (gethash promise concur--promise-registry)))
         (setf (concur-promise-meta-resources-held meta)
               (cl-delete resource (concur-promise-meta-resources-held meta)))
         (concur--log :debug (concur-promise-id promise)
-                     "Promise '%s' released resource %S."
-                     (concur-promise-meta-name meta) resource)))))
+                     "Promise released resource %S." (type-of resource))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Public Registry Inspection API
+;;; Public API: Introspection
+
+;;;###autoload
+(defun concur-registry-get-promise-by-id (promise-id)
+  "Return the promise object associated with `PROMISE-ID`. O(1) complexity.
+
+Arguments:
+- `PROMISE-ID` (symbol): The unique `gensym` ID of the promise.
+
+Returns:
+- `(concur-promise or nil)`: The promise object, or `nil` if not found."
+  (when (and concur-enable-promise-registry promise-id)
+    (concur:with-mutex! concur--promise-registry-lock
+      (gethash promise-id concur--promise-id-to-promise-map))))
 
 ;;;###autoload
 (defun concur-registry-get-promise-name (promise &optional default)
-  "Return the registered name for PROMISE, or DEFAULT if not found.
-This function is thread-safe and respects `concur-enable-promise-registry`.
+  "Return the registered name for `PROMISE`, or `DEFAULT` if not found.
 
-  Arguments:
-  - `PROMISE` (concur-promise): The promise to look up.
-  - `DEFAULT` (any, optional): The value to return if the promise or its
-    name is not found in the registry.
+Arguments:
+- `PROMISE` (concur-promise): The promise to inspect.
+- `DEFAULT` (any): The value to return if the promise is not in the registry.
 
-  Returns:
-  - (string or any): The registered name, or `DEFAULT`."
-  (unless (concur-promise-p promise)
-    (user-error "concur-registry-get-promise-name: Invalid promise: %S" promise))
-  (if (not concur-enable-promise-registry)
-      default
-    (concur:with-mutex! concur--promise-registry-lock
-      (let* ((meta (gethash promise concur--promise-registry))
-             (name (and meta (concur-promise-meta-name meta))))
-        (or name default)))))
+Returns:
+- (string or any): The promise's name, or the `DEFAULT` value."
+  (unless (concur-promise-p promise) (error "Invalid promise: %S" promise))
+  (if-let ((meta (and concur-enable-promise-registry
+                       (gethash promise concur--promise-registry))))
+      (or (concur-promise-meta-name meta) default)
+    default))
 
 ;;;###autoload
-(defun concur:list-promises (&optional status-filter name-filter tags-filter)
-  "Return a list of promises currently in the global registry.
-Allows filtering by status, by a partial name match, or by tags.
+(defun concur:list-promises (&key status name tags)
+  "Return a list of promises from the registry, with optional filters.
 
-  Arguments:
-  - `STATUS-FILTER` (symbol, optional): `:pending`, `:resolved`, or `:rejected`.
-    If `nil`, all statuses are included.
-  - `NAME-FILTER` (string, optional): A substring to search for in promise names.
-    Case-sensitive.
-  - `TAGS-FILTER` (list or symbol, optional): A tag or list of tags. Promises
-    must have at least one of these tags.
+Arguments:
+- `:STATUS` (symbol): Filter by status: `:pending`, `:resolved`, or `:rejected`.
+- `:NAME` (string): Filter by a substring in the promise name.
+- `:TAGS` (list or symbol): Filter by a tag or list of tags.
 
-  Returns:
-  - (list): A list of `concur-promise` objects."
-  (unless concur-enable-promise-registry
-    (user-error "concur:list-promises: Promise registry is not enabled."))
-  (let ((matching-promises '()))
+Returns:
+- (list): A list of `concur-promise` objects."
+  (unless concur-enable-promise-registry (error "Promise registry is disabled"))
+  (let (matching)
     (concur:with-mutex! concur--promise-registry-lock
       (maphash
        (lambda (promise meta)
-         (when (and (or (null status-filter)
-                        (eq (concur-promise-state promise) status-filter))
-                    (or (null name-filter)
+         (when (and (or (null status) (eq (concur:status promise) status))
+                    (or (null name)
                         (and (concur-promise-meta-name meta)
-                             (s-contains? name-filter
-                                          (concur-promise-meta-name meta))))
-                    (or (null tags-filter)
-                        (cl-some (lambda (tag)
-                                   (member tag (concur-promise-meta-tags meta)))
-                                 (if (listp tags-filter) tags-filter (list tags-filter)))))
-           (push promise matching-promises)))
+                             (s-contains? name (concur-promise-meta-name meta))))
+                    (or (null tags)
+                        (let ((tag-list (if (listp tags) tags (list tags))))
+                          (-any? (lambda (tag) (memq tag (concur-promise-meta-tags meta)))
+                                 tag-list))))
+           (push promise matching)))
        concur--promise-registry))
-    (nreverse matching-promises)))
+    (nreverse matching)))
 
 ;;;###autoload
 (defun concur:find-promise (id-or-name)
-  "Find a promise in the registry by its ID (gensym) or name.
+  "Find a promise in the registry by its ID (symbol) or name (string).
 
-  Arguments:
-  - `ID-OR-NAME` (symbol or string): The promise's gensym ID or registered name.
+Arguments:
+- `ID-OR-NAME` (symbol or string): The promise's `gensym` ID or registered name.
 
-  Returns:
-  - (concur-promise or nil): The matching promise, or `nil`."
-  (unless concur-enable-promise-registry
-    (user-error "concur:find-promise: Promise registry is not enabled."))
-  (concur:with-mutex! concur--promise-registry-lock
-    (cl-block find-promise-block
-      (maphash
-       (lambda (promise meta)
-         (when (or (eq (concur-promise-id promise) id-or-name)
-                   (and (stringp id-or-name)
-                        (string= id-or-name (concur-promise-meta-name meta))))
-           (cl-return-from find-promise-block promise)))
-       concur--promise-registry)
-      nil))) ; Return nil if loop completes without finding a match.
+Returns:
+- `(concur-promise or nil)`: The matching promise, or `nil`."
+  (unless concur-enable-promise-registry (error "Promise registry is disabled"))
+  (if (symbolp id-or-name)
+      (concur-registry-get-promise-by-id id-or-name)
+    (concur:with-mutex! concur--promise-registry-lock
+      (cl-block find-by-name
+        (maphash (lambda (promise meta)
+                   (when (and (stringp id-or-name)
+                              (string= id-or-name (concur-promise-meta-name meta)))
+                     (cl-return-from find-by-name promise)))
+                 concur--promise-registry)))))
 
 ;;;###autoload
 (defun concur:clear-registry ()
   "Clear all promises from the global registry.
-Primarily for testing or debugging. Use with caution.
+This is primarily for testing or debugging. Use with caution.
 
-  Returns:
-  - `nil` (side-effect: clears registry)."
-  (unless concur-enable-promise-registry
-    (user-error "concur:clear-registry: Promise registry is not enabled."))
+Returns:
+- `nil`."
+  (interactive)
+  (unless concur-enable-promise-registry (error "Promise registry is disabled"))
   (concur:with-mutex! concur--promise-registry-lock
-    (clrhash concur--promise-registry))
+    (clrhash concur--promise-registry)
+    (clrhash concur--promise-id-to-promise-map)
+    (setq concur--promise-registry-fifo-queue (concur-queue-create)))
   (concur--log :info nil "Concur promise registry cleared."))
 
 ;;;###autoload
 (defun concur:dump-registry ()
   "Dump a formatted string of all promises in the registry.
-Provides a comprehensive overview of promises and their states.
 
-  Returns:
-  - (string): A multi-line string representation of the registry."
-  (unless concur-enable-promise-registry
-    (user-error "concur:dump-registry: Promise registry is not enabled."))
+Returns:
+- (string): A multi-line string representation of the registry."
+  (unless concur-enable-promise-registry (error "Promise registry is disabled"))
   (concur:with-mutex! concur--promise-registry-lock
     (with-temp-buffer
       (insert "--- Concur Promise Registry Dump ---\n")
-      (insert (format "Total Promises: %d\n"
-                      (hash-table-count concur--promise-registry)))
+      (insert (format "Total Promises: %d\n" (hash-table-count concur--promise-registry)))
       (insert "-----------------------------------\n")
       (maphash
        (lambda (promise meta)
          (insert (format "Promise: %s\n" (concur:format-promise promise)))
          (insert (format "  Name: %S\n" (concur-promise-meta-name meta)))
-         (insert (format "  ID: %S\n" (concur-promise-id promise)))
-         (insert (format "  Mode: %S\n" (concur-promise-mode promise)))
-         (insert (format "  Created: %S\n"
-                         (format-time-string "%Y-%m-%d %H:%M:%S"
-                                             (concur-promise-meta-creation-time meta))))
-         (when (concur-promise-meta-settlement-time meta)
-           (insert (format "  Settled: %S\n"
-                           (format-time-string "%Y-%m-%d %H:%M:%S"
-                                               (concur-promise-meta-settlement-time meta)))))
          (when-let (parent (concur-promise-meta-parent-promise meta))
            (insert (format "  Parent: %s\n" (concur:format-promise parent))))
-         (when-let (children (concur-promise-meta-children-promises meta))
-           (insert (format "  Children (%d): %s\n" (length children)
-                           (s-join ", " (mapcar (lambda (p) (format "%S" (concur-promise-id p))) children)))))
-         (when-let (resources (concur-promise-meta-resources-held meta))
-           (insert (format "  Resources (%d): %S\n" (length resources)
-                           (mapcar (lambda (r) (type-of r)) resources))))
-         (when-let (history (concur-promise-meta-status-history meta))
-           (insert (format "  History (%d):\n" (length history)))
-           (cl-loop for entry in (nreverse history) do
-                    (insert (format "    - %S at %S\n" (cdr entry)
-                                    (format-time-string "%H:%M:%S" (car entry))))))
          (when-let (tags (concur-promise-meta-tags meta))
            (insert (format "  Tags: %S\n" tags)))
          (insert "-----------------------------------\n"))
@@ -359,47 +286,40 @@ Provides a comprehensive overview of promises and their states.
 (defun concur:registry-status ()
   "Return a snapshot of the global promise registry's current status.
 
-  Returns:
-  - (plist): A property list with registry metrics:
-    `:enabled-p`: Whether the registry is currently enabled.
-    `:total-promises`: Total number of promises tracked.
-    `:pending-count`: Number of promises currently in `:pending` state.
-    `:resolved-count`: Number of promises in `:resolved` state.
-    `:rejected-count`: Number of promises in `:rejected` state.
-    `:active-resources`: Number of unique resources currently held by promises."
+Returns:
+- (plist): A property list with registry metrics."
   (interactive)
-  (unless concur-enable-promise-registry
-    (user-error "concur:registry-status: Promise registry is not enabled."))
+  (unless concur-enable-promise-registry (error "Promise registry is disabled"))
   (concur:with-mutex! concur--promise-registry-lock
-    (let ((total 0) (pending 0) (resolved 0) (rejected 0) (resources-set (make-hash-table)))
+    (let ((total 0) (pending 0) (resolved 0) (rejected 0))
       (maphash
-       (lambda (promise meta)
+       (lambda (_promise meta)
          (cl-incf total)
-         (pcase (concur-promise-state promise)
+         (pcase (concur-promise-state (concur-promise-meta-promise meta))
            (:pending (cl-incf pending))
            (:resolved (cl-incf resolved))
-           (:rejected (cl-incf rejected)))
-         (dolist (resource (concur-promise-meta-resources-held meta))
-           (puthash resource t resources-set)))
+           (:rejected (cl-incf rejected))))
        concur--promise-registry)
       `(:enabled-p ,concur-enable-promise-registry
         :total-promises ,total
         :pending-count ,pending
         :resolved-count ,resolved
-        :rejected-count ,rejected
-        :active-resources ,(hash-table-count resources-set)))))
+        :rejected-count ,rejected))))
 
-;; Add hook to reject pending promises on Emacs exit if configured.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Emacs Exit Hook
+
 (add-hook 'kill-emacs-hook
           (lambda ()
-            (when concur-registry-shutdown-on-exit-p
+            (when (and concur-enable-promise-registry
+                       concur-registry-shutdown-on-exit-p)
               (concur:with-mutex! concur--promise-registry-lock
-                (concur--log :info nil "Registry: Rejecting all pending promises on exit.")
-                (cl-loop for promise being the hash-keys of concur--promise-registry
-                         when (concur:pending-p promise) do
-                         (concur:reject promise (concur:make-error :type :shutdown
-                                                                   :message "Emacs is shutting down.")))))))
-
+                (concur--log :info nil "Registry: Rejecting pending promises on exit.")
+                (cl-loop for p being the hash-keys of concur--promise-registry
+                         when (concur:pending-p p) do
+                         (concur:reject
+                          p (concur:make-error :type 'concur-pool-shutdown
+                                               :message "Emacs is shutting down.")))))))
 
 (provide 'concur-registry)
 ;;; concur-registry.el ends here

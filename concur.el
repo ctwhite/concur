@@ -61,9 +61,9 @@
 (require 'concur-log)      ; First, for logging throughout
 (require 'concur-lock)
 (require 'concur-queue)
+(require 'concur-async)
 (require 'concur-microtask)
 (require 'concur-registry) ; Needs core, but core needs registry-update. OK.
-(require 'concur-ast)      ; Needed by core for context capture
 (require 'concur-core)     ; Foundational promise definitions
 (require 'concur-cancel)   ; Cancellation primitives (depends on core)
 (require 'concur-scheduler) ; Task scheduling (depends on core, queue)
@@ -75,7 +75,7 @@
 (require 'concur-shell)    ; Shell worker pool (depends on core, chain, lock, queue, stream)
 (require 'concur-graph)    ; Dependency graphs (depends on core, chain, combinators)
 (require 'concur-pipeline) ; High-level pipelines (depends on core, graph, async, shell, chain)
-(require 'concur-async)    ; High-level async execution (depends on core, chain, pool, graph, combinators, semaphore)
+(require 'concur-flow)    ; High-level async execution (depends on core, chain, pool, graph, combinators, semaphore)
 (require 'concur-nursery)  ; Structured concurrency (depends on core, chain, cancel, async, combinators, registry, lock)
 
 ;; Load the coroutine bridge, which is essential for the async/await syntax.

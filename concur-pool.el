@@ -1,631 +1,459 @@
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; concur-pool.el --- Persistent Worker Pool for Concur Promises -*- lexical-binding: t; -*-
+;;; concur-pool.el --- Persistent Worker Pool for Emacs Lisp -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-
-;; This library provides a persistent worker pool for executing asynchronous
-;; tasks in background Emacs processes. It is a high-performance backend for
-;; `(concur:async! ... :mode 'async)`, specifically for evaluating Emacs Lisp
-;; forms in parallel worker processes.
 ;;
-;; Instead of incurring the high cost of starting a new Emacs process for
-;; every task, this module creates a fixed-size pool of worker processes that
-;; persist for the duration of the Emacs session. Tasks are sent to idle
-;; workers from a priority queue, dramatically improving throughput and
-;; responsiveness for CPU-bound or blocking Lisp operations.
+;; This library provides a high-performance, persistent worker pool for executing
+;; asynchronous tasks in background Emacs processes. It is the primary backend
+;; for CPU-bound or blocking Emacs Lisp operations.
 ;;
-;; Key Components:
-;;
-;; - The Pool Manager (`concur-pool` struct): A central object that manages
-;;   the lifecycle of worker processes, tracks their status, and maintains a
-;;   priority queue of pending tasks.
-;;
-;; - The Worker Process: A background Emacs process running a simple,
-;;   persistent loop to evaluate Lisp forms sent via JSON IPC.
-;;
-;; - Robustness Features: The pool includes task timeouts, graceful shutdown,
-;;   automatic worker restarts, and detection of "poison pill" tasks that
-;;   repeatedly crash workers.
+;; Key Features:
+;; - Robust Workers: Uses `concur-async.el` primitives to reliably start workers.
+;; - Stateful Sessions: The `concur:pool-session` macro allows for reserving a
+;;   single worker for a sequence of stateful commands.
+;; - Two-Way Message Passing: Tasks can send progress updates back to the parent
+;;   process via an `:on-message` callback.
+;; - Cancellation: Tasks can be cancelled via `concur-cancel-token`, which will
+;;   either remove them from the queue or terminate the running worker.
 
 ;;; Code:
 
-(require 'cl-lib)             ; For cl-loop, cl-find-if, etc.
-(require 'json)               ; For inter-process communication (IPC)
-(require 'async)              ; For `async-start` and background processes
-(require 'concur-core)        ; Core Concur promises and future management
-(require 'concur-lock)        ; For mutexes to protect shared pool state
-(require 'concur-priority-queue) ; For task prioritization
+(require 'cl-lib)
+(require 's)
+(require 'concur-core)
+(require 'concur-chain)
+(require 'concur-lock)
+(require 'concur-queue)
+(require 'concur-priority-queue)
+(require 'concur-log)
+(require 'concur-async)
+(require 'concur-nursery)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Customization & Errors
+;;; Errors & Customization
+
+(define-error 'concur-pool-error "Generic error in the worker pool." 'concur-error)
+(define-error 'concur-invalid-pool-error "Invalid pool object." 'concur-pool-error)
+(define-error 'concur-pool-shutdown "Pool was shut down during task execution." 'concur-pool-error)
+(define-error 'concur-pool-task-error "An error occurred during task execution." 'concur-pool-error)
+(define-error 'concur-pool-poison-pill "A task repeatedly crashed workers." 'concur-pool-error)
 
 (defcustom concur-pool-default-size 4
-  "Default number of worker processes in the global pool.
-This determines the default maximum number of concurrent Lisp tasks."
-  :type 'integer
-  :group 'concur)
+  "The number of worker processes in the default pool."
+  :type 'integer :group 'concur)
 
-(defcustom concur-pool-max-worker-restart-attempts 3
-  "Maximum consecutive restart attempts for a worker process.
-If a worker crashes more than this many times in a row, it's marked
-as failed and removed from the pool to prevent infinite restart loops."
-  :type 'integer
-  :group 'concur)
-
-(defcustom concur-pool-max-queued-tasks 1000
-  "Maximum number of tasks allowed in the pool's queue.
-If exceeded, `concur:pool-submit-task` will reject new tasks (backpressure)
-to prevent unbounded memory growth."
-  :type 'integer
-  :group 'concur)
-
-;; Define custom error types for concur-pool, inheriting from `concur-error`.
-(define-error 'concur-pool-error
-  "A generic error occurred in the worker pool."
-  'concur-error)
-(define-error 'concur-pool-shutdown-error
-  "The worker pool was shut down, and a task could not be processed."
-  'concur-pool-error)
-(define-error 'concur-pool-task-error
-  "An error occurred while executing a task in a worker process."
-  'concur-pool-error)
-(define-error 'concur-pool-task-timeout-error
-  "A task submitted to the worker pool timed out before completion."
-  'concur-pool-task-error)
-(define-error 'concur-pool-poison-pill-error
-  "A task repeatedly crashed worker processes, indicating a problematic
-  task that is being dropped."
-  'concur-pool-task-error)
-(define-error 'concur-pool-worker-restart-failed
-  "A worker process failed to restart after multiple attempts."
-  'concur-pool-error)
-(define-error 'concur-pool-worker-terminated-mid-task
-  "A worker process terminated while it was busy executing a task."
-  'concur-pool-error)
-(define-error 'concur-pool-queue-full-error
-  "The worker pool's task queue is full, and a new task was rejected."
-  'concur-pool-error)
+(defcustom concur-pool-max-worker-restarts 3
+  "Maximum consecutive restart attempts for a failed worker."
+  :type 'integer :group 'concur)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Data Structures
+;;; Data Structures
 
-(cl-defstruct (concur-pool-task (:constructor %%make-concur-pool-task))
-  "Represents a task to be executed by the worker pool.
+(cl-defstruct (concur-pool-task (:constructor %%make-pool-task))
+  "Represents a task for the worker pool."
+  promise id form vars on-message-fn (priority 50)
+  (retries 0) worker cancel-token)
 
-  Arguments:
-  - `promise` (concur-promise): The `concur-promise` that will be settled
-    with the task's result or rejected on failure.
-  - `id` (string): A unique identifier (typically a `gensym` formatted string)
-    to correlate requests and responses between the main Emacs process and
-    the worker process.
-  - `form` (any): The Emacs Lisp form to be evaluated by the worker process.
-  - `require` (list): A list of feature symbols that the worker process
-    should `require` before attempting to evaluate the `form`.
-  - `priority` (integer): The task's priority (lower integer means higher
-    priority). Tasks with higher priority are picked from the queue first.
-    Defaults to 50.
-  - `timeout` (number or nil): An optional timeout (in seconds) for this
-    specific task. If the task exceeds this duration, it will be
-    forcibly terminated and its promise rejected. Defaults to `nil`.
-  - `retries` (integer): An internal counter used for poison pill detection.
-    It tracks how many times this task has been re-enqueued due to a worker
-    crash. Initialized to 0."
-  (promise nil :type (satisfies concur-promise-p))
-  (id nil :type string)
-  (form nil)
-  (require nil :type (or list null))
-  (priority 50 :type integer)
-  (timeout nil :type (or number null))
-  (retries 0 :type integer))
+(cl-defstruct (concur-worker (:constructor %%make-worker))
+  "Represents a single worker process in the pool."
+  process id status current-task (restart-attempts 0))
 
-(cl-defstruct (concur-worker (:constructor %%make-concur-worker))
-  "Represents a single worker process in the pool.
-
-  Arguments:
-  - `process` (process): The underlying Emacs `async` process object that
-    serves as the worker. Defaults to `nil` (initialized during worker start).
-  - `id` (integer): A unique identifier for this worker slot within the pool
-    (e.g., 1, 2, 3...).
-  - `status` (keyword): The current status of the worker. Possible values:
-    - `:idle`: The worker is ready and waiting for a new task.
-    - `:busy`: The worker is currently executing a task.
-    - `:dead`: The worker process has terminated unexpectedly.
-    - `:restarting`: The worker process is being restarted after a crash.
-    - `:failed`: The worker has exceeded `concur-pool-max-worker-restart-attempts`
-      and will not be restarted.
-  - `current-task` (concur-pool-task or nil): The `concur-pool-task` object
-    that this worker is currently executing. `nil` if idle.
-  - `timeout-timer` (timer or nil): The Emacs-side timer object used to enforce
-    task-specific timeouts. `nil` if no timeout is active or if the task completed.
-  - `restart-attempts` (integer): A counter for consecutive failed restart
-    attempts. This is reset to 0 upon successful task completion. Initialized to 0."
-  (process nil :type (or process null))
-  (id nil :type integer)
-  (status :idle :type (member :idle :busy :dead :restarting :failed))
-  (current-task nil :type (or null (satisfies concur-pool-task-p)))
-  (timeout-timer nil :type (or timer null))
-  (restart-attempts 0 :type integer))
-
-(cl-defstruct (concur-pool (:constructor %%make-concur-pool))
-  "Represents a pool of persistent worker processes.
-
-  Arguments:
-  - `lock` (concur-lock): A `concur-lock` (mutex) protecting the pool's
-    internal state. All operations modifying shared resources (like the
-    `workers` list or `task-queue`) must acquire this lock to ensure
-    thread-safety. Defaults to a new `:thread` mode `concur-lock`.
-  - `workers` (list): A list of all `concur-worker` structs currently
-    managed by this pool. Defaults to `nil`.
-  - `task-queue` (concur-priority-queue): The priority queue (`concur-priority-queue`)
-    holding `concur-pool-task` objects that are awaiting execution by an idle
-    worker. Tasks are prioritized based on their `priority` field. Defaults
-    to a new `concur-priority-queue` instance.
-  - `name` (string): A descriptive name for the pool instance. Defaults to
-    \"unnamed-pool\" or a unique `gensym` name if unspecified in constructor.
-  - `init-fn` (function or nil): An optional nullary function that will be
-    run once in each new worker process upon its startup. This is useful for
-    setting up `load-path`s or requiring common libraries in the worker.
-  - `shutdown-p` (boolean): `t` if the pool is in the process of shutting
-    down (e.g., during Emacs exit). No new tasks will be accepted or
-    dispatched. Defaults to `nil`."
-  (lock nil :type (or null (satisfies concur-lock-p))) ; Initialized in pool-create
-  (workers nil :type (or null (list (satisfies concur-worker-p))))
-  (task-queue nil :type (or null (satisfies concur-priority-queue-p))) ; Initialized in pool-create
-  (name "<unnamed-pool>" :type string)
-  (init-fn nil :type (or function null))
-  (shutdown-p nil :type boolean))
+(cl-defstruct (concur-pool (:constructor %%make-pool))
+  "Represents a pool of persistent worker processes."
+  name workers lock task-queue waiter-queue worker-env (shutdown-p nil))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Global Default Pool Management
+;;; Global Default Pool Management
 
 (defvar concur--default-pool nil
-  "The global, default instance of the worker pool.
-This pool is created lazily the first time `concur-pool-get-default`
-is called.")
+  "The global, default instance of the worker pool.")
+(defvar concur--default-pool-init-lock (concur:make-lock "default-pool-init-lock")
+  "A lock to protect the one-time initialization of the default pool.")
 
-(defvar concur--default-pool-init-lock
-  (concur:make-lock "default-pool-init-lock")
-  "A mutex to protect the one-time initialization of the default pool.
-Ensures `concur--default-pool` is a singleton.")
+(defun concur--pool-get-default ()
+  "Return the default global worker pool, creating it if it doesn't exist."
+  (unless concur--default-pool
+    (concur:with-mutex! concur--default-pool-init-lock
+      (unless concur--default-pool
+        (setq concur--default-pool (concur-pool-create))
+        (add-hook 'kill-emacs-hook #'concur--pool-shutdown-default-pool))))
+  concur--default-pool)
 
-(defun concur-pool-get-default ()
-  "Return the default global worker pool, creating it if necessary.
-This function is thread-safe and ensures the default pool is a singleton.
-If the pool has not been created yet, it will be initialized
-with `concur-pool-default-size` workers.
-
-  Returns:
-  - (concur-pool): The default pool instance."
-  (or concur--default-pool
-      (concur:with-mutex! concur--default-pool-init-lock
-        (unless concur--default-pool ; Double-check inside lock
-          (setq concur--default-pool (concur-pool-create
-                                      :name "global-default-pool"))
-          ;; Add hook to gracefully shut down pool when Emacs exits
-          (add-hook 'kill-emacs-hook #'concur-pool-shutdown-default-pool))
-        concur--default-pool)))
-
-(defun concur-pool-shutdown-default-pool ()
-  "Shut down the default worker pool gracefully when Emacs exits.
-This function is automatically added to `kill-emacs-hook` when the
-default pool is first accessed. It ensures all worker processes are
-terminated and pending tasks are cleaned up."
-  (interactive)
+(defun concur--pool-shutdown-default-pool ()
+  "Hook function to shut down the default pool when Emacs exits."
   (when concur--default-pool
-    (message "Concur-pool: Shutting down default pool...")
-    (concur:with-mutex! (concur-pool-lock concur--default-pool)
-      (unless (concur-pool-shutdown-p concur--default-pool)
-        (setf (concur-pool-shutdown-p concur--default-pool) t)
-        ;; Kill all worker processes.
-        (dolist (worker (concur-pool-workers concur--default-pool))
-          (when-let (proc (concur-worker-process worker))
-            (when (process-live-p proc)
-              ;; Explicitly reject the task of a busy worker.
-              (when-let (task (concur-worker-current-task worker))
-                (concur:reject (concur-pool-task-promise task)
-                               (concur:make-error
-                                :type 'concur-pool-worker-terminated-mid-task)))
-              (delete-process proc)
-              (message "Concur-pool: Killed worker %d."
-                       (concur-worker-id worker)))))
-        ;; Reject all tasks still remaining in the queue.
-        (while-let ((task (concur-priority-queue-pop
-                           (concur-pool-task-queue concur--default-pool))))
-          (concur:reject (concur-pool-task-promise task)
-                         (concur:make-error :type :pool-shutdown-error)))
-        ;; Clear the workers list
-        (setf (concur-pool-workers concur--default-pool) nil)
-        (message "Concur-pool: Default pool shut down."))))
-  (setq concur--default-pool nil)) ; Clear the global variable
+    (concur:pool-shutdown! concur--default-pool)))
+
+(defun concur--validate-pool (pool function-name)
+  "Signal an error if POOL is not a `concur-pool`."
+  (unless (concur-pool-p pool)
+    (signal 'concur-invalid-pool-error
+            (list (format "%s: Invalid pool object" function-name) pool))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Internal: Worker Process Logic
+;;; Internal: Worker Logic & IPC
 
-(defun concur--worker-script-form (init-fn)
-  "Generate the Emacs Lisp code a background worker process will execute.
-This script is sent to the `async` process and forms its main loop.
-It receives JSON-serialized tasks, evaluates them, and sends back
-JSON-serialized results or errors.
+;; This function is intended to be run inside the worker process.
+(defun concur:pool-send-message (payload)
+  "Send a progress message `PAYLOAD` from a worker to the parent process.
+This function is only available within code executed by a `concur:pool-eval`.
 
-  Arguments:
-  - `init-fn` (function or nil): An optional function to run once
-    in the worker process at startup.
+Arguments:
+- `PAYLOAD` (any): The Lisp object to send as a message."
+  (princ (format "M:%S\n" (prin1-to-string payload)))
+  (finish-output))
 
-  Returns:
-  - (lambda): An Emacs Lisp lambda form suitable for `async-start`."
-  `(lambda ()
-     ;; Ensure `json` and `cl-lib` are available in the worker process
-     (require 'json)
-     (require 'cl-lib) ; Ensure cl-lib is available in worker for general use
-     (let ((load-path ,load-path) ; Inherit load-path from main Emacs
-           (default-directory ,default-directory))
-       (when ,init-fn (funcall ,init-fn)) ; Run worker-specific init function
-       ;; Main worker loop: read task, evaluate, send response
-       (while t
-         (let* ((json-string (read-line)) ; Read task JSON from main process
-                (task-data (json-read-from-string json-string))
-                (task-id (cdr (assoc 'id task-data)))
-                (form (cdr (assoc 'form task-data)))
-                (features (cdr (assoc 'require task-data)))
-                response)
-           ;; Require necessary features for the task
-           (dolist (feature features) (require feature nil t))
-           (setq response
-                 (condition-case err
-                     ;; Evaluate the Lisp form safely
-                     (list :id task-id :result (eval form))
-                   (error (list :id task-id
-                                :error `(:type :task-exec-error
-                                         :message ,(error-message-string err)
-                                         :task-id ,task-id)))))
-           ;; Send JSON response back to main process
-           (princ (json-serialize response))
-           (princ "\n")
-           (finish-output (standard-output)))))))
+(defun concur--pool-worker-entry-point ()
+  "The main entry point for a background worker process.
+This function runs in a loop, reading tasks, executing them,
+and sending back results, errors, or messages."
+  (require 'cl-extra)
+  ;; Main loop: read a task S-exp, evaluate it, send response.
+  (while t
+    (let* ((task-sexp (read))
+           (id (plist-get task-sexp :id))
+           (form (plist-get task-sexp :form))
+           (vars (plist-get task-sexp :vars)))
+      (condition-case err
+          ;; The `let` binding makes user-provided variables available.
+          (let ((result (eval `(let ,vars ,form) t)))
+            (princ (format "R:%S\n" (prin1-to-string (list :id id :result result)))))
+        (error
+         (princ (format "E:%S\n"
+                        (prin1-to-string
+                         (list :id id
+                               :error (cl-serialize-error err)))))))
+      (finish-output))))
 
-(defun concur--worker-filter (worker chunk)
-  "The filter for worker processes, processing JSON responses from a worker.
-This function is called when a chunk of output is received from a worker.
+(defun concur--pool-handle-worker-output (worker task output)
+  "Handle a single parsed `OUTPUT` object from a `WORKER` for a `TASK`.
 
-  Arguments:
-  - `worker` (concur-worker): The worker process sending data.
-  - `chunk` (string): The raw output chunk received from the worker,
-    expected to be a JSON string.
+Arguments:
+- `WORKER` (concur-worker): The worker that produced the output.
+- `TASK` (concur-pool-task): The task associated with the output.
+- `OUTPUT` (plist): The parsed S-expression from the worker."
+  (pcase (plist-get output :type)
+    ;; Result (R)
+    (:result
+     (concur:resolve (concur-pool-task-promise task)
+                     (plist-get output :payload))
+     (concur--pool-release-worker worker))
+    ;; Error (E)
+    (:error
+     (concur:reject (concur-pool-task-promise task)
+                    (concur:make-error
+                     :type 'concur-pool-task-error
+                     :message "Task failed in worker."
+                     :cause (cl-deserialize-error
+                             (plist-get output :payload))))
+     (concur--pool-release-worker worker))
+    ;; Message (M)
+    (:message
+     (when-let (cb (concur-pool-task-on-message-fn task))
+       (funcall cb (plist-get output :payload))))
+    ;; Unknown
+    (_
+     (concur--log :warn "Mismatched response for worker %d: %S"
+                  (concur-worker-id worker) output))))
 
-  Returns:
-  - `nil` (side-effect: processes response and updates worker/task state)."
-  (let* ((pool (concur-pool-get-default))
-         (response (json-read-from-string chunk))
-         (task-id (cdr (assoc 'id response)))
-         (task (concur-worker-current-task worker))
-         (promise (and task (concur-pool-task-promise task))))
+(defun concur--pool-start-worker (worker pool)
+  "Create and start a single background worker process.
+This now uses `concur:async-stream` to get a reliable, streaming
+connection to the worker's stdout.
 
-    ;; Cancel timeout timer once response is received
-    (when-let (timer (concur-worker-timeout-timer worker))
-      (cancel-timer timer)
-      (setf (concur-worker-timeout-timer worker) nil))
+Arguments:
+- `WORKER` (concur-worker): The worker struct to initialize.
+- `POOL` (concur-pool): The parent pool."
+  (let* ((worker-env (concur-pool-worker-env pool))
+         (stream (concur:async-stream
+                  `(progn
+                     ;; The worker needs its own code to run.
+                     (require 'concur-pool)
+                     (concur--pool-worker-entry-point))
+                  :load-path (plist-get worker-env :load-path)
+                  :require (append (plist-get worker-env :require)
+                                   '(cl-extra)))))
+    ;; The stream's associated process is the worker process.
+    (setf (concur-worker-process worker) (process-get stream 'process))
+    ;; Process messages from the worker's stdout stream.
+    (concur:stream-for-each
+     stream
+     (lambda (response)
+       (let* ((task (concur-worker-current-task worker))
+              (task-id (and task (concur-pool-task-id task))))
+         (when (and task (equal task-id (plist-get response :id)))
+           (concur--pool-handle-worker-output worker task response)))))))
 
-    ;; Verify that the response corresponds to the currently active task
-    (if (and task (equal task-id (concur-pool-task-id task)))
-        (progn
-          (if-let ((worker-err (cdr (assoc 'error response))))
-              ;; Task execution failed in the worker
-              (concur:reject
-               promise
-               (concur:make-error :type :pool-task-error
-                                  :message (format "Worker %d task failed: %s"
-                                                   (concur-worker-id worker)
-                                                   (cdr (assoc 'message worker-err)))
-                                  :cause worker-err))
-            ;; Task executed successfully
-            (concur:resolve promise (cdr (assoc 'result response))))
-          ;; Reset worker state and dispatch next task within lock
-          (concur:with-mutex! (concur-pool-lock pool)
-            (setf (concur-worker-status worker) :idle)
-            (setf (concur-worker-current-task worker) nil)
-            (setf (concur-worker-restart-attempts worker) 0) ; Success resets counter
-            (concur--pool-dispatch-next-task pool)))
-      ;; Mismatched ID indicates a serious issue or orphaned response
-      (warn "Concur-pool: Received mismatched response ID: %s for worker %d. \
-             Expected task ID: %S. Response: %S"
-            task-id (concur-worker-id worker)
-            (and task (concur-pool-task-id task))
-            response))))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Internal: Lifecycle & Dispatch
 
-(defun concur--handle-task-timeout (worker)
-  "Handle a timed out task by killing the worker and rejecting the promise.
-This function is called by the task's timeout timer.
-
-  Arguments:
-  - `worker` (concur-worker): The worker whose current task timed out.
-
-  Returns:
-  - `nil` (side-effect: kills worker process, rejects task promise)."
+(defun concur--worker-sentinel (worker event pool)
+  "Sentinel for worker processes. Handles unexpected termination and restart."
+  (concur--log :warn nil "Pool worker %d died. Event: %s"
+               (concur-worker-id worker) event)
   (let ((task (concur-worker-current-task worker)))
-    (warn "Concur-pool: Task '%s' in worker %d timed out. Killing worker."
-          (concur-pool-task-id task) (concur-worker-id worker))
-    ;; Kill the worker process; its sentinel will handle restart
-    (when-let (proc (concur-worker-process worker))
-      (when (process-live-p proc)
-        (delete-process proc)))
-    ;; Reject the task's promise if it's still pending
-    (when-let (promise (and task (concur-pool-task-promise task)))
-      (when (concur:pending-p promise)
-        (concur:reject
-         promise
-         (concur:make-error :type :pool-task-timeout-error
-                            :message (format "Task exceeded timeout of %ss"
-                                             (concur-pool-task-timeout task))))))))
-
-(defun concur--worker-sentinel (worker event)
-  "The sentinel for worker processes. Handles unexpected termination
-  and initiates restarts.
-
-  Arguments:
-  - `worker` (concur-worker): The worker that triggered the sentinel.
-  - `event` (string): The event string from Emacs (e.g., \"exited abnormally\").
-
-  Returns:
-  - `nil` (side-effect: manages worker state and pool dispatch)."
-  (message "Concur-pool: Worker %d died unexpectedly. Event: %s"
-           (concur-worker-id worker) event)
-  (let* ((pool (concur-pool-get-default))
-         (task (concur-worker-current-task worker)))
-    ;; Cancel any active timeout timer for the worker
-    (when-let (timer (concur-worker-timeout-timer worker))
-      (cancel-timer timer)
-      (setf (concur-worker-timeout-timer worker) nil))
-
-    ;; Handle the task that was running when the worker died
+    ;; If the worker was busy, handle the task.
     (when task
       (cl-incf (concur-pool-task-retries task))
-      (if (> (concur-pool-task-retries task)
-             concur-pool-max-worker-restart-attempts)
-          ;; Task is a poison pill, reject its promise
+      (if (> (concur-pool-task-retries task) concur-pool-max-worker-restarts)
+          ;; This task is a "poison pill".
           (concur:reject (concur-pool-task-promise task)
-                         (concur:make-error :type :pool-poison-pill-error
-                                            :message (format "Task %s repeatedly \
-                                                              crashed workers."
-                                                              (concur-pool-task-id task))))
-        ;; Re-enqueue task for retry
+                         (concur:make-error :type 'concur-pool-poison-pill))
+        ;; Re-queue the task to be tried on another worker.
         (concur:with-mutex! (concur-pool-lock pool)
           (concur-priority-queue-insert (concur-pool-task-queue pool) task))))
-
-    ;; Update worker status and try to restart or mark as failed
+    ;; Attempt to restart the worker.
     (concur:with-mutex! (concur-pool-lock pool)
-      (setf (concur-worker-current-task worker) nil) ; Clear active task
       (setf (concur-worker-status worker) :dead)
-
       (unless (concur-pool-shutdown-p pool)
         (cl-incf (concur-worker-restart-attempts worker))
-        (if (> (concur-worker-restart-attempts worker)
-               concur-pool-max-worker-restart-attempts)
-            (progn
-              (setf (concur-worker-status worker) :failed)
-              (message "Concur-pool: Worker %d permanently failed after %d \
-                        restarts."
-                       (concur-worker-id worker)
-                       concur-pool-max-worker-restart-attempts))
+        (if (> (concur-worker-restart-attempts worker) concur-pool-max-worker-restarts)
+            (progn (setf (concur-worker-status worker) :failed)
+                   (concur--log :error nil "Worker %d failed permanently."
+                                (concur-worker-id worker)))
           (setf (concur-worker-status worker) :restarting)
-          (message "Concur-pool: Restarting worker %d (Attempt %d)."
-                   (concur-worker-id worker)
-                   (concur-worker-restart-attempts worker))
-          (setf (concur-worker-process worker)
-                (concur--pool-start-worker worker pool))))
-      ;; Attempt to dispatch the next task if any are waiting
+          (concur--pool-start-worker worker pool)))
       (concur--pool-dispatch-next-task pool))))
 
-(defun concur--pool-start-worker (worker pool-instance)
-  "Create and start a single background worker process.
+(defun concur--pool-release-worker (worker)
+  "Release a worker back to the pool, making it available for new tasks."
+  (let ((pool (concur--pool-get-default)))
+    (concur:with-mutex! (concur-pool-lock pool)
+      (setf (concur-worker-status worker) :idle)
+      (setf (concur-worker-current-task worker) nil)
+      (concur--pool-dispatch-next-task pool))))
 
-  Arguments:
-  - `worker` (concur-worker): The worker struct to initialize.
-  - `pool-instance` (concur-pool): The pool this worker belongs to.
-
-  Returns:
-  - (process or nil): The new Emacs process object, or nil if creation fails."
-  (message "Concur-pool: Starting worker %d..."
-           (concur-worker-id worker))
-  (condition-case err
-      (let ((proc (async-start
-                   (concur--worker-script-form (concur-pool-init-fn pool-instance)))))
-        (set-process-filter proc (lambda (_p c) (concur--worker-filter worker c)))
-        (set-process-sentinel proc (lambda (_p e) (concur--worker-sentinel worker e)))
-        (setf (concur-worker-status worker) :idle) ; Worker is ready
-        (setf (concur-worker-restart-attempts worker) 0) ; Reset on successful start
-        proc)
-    (error
-     (message "Concur-pool: Failed to start worker %d: %S"
-              (concur-worker-id worker) err)
-     (setf (concur-worker-status worker) :failed)
-     nil)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Internal: Pool and Dispatch Management
-
-(defun concur--pool-dispatch-next-task (pool-instance)
-  "Find an idle worker and dispatch the next task from the queue.
-This function MUST be called from within the pool's lock (`concur-pool-lock`).
-
-  Arguments:
-  - `pool-instance` (concur-pool): The pool to manage tasks for.
-
-  Returns:
-  - `nil` (side-effect: dispatches tasks)."
-  (unless (or (concur-priority-queue-empty-p
-               (concur-pool-task-queue pool-instance))
-              (concur-pool-shutdown-p pool-instance))
-    (when-let ((worker (cl-find-if
-                        (lambda (w) (eq (concur-worker-status w) :idle))
-                        (concur-pool-workers pool-instance))))
-      (let* ((task (concur-priority-queue-pop
-                    (concur-pool-task-queue pool-instance)))
-             (json (json-serialize `((id . ,(concur-pool-task-id task))
-                                     (form . ,(concur-pool-task-form task))
-                                     (require . ,(concur-pool-task-require task))))))
-        (setf (concur-worker-status worker) :busy)
-        (setf (concur-worker-current-task worker) task)
-        ;; Schedule timeout timer for the task
-        (when-let (timeout (concur-pool-task-timeout task))
-          (setf (concur-worker-timeout-timer worker)
-                (run-at-time timeout nil #'concur--handle-task-timeout worker)))
-        (process-send-string (concur-worker-process worker)
-                             (concat json "\n"))))))
+(defun concur--pool-dispatch-next-task (pool)
+  "Find an idle worker and dispatch the next task or waiting session.
+This function MUST be called from within the pool's lock."
+  (unless (concur-pool-shutdown-p pool)
+    ;; Prioritize sessions waiting for a worker.
+    (if-let ((waiter (pop (concur-pool-waiter-queue pool))))
+        (if-let ((worker (cl-find-if (lambda (w) (eq (concur-worker-status w) :idle))
+                                    (concur-pool-workers pool))))
+            (progn (setf (concur-worker-status worker) :reserved)
+                   (funcall (car waiter) worker)) ; Resolve waiter's promise.
+          (push waiter (concur-pool-waiter-queue pool))) ; Re-queue if no worker.
+      ;; If no waiting sessions, check the general task queue.
+      (unless (concur-priority-queue-empty-p (concur-pool-task-queue pool))
+        (when-let ((worker (cl-find-if (lambda (w) (eq (concur-worker-status w) :idle))
+                                      (concur-pool-workers pool))))
+          (let* ((task (concur-priority-queue-pop (concur-pool-task-queue pool)))
+                 (payload `(:id ,(concur-pool-task-id task)
+                                :form ,(concur-pool-task-form task)
+                                :vars ,(concur-pool-task-vars task))))
+            (setf (concur-worker-status worker) :busy)
+            (setf (concur-worker-current-task worker) task)
+            (setf (concur-pool-task-worker task) worker)
+            (process-send-string (concur-worker-process worker)
+                                 (prin1-to-string payload))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Public API: Pool Management
+;;; Public API
 
 ;;;###autoload
 (cl-defun concur-pool-create (&key (name (format "pool-%S" (gensym)))
                                   (size concur-pool-default-size)
-                                  (init-fn nil))
+                                  init-fn load-path require)
   "Create and initialize a new worker pool.
 
-  Arguments:
-  - `:name` (string): A descriptive name for the pool. Defaults to a
-    unique `gensym`-based name.
-  - `:size` (integer): The fixed number of workers in the pool. Defaults
-    to `concur-pool-default-size`.
-  - `:init-fn` (function or nil): A nullary function to run once in each new
-    worker process upon its startup. This is useful for setting up
-    `load-path`s or requiring common libraries in the worker.
+Arguments:
+- `:NAME` (string): A descriptive name for the pool.
+- `:SIZE` (integer): The fixed number of workers in the pool.
+- `:INIT-FN` (function): A nullary function to run once in each new
+  worker at startup.
+- `:LOAD-PATH` (list): A list of directory strings to prepend to the
+  worker's `load-path`.
+- `:REQUIRE` (list): A list of feature symbols to `require` in each
+  worker at startup.
 
-  Returns:
-  - (concur-pool): A new, initialized pool object."
-  (message "Concur-pool: Creating new pool %S with %d workers."
-           name size)
-  (let ((pool (%%make-concur-pool
-               :name name
-               :lock (concur:make-lock (format "pool-lock-%s" name))
-               :task-queue (concur-priority-queue-create)
-               :init-fn init-fn)))
+Returns:
+- `(concur-pool)`: A new, initialized pool object."
+  (let* ((worker-env `(:init-fn ,init-fn :load-path ,load-path :require ,require))
+         (pool (%%make-pool
+                :name name
+                :lock (concur:make-lock (format "pool-lock-%s" name))
+                :task-queue (concur-priority-queue-create
+                             :comparator (lambda (a b)
+                                           (< (concur-pool-task-priority a)
+                                              (concur-pool-task-priority b))))
+                :worker-env worker-env)))
     (setf (concur-pool-workers pool)
           (cl-loop for i from 1 to size
-                   collect (let ((worker (%%make-concur-worker :id i)))
-                             (setf (concur-worker-process worker)
-                                   (concur--pool-start-worker worker pool))
+                   collect (let ((worker (%%make-worker :id i)))
+                             (concur--pool-start-worker worker pool)
                              worker)))
     pool))
 
 ;;;###autoload
-(cl-defun concur:pool-submit-task (pool promise form require
-                                       &key (priority 50) timeout)
-  "Submit a task to the worker POOL.
-Creates a task and enqueues it into the pool's priority queue.
-Implements backpressure by rejecting tasks if the queue is full.
+(cl-defun concur:pool-submit-task (pool form &key on-message vars
+                                                 priority cancel-token)
+  "Submit a task to the worker `POOL`. (Low-level)
 
-  Arguments:
-  - `POOL` (concur-pool): The pool to submit the task to.
-  - `PROMISE` (concur-promise): The promise to settle with the task's result.
-  - `FORM` (any): The Emacs Lisp form to be evaluated by the worker.
-  - `REQUIRE` (list): A list of feature symbols for the worker to `require`
-    before evaluating the form.
-  - `:PRIORITY` (integer, optional): Task priority (lower integer means higher
-    priority). Defaults to 50.
-  - `:TIMEOUT` (number, optional): Optional timeout in seconds for this task.
-    If the task exceeds this duration, it will be terminated.
+Arguments:
+- `POOL` (concur-pool): The pool to submit the task to.
+- `FORM` (any): The Emacs Lisp form to be evaluated by the worker.
+- `:ON-MESSAGE` (function): Callback for progress messages from the worker.
+- `:VARS` (alist): `let`-bindings for the worker's execution context.
+- `:PRIORITY` (integer): Task priority (lower is higher).
+- `:CANCEL-TOKEN` (concur-cancel-token): A token to cancel the task.
 
-  Returns:
-  - `nil` (side-effect: enqueues task or rejects promise)."
-  (let ((task (%%make-concur-pool-task
-               :promise promise
-               :id (format "task-%s" (gensym "task"))
-               :form form :require require
-               :priority priority :timeout timeout)))
+Returns:
+- (concur-promise): A new promise for the task's result."
+  (concur--validate-pool pool 'concur:pool-submit-task)
+  (let* ((promise (concur:make-promise :cancel-token cancel-token))
+         (task (%%make-pool-task
+                :promise promise :id (format "task-%s" (make-temp-name ""))
+                :form form :on-message-fn on-message :vars vars
+                :priority (or priority 50) :cancel-token cancel-token)))
+    (when cancel-token
+      (concur:cancel-token-add-callback
+       cancel-token
+       (lambda ()
+         (concur:with-mutex! (concur-pool-lock pool)
+           ;; Try to remove from queue first.
+           (unless (concur-priority-queue-remove (concur-pool-task-queue pool) task)
+             ;; If not in queue, it must be running. Kill its worker.
+             (when-let ((worker (concur-pool-task-worker task)))
+               (when (eq (concur-worker-current-task worker) task)
+                 (delete-process (concur-worker-process worker)))))))))
     (concur:with-mutex! (concur-pool-lock pool)
-      (cond
-       ((concur-pool-shutdown-p pool)
-        (concur:reject promise (concur:make-error :type :pool-shutdown-error)))
-       ((>= (concur-priority-queue-length (concur-pool-task-queue pool))
-            concur-pool-max-queued-tasks)
-        (concur:reject promise (concur:make-error :type :pool-queue-full-error)))
-       (t
-        (concur-priority-queue-insert (concur-pool-task-queue pool) task)
-        (concur--pool-dispatch-next-task pool))))))
+      (concur-priority-queue-insert (concur-pool-task-queue pool) task)
+      (concur--pool-dispatch-next-task pool))
+    promise))
+
+;;;###autoload
+(cl-defmacro concur:pool-eval (form &rest keys)
+  "Evaluate `FORM` in the default worker pool, returning a promise.
+This is the primary high-level entry point for running Elisp code in
+the background.
+
+Arguments:
+- `FORM` (form): The Lisp form to execute in a background worker.
+- `KEYS` (plist): A property list of options passed to
+  `concur:pool-submit-task`, e.g., `:on-message`, `:vars`,
+  `:priority`, `:cancel-token`.
+
+Returns:
+- (concur-promise): A promise that resolves with the result of `FORM`."
+  `(apply #'concur:pool-submit-task
+          (concur--pool-get-default) ',form ',keys))
+
+;;;###autoload
+(cl-defmacro concur:pool-session ((session-var &key pool) &rest body)
+  "Reserve a single worker for a sequence of stateful commands.
+`SESSION-VAR` is bound to a runner function that sends tasks to the
+dedicated worker. The runner has the signature:
+  `(lambda (form &key on-message vars priority))`
+
+Arguments:
+- `SESSION-VAR` (symbol): A variable to bind to the session's runner function.
+- `:POOL` (concur-pool, optional): The pool to use.
+- `BODY` (forms): The code to execute within the session.
+
+Returns:
+- (concur-promise): A promise for the result of the last form in `BODY`."
+  (let ((pool-sym (gensym "pool-")) (worker-sym (gensym "worker-")))
+    `(let ((,pool-sym (or ,pool (concur--pool-get-default))))
+       (concur--validate-pool ,pool-sym 'concur:pool-session)
+       (concur:chain
+           (concur:with-executor (resolve _reject)
+             (concur:with-mutex! (concur-pool-lock ,pool-sym)
+               (if-let ((worker (cl-find-if
+                                 (lambda (w) (eq (concur-worker-status w) :idle))
+                                 (concur-pool-workers ,pool-sym))))
+                   (progn (setf (concur-worker-status worker) :reserved)
+                          (funcall resolve worker))
+                 (push (cons resolve _reject) (concur-pool-waiter-queue ,pool-sym)))))
+         (lambda (,worker-sym)
+           (let ((,session-var
+                  (lambda (form &rest keys)
+                    (apply #'concur:pool-submit-task
+                           ,pool-sym form :worker ,worker-sym keys))))
+             (concur:unwind-protect! (progn ,@body)
+               (lambda () (concur--pool-release-worker ,worker-sym)))))))))
+
+;;;###autoload
+(defun concur:pool-map (func items &key (pool (concur--pool-get-default))
+                                        (concurrency 4))
+  "Apply `FUNC` to each of `ITEMS` in parallel using `POOL`.
+This function distributes work across the pool's workers, managing
+the concurrency level, and returns a single promise that resolves with
+a list of all the results in the original order.
+
+Arguments:
+- `FUNC` (function): The function to apply to each item.
+- `ITEMS` (list): The list of items to process.
+- `:POOL` (concur-pool, optional): The pool to use.
+- `:CONCURRENCY` (integer, optional): Max number of items to process at once.
+
+Returns:
+- `(concur-promise)`: A promise that resolves with the list of results."
+  (concur:with-nursery (n :concurrency concurrency)
+    (concur:all
+     (mapcar
+      (lambda (item)
+        (concur:nursery-start-soon
+         n (lambda () (concur:pool-eval `(funcall ',func ',item) :pool pool))))
+      items))))
 
 ;;;###autoload
 (defun concur:pool-shutdown! (&optional pool)
-  "Gracefully shut down a worker POOL.
-Terminates all worker processes and rejects any pending tasks.
+  "Gracefully shut down a worker `POOL`.
 
-  Arguments:
-  - `POOL` (concur-pool, optional): The pool to shut down.
-    Defaults to the global default worker pool.
+Arguments:
+- `POOL` (concur-pool, optional): The pool to shut down. Defaults to the
+  global default pool.
 
-  Returns:
-  - `nil`."
+Returns:
+- `nil`."
   (interactive)
-  (let ((p (or pool concur--default-pool)))
-    (unless p
-      (user-error "Concur-pool: No pool is active to shut down."))
-    (message "Concur-pool: Shutting down pool %S..."
-             (concur-pool-name p))
+  (let ((p (or pool (concur--pool-get-default))))
+    (concur--validate-pool p 'concur:pool-shutdown!)
+    (concur--log :info nil "Shutting down pool %S..." (concur-pool-name p))
     (concur:with-mutex! (concur-pool-lock p)
       (unless (concur-pool-shutdown-p p)
         (setf (concur-pool-shutdown-p p) t)
-        ;; Kill all worker processes.
         (dolist (worker (concur-pool-workers p))
           (when-let (proc (concur-worker-process worker))
             (when (process-live-p proc)
-              ;; Explicitly reject the task of a busy worker.
               (when-let (task (concur-worker-current-task worker))
                 (concur:reject (concur-pool-task-promise task)
-                               (concur:make-error
-                                :type 'concur-pool-worker-terminated-mid-task)))
-              (delete-process proc)
-              (message "Concur-pool: Killed worker %d."
-                       (concur-worker-id worker)))))
-        ;; Reject all tasks still remaining in the queue.
-        (while-let ((task (concur-priority-queue-pop
-                           (concur-pool-task-queue p))))
+                               (concur:make-error :type 'concur-pool-shutdown)))
+              (delete-process proc))))
+        (while-let ((task (concur-priority-queue-pop (concur-pool-task-queue p))))
           (concur:reject (concur-pool-task-promise task)
-                         (concur:make-error :type :pool-shutdown-error)))
-        ;; Clear the workers list
-        (setf (concur-pool-workers p) nil)
-        (message "Concur-pool: Pool %S shut down."
-                 (concur-pool-name p))))
+                         (concur:make-error :type 'concur-pool-shutdown)))
+        (setf (concur-pool-workers p) nil)))
     (when (eq p concur--default-pool)
-      (setq concur--default-pool nil)))) ; Clear global variable
+      (setq concur--default-pool nil))))
 
 ;;;###autoload
 (defun concur:pool-status (&optional pool)
-  "Return a snapshot of the POOL's current status.
+  "Return a snapshot of the `POOL`'s current status.
 
-  Arguments:
-  - `POOL` (concur-pool, optional): The pool to inspect.
-    Defaults to the global default worker pool.
+Arguments:
+- `POOL` (concur-pool, optional): The pool to inspect. Defaults to the
+  global default pool.
 
-  Returns:
-  - (plist): A property list with pool metrics:
-    `:name`: Name of the pool.
-    `:size`: Total number of worker slots.
-    `:idle-workers`: Number of workers currently idle.
-    `:busy-workers`: Number of workers currently busy.
-    `:restarting-workers`: Number of workers currently restarting.
-    `:failed-workers`: List of IDs of workers marked as permanently failed.
-    `:queued-tasks`: Number of tasks awaiting execution in the queue.
-    `:is-shutdown`: Whether the pool is in shutdown state."
+Returns:
+- (plist): A property list with pool metrics."
   (interactive)
-  (let* ((p (or pool concur--default-pool)))
-    (unless p
-      (user-error "Concur-pool: No pool is active to inspect."))
+  (let* ((p (or pool (concur--pool-get-default))))
+    (unless p (error "No active pool to inspect."))
+    (concur--validate-pool p 'concur:pool-status)
     (concur:with-mutex! (concur-pool-lock p)
       `(:name ,(concur-pool-name p)
         :size ,(length (concur-pool-workers p))
-        :idle-workers ,(cl-loop for w in (concur-pool-workers p)
-                                when (eq (concur-worker-status w) :idle)
-                                count t)
-        :busy-workers ,(cl-loop for w in (concur-pool-workers p)
-                                when (eq (concur-worker-status w) :busy)
-                                count t)
-        :restarting-workers ,(cl-loop for w in (concur-pool-workers p)
-                                      when (eq (concur-worker-status w) :restarting)
-                                      count t)
-        :failed-workers ,(cl-loop for w in (concur-pool-workers p)
-                                  when (eq (concur-worker-status w) :failed)
-                                  collect (concur-worker-id w))
-        :queued-tasks ,(concur-priority-queue-length
-                        (concur-pool-task-queue p))
+        :idle-workers ,(-count (lambda (w) (eq (concur-worker-status w) :idle))
+                               (concur-pool-workers p))
+        :busy-workers ,(-count (lambda (w) (eq (concur-worker-status w) :busy))
+                               (concur-pool-workers p))
+        :reserved-workers ,(-count (lambda (w) (eq (concur-worker-status w) :reserved))
+                                   (concur-pool-workers p))
+        :failed-workers ,(-count (lambda (w) (eq (concur-worker-status w) :failed))
+                                 (concur-pool-workers p))
+        :queued-tasks ,(concur-priority-queue-length (concur-pool-task-queue p))
+        :waiting-sessions ,(length (concur-pool-waiter-queue p))
         :is-shutdown ,(concur-pool-shutdown-p p)))))
 
 (provide 'concur-pool)

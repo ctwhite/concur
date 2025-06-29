@@ -1,58 +1,73 @@
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; concur-priority-queue.el --- Priority Queue for Concurrent Task Scheduling -*- lexical-binding: t; -*-
+;;; concur-priority-queue.el --- Thread-Safe Priority Queue -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; This file provides a priority queue implementation based on a binary min-heap.
-;; It can be used to manage items based on priority levels, ensuring that
-;; high-priority items are processed first according to a defined comparator.
+;; This file provides a thread-safe priority queue implementation based on a
+;; binary min-heap. It is designed to manage items based on priority levels,
+;; ensuring that high-priority items are processed first according to a
+;; user-defined comparator.
 ;;
 ;; Features:
 ;; - Efficient priority-based retrieval (O(log n) for insert/pop).
-;; - Support for dynamic resizing of the underlying heap vector.
-;; - Flexible comparator to support min-heap (default) or max-heap.
+;; - Thread-safe operations via an internal mutex.
+;; - Support for removing arbitrary items (O(n) search + O(log n) removal).
+;; - Flexible comparator to support min-heaps (default) or max-heaps.
 
 ;;; Code:
 
-(require 'cl-lib) ; For cl-defstruct, cl-incf, cl-decf, cl-rotatef, cl-loop
-(require 'concur-log)  ; For concur--log
+(require 'cl-lib)
+(require 'concur-core)               ; For error definitions
+(require 'concur-lock)
+(require 'concur-log)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Data Structures
+;;; Errors
 
-(eval-and-compile
-  (cl-defstruct (concur-priority-queue
-                 (:constructor %%make-concur-priority-queue))
-    "A binary heap-based priority queue implementation.
+(define-error 'concur-priority-queue-error
+  "A generic error related to a priority queue."
+  'concur-error)
 
-  Arguments:
-  - `heap` (vector): A vector holding items in heap order. The root
-    (highest priority item) is at index 0. Defaults to a new vector.
-  - `comparator` (function): A binary function `(fn A B)` that returns non-nil
-    if `A` has higher priority than `B`. For a min-heap, this is `<`.
-    Defaults to `<`.
-  - `len` (integer): The current number of active items in the heap.
-    Defaults to 0.
-  - `initial-capacity` (integer): The initial size of the heap vector.
-    Defaults to 32."
-    (heap (make-vector 32 nil) :type vector)
-    (comparator #'< :type function)
-    (len 0 :type integer)
-    (initial-capacity 32 :type integer)))
+(define-error 'concur-invalid-priority-queue-error
+  "An operation was attempted on an invalid priority queue object."
+  'concur-priority-queue-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Internal Heap Helper Functions
+;;; Data Structures
 
-(defun concur-priority-queue--heapify-up (queue idx)
-  "Move the element at IDX up in the heap to maintain the heap property.
-This is used after insertion to bubble an item up to its correct position.
+(cl-defstruct (concur-priority-queue (:constructor %%make-priority-queue))
+  "A binary heap-based, thread-safe priority queue.
 
-  Arguments:
-  - `queue` (concur-priority-queue): The priority queue instance.
-  - `idx` (integer): The index of the element to move up.
+Fields:
+- `heap` (vector): A vector holding items in heap order.
+- `lock` (concur-lock): A mutex protecting all heap operations.
+- `comparator` (function): A function `(A B)` returning non-nil if A has
+  higher priority than B. For a min-heap, this is `<`.
+- `len` (integer): The current number of items in the heap."
+  (heap (make-vector 32 nil) :type vector)
+  (lock (concur:make-lock) :type concur-lock-p)
+  (comparator #'< :type function)
+  (len 0 :type integer))
 
-  Returns:
-  - `nil` (side-effect: modifies the heap vector)."
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Internal Helpers
+
+(defun concur--validate-queue (queue function-name)
+  "Signal an error if QUEUE is not a `concur-priority-queue`.
+
+Arguments:
+- `QUEUE` (any): The object to validate.
+- `FUNCTION-NAME` (symbol): The name of the calling function for the error."
+  (unless (concur-priority-queue-p queue)
+    (signal 'concur-invalid-priority-queue-error
+            (list (format "%s: Invalid queue object" function-name) queue))))
+
+(defun concur--priority-queue-heapify-up (queue idx)
+  "Move the element at `IDX` up to maintain the heap property.
+This must be called within a locked context.
+
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+- `IDX` (integer): The index of the element to move up."
   (let ((heap (concur-priority-queue-heap queue))
         (comparator (concur-priority-queue-comparator queue)))
     (catch 'done
@@ -60,24 +75,17 @@ This is used after insertion to bubble an item up to its correct position.
         (let* ((parent-idx (floor (1- idx) 2))
                (current (aref heap idx))
                (parent (aref heap parent-idx)))
-          ;; If parent has higher priority than current, heap property is met.
-          (if (funcall comparator parent current)
-              (throw 'done nil)
-            ;; Otherwise, swap current with parent and continue bubbling up.
+          (if (funcall comparator parent current) (throw 'done nil) ; Parent is higher prio
             (cl-rotatef (aref heap idx) (aref heap parent-idx))
             (setq idx parent-idx)))))))
 
-(defun concur-priority-queue--heapify-down (queue idx)
-  "Move the element at IDX down in the heap to maintain the heap property.
-This is used after removal (specifically, moving the last item to the
-root) to bubble an item down to its correct position.
+(defun concur--priority-queue-heapify-down (queue idx)
+  "Move the element at `IDX` down to maintain the heap property.
+This must be called within a locked context.
 
-  Arguments:
-  - `queue` (concur-priority-queue): The priority queue instance.
-  - `idx` (integer): The index of the element to move down.
-
-  Returns:
-  - `nil` (side-effect: modifies the heap vector)."
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+- `IDX` (integer): The index of the element to move down."
   (let ((heap (concur-priority-queue-heap queue))
         (len (concur-priority-queue-len queue))
         (comparator (concur-priority-queue-comparator queue)))
@@ -85,185 +93,213 @@ root) to bubble an item down to its correct position.
       (while t
         (let* ((left (1+ (* 2 idx)))
                (right (1+ left))
-               (highest idx)) ; Assume current is highest priority initially.
-          ;; Check if left child has higher priority.
+               (highest idx))
           (when (and (< left len) (funcall comparator (aref heap left)
                                            (aref heap highest)))
             (setq highest left))
-          ;; Check if right child has higher priority.
           (when (and (< right len) (funcall comparator (aref heap right)
                                             (aref heap highest)))
             (setq highest right))
-          ;; If current is still highest priority, heap property is met.
-          (if (= highest idx)
-              (throw 'done nil)
-            ;; Otherwise, swap current with the highest priority child.
+          (if (= highest idx) (throw 'done nil) ; Property is met
             (cl-rotatef (aref heap idx) (aref heap highest))
             (setq idx highest)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Public API
+;;; Public API
 
 ;;;###autoload
 (cl-defun concur-priority-queue-create (&key (comparator #'<) (initial-capacity 32))
-  "Create and return a new empty `concur-priority-queue`.
+  "Create and return a new empty, thread-safe `concur-priority-queue`.
 
-  Arguments:
-  - `:comparator` (function, optional): A function `(A B)` that returns
-    non-nil if A has higher priority than B. Defaults to `<` (a min-heap).
-  - `:initial-capacity` (integer, optional): The initial size of the heap
-    vector. Must be a positive integer. Defaults to 32.
+Arguments:
+- `:COMPARATOR` (function, optional): A function `(A B)` that returns non-nil
+  if A has higher priority than B. Defaults to `<` (a min-heap).
+- `:INITIAL-CAPACITY` (integer, optional): The initial size of the internal
+  heap vector. Defaults to 32.
 
-  Returns:
-  - (concur-priority-queue): A new priority queue instance."
-  (unless (functionp comparator)
-    (user-error "concur-priority-queue-create: :comparator must be a function: %S"
-                comparator))
+Returns:
+- `(concur-priority-queue)`: A new priority queue instance.
+
+Signals:
+- `error` on invalid arguments."
+  (unless (functionp comparator) (error "Comparator must be a function"))
   (unless (and (integerp initial-capacity) (> initial-capacity 0))
-    (user-error "concur-priority-queue-create: :initial-capacity must be a \
-                 positive integer: %S" initial-capacity))
-  (let ((queue (%%make-concur-priority-queue
-                :heap (make-vector initial-capacity nil)
-                :comparator comparator
-                :len 0
-                :initial-capacity initial-capacity)))
-    (concur--log :debug nil "Created priority queue %S with capacity %d."
-                 queue initial-capacity)
+    (error "Initial capacity must be a positive integer"))
+  (let* ((name (format "pq-lock-%S" (gensym)))
+         (queue (%%make-priority-queue
+                 :heap (make-vector initial-capacity nil)
+                 :comparator comparator
+                 :lock (concur:make-lock name))))
+    (concur--log :debug nil "Created priority queue with capacity %d."
+                 initial-capacity)
     queue))
 
 ;;;###autoload
-(defsubst concur-priority-queue-length (queue)
-  "Return the number of items in the priority QUEUE. O(1) complexity."
-  (unless (concur-priority-queue-p queue)
-    (user-error "concur-priority-queue-length: Invalid queue object: %S" queue))
+(defsubst concur:priority-queue-length (queue)
+  "Return the number of items in the priority `QUEUE`. O(1) complexity.
+
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+
+Returns:
+- `(integer)`: The number of items in the queue."
+  (concur--validate-queue queue 'concur:priority-queue-length)
   (concur-priority-queue-len queue))
 
 ;;;###autoload
-(defsubst concur-priority-queue-empty-p (queue)
-  "Return non-nil if the priority QUEUE is empty. O(1) complexity."
-  (unless (concur-priority-queue-p queue)
-    (user-error "concur-priority-queue-empty-p: Invalid queue object: %S" queue))
+(defsubst concur:priority-queue-empty-p (queue)
+  "Return non-nil if the priority `QUEUE` is empty. O(1) complexity.
+
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+
+Returns:
+- `(boolean)`: `t` if the queue is empty, `nil` otherwise."
+  (concur--validate-queue queue 'concur:priority-queue-empty-p)
   (zerop (concur-priority-queue-len queue)))
 
 ;;;###autoload
-(defun concur-priority-queue-insert (queue item)
+(defun concur:priority-queue-insert (queue item)
   "Insert `ITEM` into the priority `QUEUE`. O(log n) complexity.
-If the underlying vector is full, it is dynamically resized (doubled).
+This operation is thread-safe. If the underlying vector is full,
+it is dynamically resized.
 
-  Arguments:
-  - `QUEUE` (concur-priority-queue): The queue instance.
-  - `ITEM` (any): The item to insert.
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+- `ITEM` (any): The item to insert.
 
-  Returns:
-  - (any): The `ITEM` that was inserted."
-  (unless (concur-priority-queue-p queue)
-    (user-error "concur-priority-queue-insert: Invalid queue object: %S" queue))
-  (let* ((len (concur-priority-queue-len queue))
-         (capacity (length (concur-priority-queue-heap queue))))
-    ;; Resize if the heap vector is full.
-    (when (>= len capacity)
-      (let* ((new-capacity (if (zerop capacity) 32 (* 2 capacity)))
-             (new-heap (make-vector new-capacity nil)))
-        (dotimes (i len)
-          (aset new-heap i (aref (concur-priority-queue-heap queue) i)))
-        (setf (concur-priority-queue-heap queue) new-heap)
-        (concur--log :debug nil "Priority queue resized to capacity %d."
-                     new-capacity))))
-  (let ((heap (concur-priority-queue-heap queue))
-        (idx (concur-priority-queue-len queue)))
-    (aset heap idx item) ; Add item to the end of the heap.
-    (cl-incf (concur-priority-queue-len queue))
-    (concur-priority-queue--heapify-up queue idx) ; Bubble it up.
-    (concur--log :debug nil "Inserted item into priority queue. Length: %d."
-                 (concur-priority-queue-len queue))
-    item))
+Returns:
+- (any): The `ITEM` that was inserted."
+  (concur--validate-queue queue 'concur:priority-queue-insert)
+  (concur:with-mutex! (concur-priority-queue-lock queue)
+    (let* ((len (concur-priority-queue-len queue))
+           (capacity (length (concur-priority-queue-heap queue)))
+           (heap (concur-priority-queue-heap queue)))
+      (when (>= len capacity)
+        (let* ((new-capacity (if (zerop capacity) 32 (* 2 capacity)))
+               (new-heap (make-vector new-capacity nil)))
+          (dotimes (i len) (aset new-heap i (aref heap i)))
+          (setq heap (setf (concur-priority-queue-heap queue) new-heap))
+          (concur--log :debug nil "Priority queue resized to %d." new-capacity)))
+      (let ((idx len))
+        (aset heap idx item)
+        (cl-incf (concur-priority-queue-len queue))
+        (concur--priority-queue-heapify-up queue idx))))
+  item)
 
 ;;;###autoload
-(defun concur-priority-queue-pop (queue)
+(defun concur:priority-queue-peek (queue)
+  "Return the highest-priority item from `QUEUE` without removing it. O(1).
+This operation is thread-safe.
+
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+
+Returns:
+- `(any or nil)`: The highest-priority item, or `nil` if the queue is empty."
+  (concur--validate-queue queue 'concur:priority-queue-peek)
+  (concur:with-mutex! (concur-priority-queue-lock queue)
+    (unless (concur:priority-queue-empty-p queue)
+      (aref (concur-priority-queue-heap queue) 0))))
+
+;;;###autoload
+(defun concur:priority-queue-pop (queue)
   "Pop the highest-priority item from `QUEUE`. O(log n) complexity.
+This operation is thread-safe.
 
-  Arguments:
-  - `QUEUE` (concur-priority-queue): The queue instance.
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
 
-  Returns:
-  - (any): The highest-priority item in the queue.
+Returns:
+- (any): The highest-priority item in the queue.
 
-  Signals:
-  - `user-error`: If the queue is empty."
-  (unless (concur-priority-queue-p queue)
-    (user-error "concur-priority-queue-pop: Invalid queue object: %S" queue))
-  (if (concur-priority-queue-empty-p queue)
-      (user-error "concur-priority-queue-pop: Priority queue is empty.")
-    (let* ((heap (concur-priority-queue-heap queue))
-           (len (concur-priority-queue-len queue))
-           (top (aref heap 0)) ; Highest priority item is at the root (index 0).
-           (new-len (1- len)))
-      (aset heap 0 (aref heap new-len)) ; Move last item to root.
-      (aset heap new-len nil) ; Clear the old last position.
-      (setf (concur-priority-queue-len queue) new-len)
-      (when (> new-len 0) ; Only heapify down if there are other elements.
-        (concur-priority-queue--heapify-down queue 0))
-      (concur--log :debug nil "Popped item from priority queue. Length: %d."
-                   (concur-priority-queue-len queue))
-      top)))
+Signals:
+- `error` if the queue is empty."
+  (concur--validate-queue queue 'concur:priority-queue-pop)
+  (concur:with-mutex! (concur-priority-queue-lock queue)
+    (if (concur:priority-queue-empty-p queue)
+        (error "Cannot pop from an empty priority queue")
+      (let* ((heap (concur-priority-queue-heap queue))
+             (top (aref heap 0))
+             (new-len (1- (concur-priority-queue-len queue))))
+        (aset heap 0 (aref heap new-len))
+        (aset heap new-len nil)
+        (setf (concur-priority-queue-len queue) new-len)
+        (when (> new-len 0)
+          (concur--priority-queue-heapify-down queue 0))
+        top))))
 
 ;;;###autoload
-(defun concur-priority-queue-pop-n (queue n)
+(defun concur:priority-queue-pop-n (queue n)
   "Remove and return the N highest-priority items from `QUEUE`.
 The returned list is sorted by priority.
 
-  Arguments:
-  - `QUEUE` (concur-priority-queue): The queue instance.
-  - `n` (integer): The number of items to remove.
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+- `N` (integer): The number of items to remove.
 
-  Returns:
-  - (list): A list of the N highest-priority items removed, sorted by priority.
+Returns:
+- (list): A list of the `N` highest-priority items.
 
-  Signals:
-  - `user-error`: If `QUEUE` is not a `concur-priority-queue` or `n` is negative."
-  (unless (concur-priority-queue-p queue)
-    (user-error "concur-priority-queue-pop-n: Invalid queue object: %S" queue))
-  (unless (and (integerp n) (>= n 0))
-    (user-error "concur-priority-queue-pop-n: N must be a non-negative integer: %S" n))
-  (let ((count (min n (concur-priority-queue-len queue))))
-    (when (> count 0)
-      (concur--log :debug nil "Popping %d items from priority queue." count)
-      (cl-loop repeat count collect (concur-priority-queue-pop queue)))))
+Signals:
+- `error` if `N` is negative."
+  (concur--validate-queue queue 'concur:priority-queue-pop-n)
+  (unless (and (integerp n) (>= n 0)) (error "N must be a non-negative integer"))
+  (concur:with-mutex! (concur-priority-queue-lock queue)
+    (let ((count (min n (concur-priority-queue-len queue))))
+      (when (> count 0)
+        (cl-loop repeat count collect (concur:priority-queue-pop queue))))))
 
 ;;;###autoload
-(defun concur-priority-queue-peek (queue)
-  "Return the highest-priority item from `QUEUE` without removing it. O(1).
+(cl-defun concur:priority-queue-remove (queue item &key (test #'eql))
+  "Remove `ITEM` from the priority `QUEUE`. O(n) + O(log n) complexity.
+This operation is thread-safe.
 
-  Arguments:
-  - `QUEUE` (concur-priority-queue): The queue instance.
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue instance.
+- `ITEM` (any): The item to remove.
+- `:TEST` (function, optional): The equality test function. Defaults to `#'eql`.
 
-  Returns:
-  - (any or nil): The highest-priority item, or `nil` if the queue is empty."
-  (unless (concur-priority-queue-p queue)
-    (user-error "concur-priority-queue-peek: Invalid queue object: %S" queue))
-  (unless (concur-priority-queue-empty-p queue)
-    (aref (concur-priority-queue-heap queue) 0)))
+Returns:
+- `(boolean)`: `t` if the item was found and removed, `nil` otherwise."
+  (concur--validate-queue queue 'concur:priority-queue-remove)
+  (concur:with-mutex! (concur-priority-queue-lock queue)
+    (let* ((heap (concur-priority-queue-heap queue))
+           (len (concur-priority-queue-len queue))
+           (idx (cl-position item heap :end len :test test)))
+      (when idx
+        (let ((last-idx (1- len)))
+          (aset heap idx (aref heap last-idx))
+          (aset heap last-idx nil)
+          (cl-decf (concur-priority-queue-len queue))
+          (when (< idx (1- len))
+            (let ((parent-idx (floor (1- idx) 2)))
+              (if (and (> idx 0)
+                       (funcall (concur-priority-queue-comparator queue)
+                                (aref heap idx)
+                                (aref heap parent-idx)))
+                  (concur--priority-queue-heapify-up queue idx)
+                (concur--priority-queue-heapify-down queue idx)))))
+        t))))
 
 ;;;###autoload
-(cl-defun concur-priority-queue-status (queue)
+(defun concur:priority-queue-status (queue)
   "Return a snapshot of the `QUEUE`'s current status.
 
-  Arguments:
-  - `QUEUE` (concur-priority-queue): The priority queue instance to inspect.
+Arguments:
+- `QUEUE` (concur-priority-queue): The queue to inspect.
 
-  Returns:
-  - (plist): A property list with queue metrics:
-    `:length`: Number of items in the queue.
-    `:capacity`: Current allocated capacity of the underlying vector.
-    `:comparator`: The comparator function used (symbol).
-    `:empty-p`: Whether the queue is empty."
+Returns:
+- (plist): A property list with queue metrics.
+
+Signals:
+- `concur-invalid-priority-queue-error` if `QUEUE` is not valid."
   (interactive)
-  (unless (concur-priority-queue-p queue)
-    (user-error "concur-priority-queue-status: Invalid queue object: %S" queue))
-  `(:length ,(concur-priority-queue-len queue)
-    :capacity ,(length (concur-priority-queue-heap queue))
-    :comparator ,(concur-priority-queue-comparator queue)
-    :empty-p ,(concur-priority-queue-empty-p queue)))
+  (concur--validate-queue queue 'concur:priority-queue-status)
+  (concur:with-mutex! (concur-priority-queue-lock queue)
+    `(:length ,(concur-priority-queue-len queue)
+      :capacity ,(length (concur-priority-queue-heap queue))
+      :is-empty ,(concur:priority-queue-empty-p queue))))
 
 (provide 'concur-priority-queue)
 ;;; concur-priority-queue.el ends here
