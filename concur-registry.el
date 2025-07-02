@@ -19,11 +19,22 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 's)
-(require 'concur-core)
 (require 'concur-lock)
 (require 'concur-log)
 (require 'concur-queue)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Forward Declarations
+
+(declare-function concur-promise-p "concur-core")
+(declare-function concur-promise-id "concur-core")
+(declare-function concur-promise-state "concur-core")
+(declare-function concur:status "concur-core")
+(declare-function concur:pending-p "concur-core")
+(declare-function concur:format-promise "concur-core")
+(declare-function concur:reject "concur-core")
+(declare-function concur:make-error "concur-core")
+(declare-function concur-error "concur-core")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors & Customization
@@ -52,10 +63,36 @@ settled promises exceeds this limit, the oldest ones are evicted."
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Data Structures & Internal State
 
+(defvar concur-resource-tracking-function nil
+  "A function called by primitives when a resource is acquired or released.
+The function should accept two arguments: `ACTION` (a keyword like
+`:acquire` or `:release`) and `RESOURCE` (the primitive object itself).
+This is intended to be dynamically bound by a higher-level library
+(e.g., a promise executor) to associate resource management with a
+specific task.")
+
 (cl-defstruct (concur-promise-meta (:constructor %%make-promise-meta))
-  "Metadata for a promise in the global registry."
-  promise name status-history (creation-time (float-time)) settlement-time
-  parent-promise children-promises resources-held tags)
+  "Metadata for a promise in the global registry.
+
+Fields:
+- `promise` (concur-promise): The promise object this metadata describes.
+- `name` (string): A human-readable name for the promise.
+- `status-history` (list): A list of status changes `(timestamp . status)`.
+- `creation-time` (float): The time the promise was created.
+- `settlement-time` (float): The time the promise settled.
+- `parent-promise` (concur-promise): The promise that created this one.
+- `children-promises` (list): Promises created by this promise.
+- `resources-held` (list): External resources currently held by this promise.
+- `tags` (list): A list of keyword tags for filtering."
+  (promise nil :type (or null concur-promise-p))
+  (name nil :type (or null string))
+  (status-history nil :type list)
+  (creation-time (float-time) :type float)
+  (settlement-time nil :type (or null float))
+  (parent-promise nil :type (or null concur-promise-p))
+  (children-promises nil :type list)
+  (resources-held nil :type list)
+  (tags nil :type list))
 
 (defvar concur--promise-registry (make-hash-table :test 'eq)
   "Global hash table mapping promise objects to `concur-promise-meta` data.")
@@ -77,9 +114,9 @@ This provides O(1) lookup performance for `get-promise-by-id`.")
 (defun concur--registry-evict-oldest-settled ()
   "Evict the oldest settled promise if the registry exceeds its max size.
 This must be called from within the `concur--promise-registry-lock`."
-  (while (> (concur-queue-length concur--promise-registry-fifo-queue)
+  (while (> (concur:queue-length concur--promise-registry-fifo-queue)
             concur-registry-max-size)
-    (let ((oldest-promise (concur-queue-dequeue
+    (let ((oldest-promise (concur:queue-dequeue
                            concur--promise-registry-fifo-queue)))
       (when oldest-promise
         (concur--log :debug nil "Registry full. Evicting oldest promise: %S"
@@ -88,7 +125,7 @@ This must be called from within the `concur--promise-registry-lock`."
                  concur--promise-id-to-promise-map)
         (remhash oldest-promise concur--promise-registry)))))
 
-(defun concur-registry-register-promise (promise name &key parent-promise tags)
+(cl-defun concur-registry-register-promise (promise name &key parent-promise tags)
   "Register a new `PROMISE` in the global registry.
 
 Arguments:
@@ -103,7 +140,6 @@ Arguments:
       (let ((meta (%%make-promise-meta :promise promise :name name
                                        :parent-promise parent-promise
                                        :tags (cl-delete-duplicates tags))))
-        ;; Add to primary registry and secondary ID-based index.
         (puthash promise meta concur--promise-registry)
         (puthash (concur-promise-id promise) promise
                  concur--promise-id-to-promise-map)
@@ -129,8 +165,8 @@ Arguments:
           (setf (concur-promise-meta-settlement-time meta) current-time)
           (push (cons current-time (concur-promise-state promise))
                 (concur-promise-meta-status-history meta))
-          (concur-queue-enqueue concur--promise-registry-fifo-queue promise)
-          (concur-registry--evict-oldest-settled)
+          (concur:queue-enqueue concur--promise-registry-fifo-queue promise)
+          (concur--registry-evict-oldest-settled)
           (concur--log :debug (concur-promise-id promise)
                        "Updated promise '%s' to state %S."
                        (or (concur-promise-meta-name meta) "--unnamed--")
@@ -196,7 +232,7 @@ Returns:
     default))
 
 ;;;###autoload
-(defun concur:list-promises (&key status name tags)
+(cl-defun concur:list-promises (&key status name tags)
   "Return a list of promises from the registry, with optional filters.
 
 Arguments:
@@ -214,11 +250,12 @@ Returns:
          (when (and (or (null status) (eq (concur:status promise) status))
                     (or (null name)
                         (and (concur-promise-meta-name meta)
-                             (s-contains? name (concur-promise-meta-name meta))))
+                             (string-match-p (regexp-quote name)
+                                             (concur-promise-meta-name meta))))
                     (or (null tags)
                         (let ((tag-list (if (listp tags) tags (list tags))))
-                          (-any? (lambda (tag) (memq tag (concur-promise-meta-tags meta)))
-                                 tag-list))))
+                          (cl-some (lambda (tag) (memq tag (concur-promise-meta-tags meta)))
+                                   tag-list))))
            (push promise matching)))
        concur--promise-registry))
     (nreverse matching)))

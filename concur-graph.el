@@ -14,7 +14,6 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 's)
 (require 'concur-core)
 (require 'concur-chain)
 (require 'concur-combinators)

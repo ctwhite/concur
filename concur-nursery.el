@@ -25,12 +25,16 @@
 (require 'concur-core)
 (require 'concur-chain)
 (require 'concur-cancel)
-(require 'concur-pool)
 (require 'concur-semaphore)
 (require 'concur-combinators)
 (require 'concur-registry)
 (require 'concur-lock)
 (require 'concur-log)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Forward Declarations
+
+(declare-function concur:lisp-eval "concur-lisp")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors & Data Structures
@@ -151,16 +155,16 @@ Signals:
 ;;;###autoload
 (cl-defun concur:nursery-start-soon (nursery fn &rest keys)
   "Start a new asynchronous task `FN` within a `NURSERY`.
+
 This function must be called from within a `concur:with-nursery` block.
-The task is executed on the default worker pool via `concur:pool-eval`.
-If the nursery has a concurrency limit, this task may wait for a
-free slot before executing.
+The task is executed on the default lisp worker pool. If the nursery
+has a concurrency limit, this task may wait for a free slot before executing.
 
 Arguments:
 - `NURSERY` (concur-nursery): The nursery object from `with-nursery`.
 - `FN` (function): A nullary function `(lambda () ...)` to execute as a task.
-- `KEYS` (plist): Keyword arguments passed to `concur:pool-eval`, such as
-  `:vars` or `:priority`.
+- `KEYS` (plist): Keyword arguments passed to `concur:lisp-submit-task`,
+  such as `:vars` or `:priority`.
 
 Returns:
 - (concur-promise): The promise for the newly started task."
@@ -173,8 +177,12 @@ Returns:
                       (lambda ()
                         (concur:with-semaphore! semaphore (funcall fn)))
                     fn))
+         ;; CORRECTED: Call the function `concur:lisp-submit-task` instead
+         ;; of trying to apply the macro `concur:lisp-eval`.
          (task-promise
-          (apply #'concur:pool-eval `(funcall ,task-fn)
+          (apply #'concur:lisp-submit-task
+                 (concur--lisp-pool-get-default)
+                 `(funcall ,task-fn)
                  :cancel-token (concur-nursery-cancel-token nursery)
                  keys)))
 
@@ -211,12 +219,6 @@ Signals:
 - An error if the task or nursery fails."
   (concur--validate-nursery nursery 'concur:nursery-start-and-await)
   (concur:await (apply #'concur:nursery-start-soon nursery fn keys)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Core Integration
-
-;; Nurseries are self-contained and don't need to hook into the core,
-;; as they are a user-facing macro that builds upon other primitives.
 
 (provide 'concur-nursery)
 ;;; concur-nursery.el ends here

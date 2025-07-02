@@ -29,7 +29,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
 
-;; These functions are defined in `concur-core.el`.
+(declare-function concur-error "concur-core")
 (declare-function concur-execute-callback "concur-core")
 (declare-function concur-callback-target-promise "concur-core")
 (declare-function concur:make-error "concur-core")
@@ -49,23 +49,19 @@
 (defcustom concur-microtask-queue-capacity 1024
   "Maximum number of microtasks allowed in the queue.
 If the limit is reached, newly added tasks will be dropped and their
-associated promises will be rejected. Setting to 0 or less
-disables the limit, but this is not recommended."
+associated promises will be rejected."
   :type '(integer :min 0)
   :group 'concur)
 
 (defcustom concur-microtask-max-batch-size 128
-  "Maximum number of microtasks to process in a single drain tick.
-If more tasks exist, another drain is scheduled immediately. This
-prevents a long microtask cycle from blocking Emacs."
+  "Maximum number of microtasks to process in a single drain tick."
   :type '(integer :min 1)
   :group 'concur)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal State
 
-(cl-defstruct (concur-microtask-queue (:constructor %%make-microtask-queue)
-                                      (:copier nil))
+(cl-defstruct (concur-microtask-queue (:constructor %%make-microtask-queue))
   "Internal structure representing the global microtask queue.
 
 Fields:
@@ -101,8 +97,6 @@ Arguments:
     (concur--log :warn nil "Microtask queue overflow: %d dropped."
                  (length overflowed-callbacks))
     (dolist (cb overflowed-callbacks)
-      ;; This assumes `concur-callback` struct holds a direct reference
-      ;; to the target promise, a critical change for removing `eval`.
       (when-let ((promise (concur-callback-target-promise cb)))
         (concur:reject
          promise
@@ -112,12 +106,15 @@ Arguments:
 (defun concur--drain-microtask-queue ()
   "Process a batch of microtasks from the global queue.
 This function is designed to avoid deadlocks by separating locking from
-execution. It acquires the lock only to pop a batch of tasks, then
-releases the lock *before* executing them. This ensures that a
-microtask can safely schedule more microtasks.
+execution. It is intended to be called by a timer.
 
-This function is intended to be called by a timer and should not be
-called directly."
+The logic proceeds in phases:
+1.  Reset the scheduling flag under a lock.
+2.  Grab a batch of tasks from the queue, also under a lock.
+3.  Execute the batch *without* holding the lock. This is critical to
+    allow callbacks to safely schedule more microtasks.
+4.  Re-acquire the lock to check if more work was added during execution,
+    and reschedule a new drain if necessary."
   ;; Phase 1: Reset scheduling flag.
   (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
     (setf (concur-microtask-queue-drain-scheduled-p
@@ -130,30 +127,25 @@ called directly."
     (concur--log :debug nil "Microtask drain tick %d starting." tick)
 
     ;; Phase 2: Lock, grab a batch of tasks, and immediately unlock.
-    (let (batch)
+    (let ((batch)
+          (queue (concur-microtask-queue-queue concur--global-microtask-queue)))
       (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
-        (let* ((queue (concur-microtask-queue-queue
-                       concur--global-microtask-queue))
-               (batch-size (min (concur-queue-length queue)
+        (let ((batch-size (min (concur:queue-length queue)
                                 concur-microtask-max-batch-size)))
           (setq batch (cl-loop repeat batch-size
-                               collect (concur-queue-dequeue queue)))))
+                               collect (concur:queue-dequeue queue)))))
 
       ;; Phase 3: Execute the batch without holding the lock.
       (when batch
-        (concur--log :debug nil "Processing %d microtasks in tick %d."
-                     (length batch) tick)
+        (concur--log :debug nil "Processing %d microtasks in tick %d." (length batch) tick)
         (dolist (cb batch)
-          (condition-case err
-              (concur-execute-callback cb)
-            (error
-             (concur--log :error nil
-                          "Unhandled error in microtask callback: %S" err))))))
+          (condition-case err (concur-execute-callback cb)
+            (error (concur--log :error nil "Unhandled error in microtask: %S" err))))))
 
-    ;; Phase 4: Lock again to check if more work remains and reschedule if needed.
+    ;; Phase 4: Lock again to check for more work and reschedule if needed.
     (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
       (let ((queue (concur-microtask-queue-queue concur--global-microtask-queue)))
-        (when (and (not (concur-queue-empty-p queue))
+        (when (and (not (concur:queue-empty-p queue))
                    (not (concur-microtask-queue-drain-scheduled-p
                          concur--global-microtask-queue)))
           (setf (concur-microtask-queue-drain-scheduled-p
@@ -199,10 +191,9 @@ Signals:
       (let* ((capacity concur-microtask-queue-capacity)
              (queue (concur-microtask-queue-queue concur--global-microtask-queue)))
         (dolist (cb callbacks)
-          (if (and (> capacity 0) (>= (concur-queue-length queue) capacity))
+          (if (and (> capacity 0) (>= (concur:queue-length queue) capacity))
               (push cb overflowed)
-            (concur-queue-enqueue queue cb)))))
-
+            (concur:queue-enqueue queue cb)))))
     (when overflowed
       (concur--reject-overflowed-callbacks overflowed)))
 

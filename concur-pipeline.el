@@ -22,7 +22,6 @@
 (require 'concur-core)
 (require 'concur-chain)
 (require 'concur-shell)
-(require 'concur-pool)
 (require 'concur-log)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

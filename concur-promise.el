@@ -24,7 +24,7 @@
 ;;
 ;; This file offers a more lightweight alternative to requiring the entire
 ;; `concur.el` library, which includes heavier components like worker pools
-;; (`concur-pool.el`, `concur-shell.el`) and high-level async utilities
+;; (`concur-lisp.el`, `concur-shell.el`) and high-level async utilities
 ;; (`concur-async.el`).
 
 ;;; Code:

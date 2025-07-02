@@ -109,8 +109,8 @@ Arguments:
 
 Returns:
 - `(concur-promise)`: A promise that resolves to a list of status plists.
-  Each status object is like `(:status 'fulfilled :value ...)` or
-  `(:status 'rejected :reason ...)`.
+  Each status object is like `(:status \'fulfilled :value ...)` or
+  `(:status \'rejected :reason ...)`.
 
 Example:
   (concur:all-settled (list (concur:resolved! 1) (concur:rejected! \"err\")))
@@ -146,7 +146,7 @@ Example:
 ;;;###autoload
 (cl-defun concur:race (promises-list &key mode)
   "Return a promise that settles with the outcome of the first promise to settle.
-'Settling' means either resolving or rejecting. As soon as any promise in
+\'Settling\' means either resolving or rejecting. As soon as any promise in
 `PROMISES-LIST` settles, the returned promise adopts that outcome.
 
 Arguments:
@@ -225,10 +225,10 @@ Arguments:
 
 Returns:
 - `(concur-promise)`: A promise that resolves with an alist of results."
-  (let* ((keys (mapcar #'car alist))
-         (promises (mapcar #'cdr alist)))
+  (let* ((keys (cl-mapcar #'car alist))
+         (promises (cl-mapcar #'cdr alist)))
     (concur:then (concur:all promises)
-                 (lambda (values) (mapcar #'cons keys values)))))
+                 (lambda (values) (cl-mapcar #'cons keys values)))))
 
 ;;;###autoload
 (defun concur:reduce (items reducer initial-value)
@@ -247,11 +247,11 @@ Returns:
   (concur--validate-list items 'concur:reduce)
   (concur--validate-function reducer 'concur:reduce)
   (cl-labels ((reduce-loop (items-left accumulator)
-                (if (null items-left)
-                    (concur:resolved! accumulator)
-                  (concur:then (funcall reducer accumulator (car items-left))
-                               (lambda (new-acc)
-                                 (reduce-loop (cdr items-left) new-acc))))))
+              (if (null items-left)
+                  (concur:resolved! accumulator)
+                (concur:then (funcall reducer accumulator (car items-left))
+                              (lambda (new-acc)
+                                (reduce-loop (cdr items-left) new-acc))))))
     (reduce-loop items initial-value)))
 
 ;;;###autoload
@@ -289,7 +289,7 @@ Returns:
 - `(concur-promise)`: A promise that resolves with a list of the results."
   (concur--validate-list items 'concur:map-parallel)
   (concur--validate-function fn 'concur:map-parallel)
-  (concur:all (mapcar fn items)))
+  (concur:all (cl-mapcar fn items)))
 
 ;;;###autoload
 (defun concur:filter-series (items predicate)
@@ -329,10 +329,10 @@ Returns:
 - `(concur-promise)`: A promise that resolves with the list of filtered items."
   (concur--validate-list items 'concur:filter-parallel)
   (concur--validate-function predicate 'concur:filter-parallel)
-  (let* ((pred-promises (mapcar predicate items))
-         (pairs (mapcar #'cons items pred-promises)))
+  (let* ((pred-promises (cl-mapcar predicate items))
+         (pairs (cl-mapcar #'cons items pred-promises)))
     (concur:then
-     (concur:all (mapcar #'cdr pairs))
+     (concur:all (cl-mapcar #'cdr pairs))
      (lambda (results)
        (let (filtered-items)
          (cl-loop for (item . _) in pairs
@@ -411,18 +411,18 @@ Returns:
     (error "concur:retry: DELAY must be a number or function: %S" delay))
   (concur--validate-function pred 'concur:retry)
 
-  (concur:with-executor (lambda (resolve reject)
+  (concur:with-executor (lambda (resolve-fn reject-fn) 
     (let ((attempt 0))
       (cl-labels
           ((do-try ()
              (cl-incf attempt)
              (concur:then
               (funcall fn)
-              #'resolve ; On success, resolve the main promise.
+              (lambda (res) (funcall resolve-fn res)) ; Call local `resolve-fn` explicitly
               (lambda (err) ; On error, decide whether to retry.
                 (if (and (< attempt retries) (funcall pred err))
                     (delay-and-retry err)
-                  (funcall reject err)))))
+                  (funcall reject-fn err))))) ; Call local `reject-fn` explicitly
            (delay-and-retry (err)
              (let ((delay-sec (if (functionp delay)
                                   (funcall delay attempt err)

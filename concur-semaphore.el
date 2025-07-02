@@ -16,8 +16,12 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'concur-core)
+(require 'concur-cancel)
+(require 'concur-chain)
 (require 'concur-lock)
 (require 'concur-queue)
+(require 'concur-log)
+(require 'concur-combinators) ; For concur:timeout
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors
@@ -122,34 +126,22 @@ Arguments:
   pending acquisition.
 
 Returns:
-- (concur-promise): A promise that resolves to `t` on success.
-
-Signals:
-- `concur-invalid-semaphore-error` if `SEM` is not a valid semaphore."
+- (concur-promise): A promise that resolves to `t` on success."
   (concur--validate-semaphore sem 'concur:semaphore-acquire)
   (let (acquire-promise)
     (concur:with-mutex! (concur-semaphore-lock sem)
       (if (> (concur-semaphore-count sem) 0)
-          ;; Slot is available immediately.
           (progn
             (cl-decf (concur-semaphore-count sem))
-            (concur--log :debug (concur-semaphore-name sem)
-                         "Acquired slot immediately. Count: %d."
-                         (concur-semaphore-count sem))
             (setq acquire-promise (concur:resolved! t)))
-        ;; Slot is not available, queue a waiter promise.
         (setq acquire-promise (concur:make-promise :cancel-token cancel-token))
-        (concur-queue-enqueue (concur-semaphore-wait-queue sem) acquire-promise)
-        (concur--log :debug (concur-semaphore-name sem)
-                     "Queued for acquisition. Queue length: %d."
-                     (concur-queue-length (concur-semaphore-wait-queue sem)))
-        ;; If cancelled, remove promise from the wait queue.
+        (concur:queue-enqueue (concur-semaphore-wait-queue sem) acquire-promise)
         (when cancel-token
           (concur:cancel-token-add-callback
            cancel-token
            (lambda ()
              (concur:with-mutex! (concur-semaphore-lock sem)
-               (concur-queue-remove (concur-semaphore-wait-queue sem)
+               (concur:queue-remove (concur-semaphore-wait-queue sem)
                                     acquire-promise)))))))
     (if timeout (concur:timeout acquire-promise timeout) acquire-promise)))
 
@@ -162,11 +154,7 @@ Arguments:
 - `SEM` (concur-semaphore): The semaphore to release.
 
 Returns:
-- `nil`.
-
-Signals:
-- `concur-invalid-semaphore-error` if `SEM` is not a valid semaphore.
-- `error` if the semaphore is already at maximum capacity."
+- `nil`."
   (concur--validate-semaphore sem 'concur:semaphore-release)
   (let (waiter-promise)
     (concur:with-mutex! (concur-semaphore-lock sem)
@@ -174,21 +162,16 @@ Signals:
           (error "Cannot release semaphore '%s': at max capacity (%d)"
                  (concur-semaphore-name sem)
                  (concur-semaphore-max-count sem))
-        (setq waiter-promise (concur-queue-dequeue
+        (setq waiter-promise (concur:queue-dequeue
                               (concur-semaphore-wait-queue sem)))
         (unless waiter-promise
-          (cl-incf (concur-semaphore-count sem)))
-        (concur--log :debug (concur-semaphore-name sem)
-                     "Released slot. Count: %d."
-                     (concur-semaphore-count sem))))
-    ;; Resolve the waiter's promise outside the lock.
+          (cl-incf (concur-semaphore-count sem)))))
     (when waiter-promise (concur:resolve waiter-promise t))))
 
 ;;;###autoload
 (defmacro concur:with-semaphore! (sem-obj &rest body)
   "Execute BODY after acquiring a slot from `SEM-OBJ`.
-This macro ensures the acquired slot is always released, even if an
-error occurs within `BODY`.
+Ensures the acquired slot is always released, even if an error occurs.
 
 Arguments:
 - `SEM-OBJ` (concur-semaphore): The semaphore to acquire a slot from.
@@ -205,16 +188,13 @@ Returns:
 
 ;;;###autoload
 (defun concur:semaphore-get-count (sem)
-  "Return the current number of available slots in `SEM`. Non-blocking.
+  "Return the current number of available slots in `SEM`.
 
 Arguments:
 - `SEM` (concur-semaphore): The semaphore to inspect.
 
 Returns:
-- `(integer)`: The number of available slots.
-
-Signals:
-- `concur-invalid-semaphore-error` if `SEM` is not a valid semaphore."
+- `(integer)`: The number of available slots."
   (concur--validate-semaphore sem 'concur:semaphore-get-count)
   (concur-semaphore-count sem))
 
@@ -226,17 +206,14 @@ Arguments:
 - `SEM` (concur-semaphore): The semaphore to inspect.
 
 Returns:
-- (plist): A property list with semaphore metrics.
-
-Signals:
-- `concur-invalid-semaphore-error` if `SEM` is not a valid semaphore."
+- (plist): A property list with semaphore metrics."
   (interactive)
   (concur--validate-semaphore sem 'concur:semaphore-status)
   (concur:with-mutex! (concur-semaphore-lock sem)
     `(:name ,(concur-semaphore-name sem)
       :count ,(concur-semaphore-count sem)
       :max-count ,(concur-semaphore-max-count sem)
-      :pending-acquirers ,(concur-queue-length
+      :pending-acquirers ,(concur:queue-length
                            (concur-semaphore-wait-queue sem)))))
 
 (provide 'concur-semaphore)

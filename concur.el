@@ -31,11 +31,11 @@
 ;; - `concur-semaphore`: Implements counting semaphores for resource control.
 ;; - `concur-stream`: Offers asynchronous, buffered data streams.
 ;; - `concur-queue`: Provides a generic FIFO queue implementation.
-;; - `concur-pool`: Manages a persistent pool of background Lisp worker processes.
+;; - `concur-lisp`: Manages a persistent pool of background Lisp worker processes.
 ;; - `concur-shell`: Manages a persistent pool of background shell processes.
 ;; - `concur-graph`: Enables defining and executing asynchronous task dependency graphs.
 ;; - `concur-pipeline`: Provides a high-level macro for linear data-processing pipelines.
-;; - `concur-async`: Contains high-level async primitives for running tasks in
+;; - `concur-flow`: Contains high-level async primitives for running tasks in
 ;;   various execution contexts (`concur:start!`, `concur:async!`, `concur:parallel!`).
 ;; - `concur-nursery`: Implements structured concurrency using "nurseries" to
 ;;   manage groups of related tasks.
@@ -63,20 +63,21 @@
 (require 'concur-queue)
 (require 'concur-async)
 (require 'concur-microtask)
-(require 'concur-registry) ; Needs core, but core needs registry-update. OK.
-(require 'concur-core)     ; Foundational promise definitions
-(require 'concur-cancel)   ; Cancellation primitives (depends on core)
-(require 'concur-scheduler) ; Task scheduling (depends on core, queue)
-(require 'concur-semaphore) ; Resource control (depends on core, microtask, lock)
-(require 'concur-stream)   ; Data streams (depends on core, queue, lock)
-(require 'concur-chain)    ; Promise chaining primitives (depends on core, dash, ast)
-(require 'concur-combinators) ; Promise combinators (depends on core, chain, lock)
-(require 'concur-pool)     ; Lisp worker pool (depends on core, lock, priority-queue)
-(require 'concur-shell)    ; Shell worker pool (depends on core, chain, lock, queue, stream)
-(require 'concur-graph)    ; Dependency graphs (depends on core, chain, combinators)
-(require 'concur-pipeline) ; High-level pipelines (depends on core, graph, async, shell, chain)
-(require 'concur-flow)    ; High-level async execution (depends on core, chain, pool, graph, combinators, semaphore)
-(require 'concur-nursery)  ; Structured concurrency (depends on core, chain, cancel, async, combinators, registry, lock)
+(require 'concur-registry)
+(require 'concur-core)
+(require 'concur-cancel)
+(require 'concur-scheduler)
+(require 'concur-semaphore)
+(require 'concur-stream)
+(require 'concur-chain)
+(require 'concur-combinators)
+(require 'concur-abstract-pool)
+(require 'concur-lisp)     ; Lisp worker pool
+(require 'concur-shell)    ; Shell worker pool
+(require 'concur-graph)
+(require 'concur-pipeline)
+(require 'concur-flow)
+(require 'concur-nursery)
 
 ;; Load the coroutine bridge, which is essential for the async/await syntax.
 (require 'coroutines)        ; Core Emacs library for coroutines
@@ -105,8 +106,6 @@ inside a function defined with `concur:defasync!`.
   (declare (indent 1) (debug t))
   (concur--log :debug nil "Expanding concur:await! for promise: %S."
                promise-form)
-  ;; This macro expands to a `yield!` call with a special key that the
-  ;; `concur:from-coroutine` driver knows how to handle.
   `(yield! (list yield--await-external-status-key ,promise-form)))
 
 ;;;###autoload
@@ -131,11 +130,7 @@ like standard, sequential code.
     (concur--log :info nil "Defining async function: %S." name)
     `(defun ,name (,@arglist)
        ,docstring
-       ;; 1. The body of the user's function is wrapped in a coroutine.
-       ;;    Calling `coroutine-create` returns a "runner" function.
        (let ((coroutine-runner (coroutine-create (lambda () ,@body))))
-         ;; 2. The coroutine runner is then passed to `concur:from-coroutine`,
-         ;;    which wraps it in a promise and drives its execution until completion.
          (concur:from-coroutine coroutine-runner)))))
 
 ;;;###autoload
@@ -153,8 +148,7 @@ convenient async/await syntax. If the promise does not settle within
   - (any): The resolved value of the promise.
 
   Signals:
-  - `concur-timeout-error`: If the operation times out.
-  - `concur-await-error`: If the promise rejects."
+  - `concur-timeout-error`: If the operation times out."
   (declare (indent 1) (debug t))
   `(concur:await (concur:timeout ,promise-form ,timeout-seconds)))
 
@@ -172,8 +166,7 @@ the awaited operation will signal a `concur-cancel-error`.
   - (any): The resolved value of the promise.
 
   Signals:
-  - `concur-cancel-error`: If the linked token is cancelled.
-  - `concur-await-error`: If the promise rejects."
+  - `concur-cancel-error`: If the linked token is cancelled."
   (declare (indent 1) (debug t))
   `(concur:await (concur:cancel-token-link-promise ,cancel-token ,promise-form)))
 
@@ -182,7 +175,7 @@ the awaited operation will signal a `concur-cancel-error`.
 
 ;;;###autoload
 (defun concur:start-default-pools! ()
-  "Explicitly start the global `concur-pool` and `concur-shell` pools.
+  "Explicitly start the global `concur-lisp` and `concur-shell` pools.
 These pools are normally lazy-initialized on their first use. This command
 allows pre-emptive initialization, e.g., during Emacs startup.
 
@@ -190,15 +183,15 @@ allows pre-emptive initialization, e.g., during Emacs startup.
   - `nil` (side-effect: initializes pools)."
   (interactive)
   (concur--log :info nil "Explicitly starting default Concur pools...")
-  (when (fboundp 'concur-pool-get-default)
-    (concur-pool-get-default)) ; Accessing it initializes it.
-  (when (fboundp 'concur-shell-pool-get-default)
-    (concur-shell-pool-get-default)) ; Accessing it initializes it.
+  (when (fboundp 'concur--lisp-pool-get-default)
+    (concur--lisp-pool-get-default)) ; Accessing it initializes it.
+  (when (fboundp 'concur--shell-pool-get-default)
+    (concur--shell-pool-get-default)) ; Accessing it initializes it.
   (concur--log :info nil "Default Concur pools initialized."))
 
 ;;;###autoload
 (defun concur:stop-default-pools! ()
-  "Explicitly shut down the global `concur-pool` and `concur-shell` pools.
+  "Explicitly shut down the global `concur-lisp` and `concur-shell` pools.
 This gracefully terminates all worker processes and rejects any pending
 tasks within these pools. They will restart on next use.
 
@@ -206,8 +199,8 @@ tasks within these pools. They will restart on next use.
   - `nil` (side-effect: shuts down pools)."
   (interactive)
   (concur--log :info nil "Explicitly stopping default Concur pools...")
-  (when (fboundp 'concur:pool-shutdown!)
-    (concur:pool-shutdown!))
+  (when (fboundp 'concur:lisp-pool-shutdown!)
+    (concur:lisp-pool-shutdown!))
   (when (fboundp 'concur:shell-pool-shutdown!)
     (concur:shell-pool-shutdown!))
   (concur--log :info nil "Default Concur pools shut down."))

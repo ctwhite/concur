@@ -20,7 +20,12 @@
 (require 'concur-priority-queue)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Forward Declarations
+
+(declare-function concur:make-error "concur-core")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Errors & Customization
 
 (define-error 'concur-scheduler-error
   "A generic error related to a `concur-scheduler`."
@@ -29,9 +34,6 @@
 (define-error 'concur-invalid-scheduler-error
   "An operation was attempted on an invalid scheduler object."
   'concur-scheduler-error)
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Customization
 
 (defcustom concur-scheduler-default-batch-size 10
   "Default maximum number of tasks to process in one scheduler cycle."
@@ -52,6 +54,7 @@
   "Default maximum delay (in seconds) for the adaptive scheduler."
   :type '(float :min 0.0)
   :group 'concur)
+
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Data Structures
@@ -85,29 +88,17 @@ Fields:
 ;;; Internal Core Logic
 
 (defun concur--validate-scheduler (scheduler function-name)
-  "Signal an error if SCHEDULER is not a `concur-scheduler`.
-
-Arguments:
-- `SCHEDULER` (any): The object to validate.
-- `FUNCTION-NAME` (symbol): The name of the calling function for the error."
+  "Signal an error if SCHEDULER is not a `concur-scheduler`."
   (unless (concur-scheduler-p scheduler)
     (signal 'concur-invalid-scheduler-error
             (list (format "%s: Invalid scheduler object" function-name)
                   scheduler))))
 
 (defun concur--scheduler-default-delay-strategy (scheduler)
-  "Default strategy to compute the ideal idle timer delay.
-The delay is calculated based on queue size to be more responsive
-when the queue is full and less aggressive when it is empty.
-
-Arguments:
-- `SCHEDULER` (concur-scheduler): The scheduler instance.
-
-Returns:
-- (float): The computed delay in seconds."
+  "Default strategy to compute the ideal idle timer delay."
   (if (not (concur-scheduler-adaptive-delay-p scheduler))
       (concur-scheduler-min-delay scheduler)
-    (let* ((n (concur-priority-queue-length (concur-scheduler-queue scheduler)))
+    (let* ((n (concur:priority-queue-length (concur-scheduler-queue scheduler)))
            (min-d (concur-scheduler-min-delay scheduler))
            (max-d (concur-scheduler-max-delay scheduler))
            (computed-delay (/ 0.1 (max 0.1 (/ (log (1+ n)) (log 2))))))
@@ -115,10 +106,7 @@ Returns:
 
 (defun concur--scheduler-start-timer-if-needed (scheduler)
   "Start the idle timer for SCHEDULER if it is not already running.
-This function must be called from within the scheduler's lock.
-
-Arguments:
-- `SCHEDULER` (concur-scheduler): The scheduler to start."
+This function must be called from within the scheduler's lock."
   (unless (or (timerp (concur-scheduler-timer scheduler))
               (concur-scheduler-running-p scheduler))
     (let ((delay (funcall (concur-scheduler-delay-strategy-fn scheduler)
@@ -130,37 +118,24 @@ Arguments:
                    "Scheduler timer started with delay %.3fs." delay))))
 
 (defun concur--scheduler-timer-callback (scheduler)
-  "The main timer callback. It pops a batch and processes it.
-This function uses a `:running-p` flag to ensure processing ticks
-are discrete and to prevent re-entrancy issues.
-
-Arguments:
-- `SCHEDULER` (concur-scheduler): The scheduler instance."
+  "The main timer callback. It pops a batch and processes it."
   (let (batch-to-process)
-    ;; --- Phase 1: Set running flag and get work (LOCK HELD) ---
+    ;; Phase 1: Set running flag and get work (LOCK HELD).
     (concur:with-mutex! (concur-scheduler-lock scheduler)
       (setf (concur-scheduler-timer scheduler) nil)
-      ;; Mark as running to prevent `enqueue` from starting a competing timer.
       (setf (concur-scheduler-running-p scheduler) t)
       (setq batch-to-process
-            (concur-priority-queue-pop-n
+            (concur:priority-queue-pop-n
              (concur-scheduler-queue scheduler)
              (concur-scheduler-batch-size scheduler))))
-
-    ;; --- Phase 2: Process the batch (LOCK RELEASED) ---
-    ;; The lock is released here to allow the process function to enqueue
-    ;; new tasks without causing a deadlock.
+    ;; Phase 2: Process the batch (LOCK RELEASED).
     (when batch-to-process
       (funcall (concur-scheduler-process-fn scheduler) batch-to-process))
-
-    ;; --- Phase 3: Finish cycle and check for more work (LOCK HELD) ---
+    ;; Phase 3: Finish cycle and check for more work (LOCK HELD).
     (concur:with-mutex! (concur-scheduler-lock scheduler)
-      ;; Mark as no longer running before checking for more work.
       (setf (concur-scheduler-running-p scheduler) nil)
-      ;; Now, check if any work was enqueued *during* the processing phase.
-      (unless (concur-priority-queue-empty-p
+      (unless (concur:priority-queue-empty-p
                (concur-scheduler-queue scheduler))
-        ;; If so, start a completely new timer cycle.
         (concur--scheduler-start-timer-if-needed scheduler)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -179,9 +154,8 @@ Arguments:
 - `:NAME` (string): A descriptive name for the scheduler.
 - `:PROCESS-FN` (function): A mandatory function `(lambda (batch))`
   that defines how to process a batch of tasks.
-- `:PRIORITY-FN` (function): A function `(lambda (task) ...)` that returns
+- `:PRIORITY-FN` (function): A function `(lambda (task))` that returns
   a number representing the task's priority (lower is higher).
-  Defaults to `#'identity` if tasks are numbers.
 - `:BATCH-SIZE` (integer): Max tasks per cycle.
 - `:ADAPTIVE-DELAY-P` (boolean): Use adaptive idle timer delay.
 - `:MIN-DELAY` (float): Min adaptive delay (seconds).
@@ -190,11 +164,9 @@ Arguments:
   to compute the next timer delay.
 
 Returns:
-- (concur-scheduler): A newly created scheduler instance."
-  (unless (functionp process-fn)
-    (error ":process-fn must be a function"))
-  (unless (functionp priority-fn)
-    (error ":priority-fn must be a function"))
+- `(concur-scheduler)`: A newly created scheduler instance."
+  (unless (functionp process-fn) (error ":process-fn must be a function"))
+  (unless (functionp priority-fn) (error ":priority-fn must be a function"))
   (let* ((id (gensym (or name "scheduler-")))
          (scheduler
           (%%make-scheduler
@@ -216,35 +188,15 @@ Returns:
 
 ;;;###autoload
 (defun concur:scheduler-enqueue (scheduler task)
-  "Add a `TASK` to the `SCHEDULER`'s queue and start it if needed.
-
-Arguments:
-- `SCHEDULER` (concur-scheduler): The scheduler instance.
-- `TASK` (any): The task to add to the queue.
-
-Returns:
-- `nil`.
-
-Signals:
-- `concur-invalid-scheduler-error` if `SCHEDULER` is not valid."
+  "Add a `TASK` to the `SCHEDULER`'s queue and start it if needed."
   (concur--validate-scheduler scheduler 'concur:scheduler-enqueue)
   (concur:with-mutex! (concur-scheduler-lock scheduler)
-    (concur-priority-queue-insert (concur-scheduler-queue scheduler) task)
+    (concur:priority-queue-insert (concur-scheduler-queue scheduler) task)
     (concur--scheduler-start-timer-if-needed scheduler)))
 
 ;;;###autoload
 (defun concur:scheduler-stop (scheduler)
-  "Stop the `SCHEDULER`'s timer, preventing further processing.
-This function is idempotent.
-
-Arguments:
-- `SCHEDULER` (concur-scheduler): The scheduler instance to stop.
-
-Returns:
-- `nil`.
-
-Signals:
-- `concur-invalid-scheduler-error` if `SCHEDULER` is not valid."
+  "Stop the `SCHEDULER`'s timer, preventing further processing."
   (concur--validate-scheduler scheduler 'concur:scheduler-stop)
   (concur:with-mutex! (concur-scheduler-lock scheduler)
     (when-let ((timer (concur-scheduler-timer scheduler)))
@@ -254,20 +206,11 @@ Signals:
 
 ;;;###autoload
 (defun concur:scheduler-status (scheduler)
-  "Return a snapshot of the `SCHEDULER`'s current status.
-
-Arguments:
-- `SCHEDULER` (concur-scheduler): The scheduler to inspect.
-
-Returns:
-- (plist): A property list with scheduler metrics.
-
-Signals:
-- `concur-invalid-scheduler-error` if `SCHEDULER` is not valid."
+  "Return a snapshot of the `SCHEDULER`'s current status."
   (concur--validate-scheduler scheduler 'concur:scheduler-status)
   (concur:with-mutex! (concur-scheduler-lock scheduler)
     `(:id ,(concur-scheduler-id scheduler)
-      :queue-length ,(concur-priority-queue-length
+      :queue-length ,(concur:priority-queue-length
                       (concur-scheduler-queue scheduler))
       :is-running-p ,(concur-scheduler-running-p scheduler)
       :has-timer-p ,(timerp (concur-scheduler-timer scheduler)))))
