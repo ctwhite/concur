@@ -178,7 +178,7 @@ Returns:
   (unless (gethash target-node nodes)
     (signal 'concur-graph-node-not-found-error
             (list "Target node not found in graph" target-node)))
-  (concur--log :info nil "Starting graph execution for target '%S'." target-node)
+  (concur-log :info nil "Starting graph execution for target '%S'." target-node)
 
   (cl-labels ((execute-node-memo (node-name)
                 (let ((node (gethash node-name nodes)))
@@ -190,7 +190,7 @@ Returns:
                       (let* ((deps (concur-graph-node-dependencies node))
                              ;; Recursively get promises for dependencies.
                              (dep-promises (mapcar #'execute-node-memo deps)))
-                        (concur--log :debug nil "Executing node '%S' (deps: %S)."
+                        (concur-log :debug nil "Executing node '%S' (deps: %S)."
                                      node-name deps)
                         ;; Store new promise immediately for memoization.
                         (setf (concur-graph-node-promise node)
@@ -207,7 +207,7 @@ Returns:
                                      (unless executor
                                        (signal 'concur-graph-unknown-executor-error
                                                (list "No executor for type" type)))
-                                     (concur--log :debug nil "Node '%S' running." node-name)
+                                     (concur-log :debug nil "Node '%S' running." node-name)
                                      ;; Execute task via its executor.
                                      (funcall executor form dep-alist))))))))))
     ;; Start execution from the target node.
@@ -256,7 +256,7 @@ Signals:
          (show-p (plist-get body :show))
          (nodes (concur--graph-parse-let-block (cadr let-block))))
 
-    (concur--log :debug nil "Parsing task graph for target %S." target-node)
+    (concur-log :debug nil "Parsing task graph for target %S." target-node)
     (concur--graph-detect-cycle nodes) ; Signals error on cycle.
 
     (if show-p
@@ -264,7 +264,7 @@ Signals:
           (concur--graph-visualize nodes target-node)
           `(concur:resolved! ',(format "Graph for %S visualized." target-node)))
       (progn
-        (concur--log :info nil "Generating graph exec for target %S." target-node)
+        (concur-log :info nil "Generating graph exec for target %S." target-node)
         `(concur--graph-run ',nodes ',executors ',target-node ,cancel-token)))))
 
 ;;;###autoload

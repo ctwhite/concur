@@ -93,7 +93,6 @@ available throughout an Emacs session."
             `(lambda ()
                (concur--abstract-worker-entry-point
                 #'concur--lisp-task-executor-fn nil))
-            ;; CORRECTED: Explicitly list all dependencies for the worker.
             :require '(concur-lisp
                        concur-abstract-pool))))
 

@@ -90,13 +90,13 @@ Signals:
     (concur:then
      (concur:all-settled (concur-nursery-child-promises nursery))
      (lambda (results)
-       (concur--log :debug (concur-promise-id master-promise)
+       (concur-log :debug (concur-promise-id master-promise)
                     "All nursery children settled. Checking outcomes.")
        (if-let ((failure (-find-if (lambda (r) (eq (plist-get r :status) 'rejected))
                                   results)))
            (concur:reject master-promise (plist-get failure :reason))
          (concur:resolve master-promise body-result))))
-    (concur--log :debug (concur-promise-id master-promise)
+    (concur-log :debug (concur-promise-id master-promise)
                  "Nursery '%S' blocking until all children complete."
                  (concur-nursery-name nursery))
     (concur:await master-promise)))
@@ -142,7 +142,7 @@ Signals:
                            (concur:make-semaphore
                             ,concurrency
                             (format "nursery-sem-%S" nursery-name))))))
-       (concur--log :info (concur-nursery-name ,nursery-obj)
+       (concur-log :info (concur-nursery-name ,nursery-obj)
                     "Nursery created (concurrency: %s)."
                     (or ,concurrency "unlimited"))
        ;; Use unwind-protect to guarantee we wait for children, even if the
@@ -186,14 +186,14 @@ Returns:
                  :cancel-token (concur-nursery-cancel-token nursery)
                  keys)))
 
-    (concur--log :debug (concur-promise-id task-promise)
+    (concur-log :debug (concur-promise-id task-promise)
                  "Task started in nursery '%S'." (concur-nursery-name nursery))
 
     ;; If this task fails, it triggers cancellation for the entire nursery.
     (concur:catch
      task-promise
      (lambda (err)
-       (concur--log :warn (concur-promise-id task-promise)
+       (concur-log :warn (concur-promise-id task-promise)
                     "Task in nursery '%S' failed. Cancelling nursery. Error: %S"
                     (concur-nursery-name nursery) err)
        (concur:cancel-token-cancel (concur-nursery-cancel-token nursery))))

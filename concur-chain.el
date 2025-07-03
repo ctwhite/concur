@@ -98,7 +98,7 @@ Returns:
              (let ((fmt (if (and steps (stringp (car steps)))
                             (pop steps) "concur:chain log: %S")))
                (push `(:tap (lambda (val err)
-                              (concur--log :info nil ,fmt (or val err))))
+                              (concur-log :info nil ,fmt (or val err))))
                      processed)))
             (_ (push key processed)
              (when steps (push (pop steps) processed))))))

@@ -91,7 +91,7 @@ Returns:
 - (concur-future): A new `concur-future` object."
   (declare (indent 1) (debug t))
   `(let ((id (gensym "future-")))
-     (concur--log :debug nil "Creating future %S in mode %S." id ,mode)
+     (concur-log :debug nil "Creating future %S in mode %S." id ,mode)
      (%%make-future
       :lock (concur:make-lock (format "future-lock-%S" id) :mode ,mode)
       :mode ,mode
@@ -130,13 +130,13 @@ Returns:
 
     ;; If we got a thunk, we are responsible for running it outside the lock.
     (when thunk-to-run
-      (concur--log :info nil "Forcing future - executing thunk for first time.")
+      (concur-log :info nil "Forcing future - executing thunk for first time.")
       (condition-case err
           (let ((thunk-result (funcall thunk-to-run)))
             ;; The result can be another promise/future. `resolve` handles this.
             (concur:resolve promise-to-return thunk-result))
         (error
-         (concur--log :error nil "Future thunk failed synchronously: %S" err)
+         (concur-log :error nil "Future thunk failed synchronously: %S" err)
          (concur:reject
           promise-to-return
           (concur:make-error :type :executor-error
@@ -161,7 +161,7 @@ Returns:
 Signals:
 - `concur-error` on rejection or timeout."
   (concur--validate-future future 'concur:future-get)
-  (concur--log :info nil "Getting result for future (timeout: %S)." timeout)
+  (concur-log :info nil "Getting result for future (timeout: %S)." timeout)
   (concur:await (concur:force future) timeout))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -179,7 +179,7 @@ Arguments:
 Returns:
 - (concur-future): A new, already-evaluated future."
   (let ((promise (concur:resolved! value :mode mode)))
-    (concur--log :debug nil "Creating pre-resolved future with value %S." value)
+    (concur-log :debug nil "Creating pre-resolved future with value %S." value)
     (%%make-future :promise promise :evaluated-p t :mode mode
                    :lock (concur:make-lock "future-resolved-lock" :mode mode))))
 
@@ -195,7 +195,7 @@ Arguments:
 Returns:
 - (concur-future): A new, already-evaluated future."
   (let ((promise (concur:rejected! error :mode mode)))
-    (concur--log :debug nil "Creating pre-rejected future with error %S." error)
+    (concur-log :debug nil "Creating pre-rejected future with error %S." error)
     (%%make-future :promise promise :evaluated-p t :mode mode
                    :lock (concur:make-lock "future-rejected-lock" :mode mode))))
 

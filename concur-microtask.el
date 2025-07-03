@@ -94,7 +94,7 @@ Arguments:
   that were dropped from the queue."
   (let ((msg (format "Microtask queue overflow (capacity: %d)"
                      concur-microtask-queue-capacity)))
-    (concur--log :warn nil "Microtask queue overflow: %d dropped."
+    (concur-log :warn nil "Microtask queue overflow: %d dropped."
                  (length overflowed-callbacks))
     (dolist (cb overflowed-callbacks)
       (when-let ((promise (concur-callback-target-promise cb)))
@@ -124,7 +124,7 @@ The logic proceeds in phases:
             concur--global-microtask-queue))
   (let ((tick (concur-microtask-queue-drain-tick-counter
                concur--global-microtask-queue)))
-    (concur--log :debug nil "Microtask drain tick %d starting." tick)
+    (concur-log :debug nil "Microtask drain tick %d starting." tick)
 
     ;; Phase 2: Lock, grab a batch of tasks, and immediately unlock.
     (let ((batch)
@@ -137,10 +137,10 @@ The logic proceeds in phases:
 
       ;; Phase 3: Execute the batch without holding the lock.
       (when batch
-        (concur--log :debug nil "Processing %d microtasks in tick %d." (length batch) tick)
+        (concur-log :debug nil "Processing %d microtasks in tick %d." (length batch) tick)
         (dolist (cb batch)
           (condition-case err (concur-execute-callback cb)
-            (error (concur--log :error nil "Unhandled error in microtask: %S" err))))))
+            (error (concur-log :error nil "Unhandled error in microtask: %S" err))))))
 
     ;; Phase 4: Lock again to check for more work and reschedule if needed.
     (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
@@ -150,7 +150,7 @@ The logic proceeds in phases:
                          concur--global-microtask-queue)))
           (setf (concur-microtask-queue-drain-scheduled-p
                  concur--global-microtask-queue) t)
-          (concur--log :debug nil "More microtasks remain; rescheduling drain.")
+          (concur-log :debug nil "More microtasks remain; rescheduling drain.")
           (run-with-timer 0 nil #'concur--drain-microtask-queue))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

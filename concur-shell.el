@@ -44,11 +44,11 @@ Fields:
   "The shell executable used inside the worker process.")
 
 (defun concur--shell-run-command-process (command context)
-  "Start a shell process to execute COMMAND with CONTEXT.
+  "Start a shell process to execute `COMMAND` with `CONTEXT`.
 
 Arguments:
-  COMMAND (string): The shell command to execute.
-  CONTEXT (plist): A plist containing :cwd and :timeout.
+  `COMMAND` (string): The shell command to execute.
+  `CONTEXT` (plist): A plist containing :cwd and :timeout.
 
 Returns:
   (process): The process object for the running command."
@@ -61,18 +61,19 @@ Returns:
     proc))
 
 (defun concur--shell-await-command-result (proc context)
-  "Wait for PROC to finish and return its output.
+  "Wait for `PROC` to finish and return its output.
 
 Arguments:
-  PROC (process): The process to wait for.
-  CONTEXT (plist): A plist containing the :timeout.
+  `PROC` (process): The process to wait for.
+  `CONTEXT` (plist): A plist containing the :timeout.
 
 Returns:
   (string): The cleaned standard output of the command.
 
 Signals:
   `error`: If the command times out or returns a non-zero exit status."
-  (let* ((timeout (or (plist-get context :timeout) concur-shell-default-timeout))
+  (let* ((timeout (or (plist-get context :timeout)
+                      concur-shell-default-timeout))
          (output-buffer (process-get proc 'output-buffer))
          (exit-code 0)
          (cleaned-result ""))
@@ -106,8 +107,8 @@ Signals:
 This is the core logic that runs in the background process.
 
 Arguments:
-  PAYLOAD (string): The shell command string to execute.
-  CONTEXT (plist): Additional data, including :cwd and :timeout.
+  `PAYLOAD` (string): The shell command string to execute.
+  `CONTEXT` (plist): Additional data, including :cwd and :timeout.
 
 Returns:
   (string): The standard output of the executed command if successful."
@@ -121,19 +122,19 @@ Returns:
   "Create a new Emacs worker process for the shell pool.
 
 Arguments:
-  WORKER (concur-abstract-worker): The worker struct to populate.
-  SHELL-PROGRAM (string): The shell executable (e.g., \"/bin/bash\").
+  `WORKER` (concur-abstract-worker): The worker struct to populate.
+  `SHELL-PROGRAM` (string): The shell executable (e.g., \"/bin/bash\").
 
 Returns:
-  nil. Populates the process slot of WORKER."
+  nil. Populates the process slot of `WORKER`."
   (let ((worker-script
          `(lambda ()
             (setq-local concur--shell-program ,shell-program)
             (concur--abstract-worker-entry-point
              #'concur--shell-task-executor-fn nil))))
     (setf (concur-abstract-worker-process worker)
-          ;; REGRESSION FIX: Explicitly pass the parent's `load-path` to ensure
-          ;; the worker can find all required libraries.
+          ;; REGRESSION FIX: Explicitly pass the parent's `load-path` to
+          ;; ensure the worker can find all required libraries.
           (concur:async-launch worker-script
                                :require '(concur-shell)
                                :load-path load-path))))
@@ -143,9 +144,9 @@ Returns:
 It buffers partial lines and dispatches full lines based on IPC prefixes.
 
 Arguments:
-  WORKER (concur-abstract-worker): The worker sending output.
-  CHUNK (string): The string of output received.
-  POOL (concur-abstract-pool): The parent pool.
+  `WORKER` (concur-abstract-worker): The worker sending output.
+  `CHUNK` (string): The string of output received.
+  `POOL` (concur-abstract-pool): The parent pool.
 
 Returns:
   nil."
@@ -173,7 +174,7 @@ Returns:
   "Parse a JSON result string from a worker.
 
 Arguments:
-  S (string): The raw JSON string `{\"id\":...,\"result\":...}`.
+  `S` (string): The raw JSON string `{\"id\":...,\"result\":...}`.
 
 Returns:
   The extracted result value."
@@ -184,7 +185,7 @@ Returns:
   "Parse a JSON error string from a worker.
 
 Arguments:
-  S (string): The raw JSON string `{\"id\":...,\"error\":...}`.
+  `S` (string): The raw JSON string `{\"id\":...,\"error\":...}`.
 
 Returns:
   (concur-error): The deserialized error object."
@@ -204,7 +205,8 @@ Returns:
   (concur-shell-pool): The default shell worker pool instance."
   (unless (and *concur-default-shell-pool*
                (concur-abstract-pool-p *concur-default-shell-pool*)
-               (not (concur-abstract-pool-shutdown-p *concur-default-shell-pool*)))
+               (not (concur-abstract-pool-shutdown-p
+                     *concur-default-shell-pool*)))
     (setq *concur-default-shell-pool* (concur:shell-pool-create)))
   *concur-default-shell-pool*)
 
@@ -212,8 +214,8 @@ Returns:
   "Create and initialize a new shell worker pool.
 
 Arguments:
-  :shell-program (string): The shell executable (e.g., \"/bin/bash\").
-  :size (integer): The number of worker processes in the pool.
+  `:SHELL-PROGRAM` (string): The shell executable (e.g., \"/bin/bash\").
+  `:SIZE` (integer): The number of worker processes in the pool.
 
 Returns:
   (concur-shell-pool): A new, initialized shell worker pool instance."
@@ -236,13 +238,13 @@ Returns:
 ;;; Public API
 
 (cl-defun concur:shell-submit-task (pool command &key cwd timeout)
-  "Submit a COMMAND string to the shell POOL for asynchronous execution.
+  "Submit a `COMMAND` string to the shell `POOL` for asynchronous execution.
 
 Arguments:
-  POOL (concur-shell-pool): The pool to submit the task to.
-  COMMAND (string): The shell command string to execute.
-  :cwd (string): The working directory for the command.
-  :timeout (number): A timeout in seconds for the command.
+  `POOL` (concur-shell-pool): The pool to submit the task to.
+  `COMMAND` (string): The shell command string to execute.
+  `:CWD` (string): The working directory for the command.
+  `:TIMEOUT` (number): A timeout in seconds for the command.
 
 Returns:
   (concur-promise): A promise that resolves with the command's stdout."
@@ -250,11 +252,11 @@ Returns:
    pool command :context `(:cwd ,cwd :timeout ,timeout)))
 
 (defmacro concur:shell! (command-string &rest keys)
-  "Run COMMAND-STRING in the default shell pool. A convenient shorthand.
+  "Run `COMMAND-STRING` in the default shell pool. A convenient shorthand.
 
 Arguments:
-  COMMAND-STRING (string): The shell command to run.
-  KEYS (plist): Keyword arguments for `concur:shell-submit-task`,
+  `COMMAND-STRING` (string): The shell command to run.
+  `KEYS` (plist): Keyword arguments for `concur:shell-submit-task`,
     such as :cwd or :timeout.
 
 Returns:
@@ -264,10 +266,10 @@ Returns:
           (concur--shell-pool-get-default) ,command-string ',keys))
 
 (defun concur:shell-pool-shutdown! (&optional pool)
-  "Shut down the shell worker pool.
+  "Shut down the shell worker `POOL`.
 
 Arguments:
-  POOL (concur-shell-pool): The pool to shut down. If nil, shuts down the
+  `POOL` (concur-shell-pool): The pool to shut down. If nil, shuts down the
     default global pool.
 
 Returns:

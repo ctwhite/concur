@@ -84,7 +84,7 @@ Returns:
     (error "Semaphore count must be a non-negative integer: %S" n))
   (let* ((sem-name (or name (format "sem-%S" (gensym))))
          (sem-lock (concur:make-lock (format "sem-lock-%s" sem-name))))
-    (concur--log :debug sem-name "Creating semaphore with %d slots." n)
+    (concur-log :debug sem-name "Creating semaphore with %d slots." n)
     (%%make-semaphore :count n :max-count n :name sem-name
                       :lock sem-lock :wait-queue (concur-queue-create))))
 
@@ -107,7 +107,7 @@ Signals:
         (cl-decf (concur-semaphore-count sem))
         (setq acquired-p t)))
     (when acquired-p
-      (concur--log :debug (concur-semaphore-name sem)
+      (concur-log :debug (concur-semaphore-name sem)
                    "Acquired slot via try-acquire. Count: %d."
                    (concur-semaphore-count sem)))
     acquired-p))

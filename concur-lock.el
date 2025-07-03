@@ -136,7 +136,7 @@ Signals:
                           :native-mutex (make-mutex lock-name)))
             (:deferred
              (%%make-lock :name lock-name :mode mode)))))
-    (concur--log :debug (concur-lock-name new-lock) "Created lock.")
+    (concur-log :debug (concur-lock-name new-lock) "Created lock.")
     new-lock))
 
 ;;;###autoload
@@ -168,7 +168,7 @@ Signals:
              (setf (concur-lock-locked-p lock) t)
              (setf (concur-lock-owner lock) effective-owner))
          (error "Could not acquire cooperative lock %s" (concur-lock-name lock)))))
-    (concur--log :debug (concur-lock-name lock) "Acquired lock by %S."
+    (concur-log :debug (concur-lock-name lock) "Acquired lock by %S."
                  (concur-lock-owner lock))
     (concur--lock-track-resource :acquire lock)
     t))
@@ -206,7 +206,7 @@ Signals:
              (setq acquired-p t))
          (setq acquired-p nil))))
     (when acquired-p
-      (concur--log :debug (concur-lock-name lock) "Acquired lock by %S."
+      (concur-log :debug (concur-lock-name lock) "Acquired lock by %S."
                    (concur-lock-owner lock))
       (concur--lock-track-resource :acquire lock))
     acquired-p))
@@ -238,7 +238,7 @@ Signals:
     (pcase (concur-lock-mode lock)
       (:thread (mutex-unlock (concur-lock-native-mutex lock)))
       (:deferred (setf (concur-lock-locked-p lock) nil)))
-    (concur--log :debug (concur-lock-name lock) "Released lock by %S."
+    (concur-log :debug (concur-lock-name lock) "Released lock by %S."
                  effective-owner)
     t))
 

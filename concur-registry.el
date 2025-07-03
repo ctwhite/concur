@@ -119,7 +119,7 @@ This must be called from within the `concur--promise-registry-lock`."
     (let ((oldest-promise (concur:queue-dequeue
                            concur--promise-registry-fifo-queue)))
       (when oldest-promise
-        (concur--log :debug nil "Registry full. Evicting oldest promise: %S"
+        (concur-log :debug nil "Registry full. Evicting oldest promise: %S"
                      (concur-promise-id oldest-promise))
         (remhash (concur-promise-id oldest-promise)
                  concur--promise-id-to-promise-map)
@@ -145,7 +145,7 @@ Arguments:
                  concur--promise-id-to-promise-map)
         (push (cons (float-time) (concur-promise-state promise))
               (concur-promise-meta-status-history meta))
-        (concur--log :debug (concur-promise-id promise) "Registered promise '%s'."
+        (concur-log :debug (concur-promise-id promise) "Registered promise '%s'."
                      (or name "--unnamed--"))
         (when (and parent-promise (concur-promise-p parent-promise))
           (when-let ((parent-meta (gethash parent-promise concur--promise-registry)))
@@ -167,7 +167,7 @@ Arguments:
                 (concur-promise-meta-status-history meta))
           (concur:queue-enqueue concur--promise-registry-fifo-queue promise)
           (concur--registry-evict-oldest-settled)
-          (concur--log :debug (concur-promise-id promise)
+          (concur-log :debug (concur-promise-id promise)
                        "Updated promise '%s' to state %S."
                        (or (concur-promise-meta-name meta) "--unnamed--")
                        (concur-promise-state promise)))))))
@@ -182,7 +182,7 @@ Arguments:
     (concur:with-mutex! concur--promise-registry-lock
       (when-let ((meta (gethash promise concur--promise-registry)))
         (cl-pushnew resource (concur-promise-meta-resources-held meta))
-        (concur--log :debug (concur-promise-id promise)
+        (concur-log :debug (concur-promise-id promise)
                      "Promise acquired resource %S." (type-of resource))))))
 
 (defun concur-registry-release-resource-hold (promise resource)
@@ -196,7 +196,7 @@ Arguments:
       (when-let ((meta (gethash promise concur--promise-registry)))
         (setf (concur-promise-meta-resources-held meta)
               (cl-delete resource (concur-promise-meta-resources-held meta)))
-        (concur--log :debug (concur-promise-id promise)
+        (concur-log :debug (concur-promise-id promise)
                      "Promise released resource %S." (type-of resource))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -293,7 +293,7 @@ Returns:
     (clrhash concur--promise-registry)
     (clrhash concur--promise-id-to-promise-map)
     (setq concur--promise-registry-fifo-queue (concur-queue-create)))
-  (concur--log :info nil "Concur promise registry cleared."))
+  (concur-log :info nil "Concur promise registry cleared."))
 
 ;;;###autoload
 (defun concur:dump-registry ()
@@ -351,7 +351,7 @@ Returns:
             (when (and concur-enable-promise-registry
                        concur-registry-shutdown-on-exit-p)
               (concur:with-mutex! concur--promise-registry-lock
-                (concur--log :info nil "Registry: Rejecting pending promises on exit.")
+                (concur-log :info nil "Registry: Rejecting pending promises on exit.")
                 (cl-loop for p being the hash-keys of concur--promise-registry
                          when (concur:pending-p p) do
                          (concur:reject

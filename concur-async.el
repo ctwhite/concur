@@ -58,12 +58,12 @@ Used only by `concur:async-start`.")
   "Represents a single-shot task sent to a temporary worker.
 
 Fields:
-  id (string): The unique ID for this task.
-  promise (concur-promise): The promise to be settled with the result.
-  process (process): The OS process running this task.
-  timeout-timer (timer): An optional timer for process timeouts.
-  task-form (form): The original Lisp form executed by the worker.
-  task-vars (alist): Variables bound during worker execution."
+- `id` (string): The unique ID for this task.
+- `promise` (concur-promise): The promise to be settled with the result.
+- `process` (process): The OS process running this task.
+- `timeout-timer` (timer): An optional timer for process timeouts.
+- `task-form` (form): The original Lisp form executed by the worker.
+- `task-vars` (alist): Variables bound during worker execution."
   id promise process
   (timeout-timer nil :type (or null timer))
   (task-form nil)
@@ -78,7 +78,7 @@ This function, called inside the worker, sets up the `load-path`
 and `require`s specified by the parent process.
 
 Arguments:
-  TASK-LISP (plist): The payload sent from the parent."
+- `TASK-LISP` (plist): The payload sent from the parent."
   (let ((load-path (plist-get task-lisp :load-path))
         (features (plist-get task-lisp :require)))
     (dolist (path load-path) (add-to-list 'load-path path))
@@ -88,7 +88,7 @@ Arguments:
   "Report a fatal, unexpected error from within a worker process.
 
 Arguments:
-  ERR (error): The error condition to report."
+- `ERR` (error): The error condition to report."
   (let ((fatal-error
          (concur:make-error
           :type 'concur-async-worker-error
@@ -145,12 +145,12 @@ then responsible for printing S-expressions to stdout."
 ;;; Internal: Process Management
 
 (defun concur-async--reject-with-context (promise err-obj task)
-  "Reject a task's PROMISE, enhancing the ERR-OBJ with context from TASK.
+  "Reject a task's `PROMISE`, enhancing the `ERR-OBJ` with context from `TASK`.
 
 Arguments:
-  PROMISE (concur-promise): The promise to reject.
-  ERR-OBJ (concur-error): The error to report.
-  TASK (concur-async-task): The task that failed."
+- `PROMISE` (concur-promise): The promise to reject.
+- `ERR-OBJ` (concur-error): The error to report.
+- `TASK` (concur-async-task): The task that failed."
   (when (concur-error-p err-obj)
     (unless (concur-error-cmd err-obj)
       (setf (concur-error-cmd err-obj)
@@ -165,8 +165,8 @@ Arguments:
 It parses the single S-expression response and resolves the promise.
 
 Arguments:
-  PROC (process): The worker process.
-  STRING (string): The output received from the process."
+- `PROC` (process): The worker process.
+- `STRING` (string): The output received from the process."
   (let ((buffer (process-get proc 'filter-buffer)))
     (unless buffer
       (setq buffer (generate-new-buffer
@@ -200,8 +200,8 @@ Arguments:
 Handles unexpected termination and rejects the associated promise.
 
 Arguments:
-  PROC (process): The worker process that died.
-  EVENT (string): A string describing the termination event."
+- `PROC` (process): The worker process that died.
+- `EVENT` (string): A string describing the termination event."
   (dolist (task (hash-table-values concur-async--tasks))
     (when (eq proc (concur-async-task-process task))
       (when-let (timer (concur-async-task-timeout-timer task))
@@ -219,12 +219,12 @@ Arguments:
 
 (defun concur-async--stream-filter (proc string stream)
   "Process filter for streaming tasks (`concur:async-stream`).
-Parses S-expressions from output and writes them to STREAM.
+Parses S-expressions from output and writes them to `STREAM`.
 
 Arguments:
-  PROC (process): The worker process.
-  STRING (string): The output received from the process.
-  STREAM (concur-stream): The stream to write data chunks to."
+- `PROC` (process): The worker process.
+- `STRING` (string): The output received from the process.
+- `STREAM` (concur-stream): The stream to write data chunks to."
   (let ((buffer (process-get proc 'filter-buffer)))
     (unless buffer
       (setq buffer (generate-new-buffer
@@ -246,11 +246,11 @@ Arguments:
 Closes the stream on clean exit or errors it on unexpected termination.
 
 Arguments:
-  PROC (process): The worker process that died.
-  EVENT (string): A string describing the termination event.
-  STREAM (concur-stream): The stream associated with the process.
-  TASK-FORM (form): The original Lisp form executed by the worker.
-  TASK-VARS (alist): Variables bound during worker execution."
+- `PROC` (process): The worker process that died.
+- `EVENT` (string): A string describing the termination event.
+- `STREAM` (concur-stream): The stream associated with the process.
+- `TASK-FORM` (form): The original Lisp form executed by the worker.
+- `TASK-VARS` (alist): Variables bound during worker execution."
   (when-let (timer (process-get proc 'concur-async-timeout-timer))
     (cancel-timer timer))
   (let* ((stderr-buffer (process-get proc 'stderr-buffer))
@@ -274,17 +274,17 @@ Arguments:
   "Launch a subordinate Emacs process. (Low-level primitive).
 
 Arguments:
-  START-FUNC (list): The lambda expression to `funcall` on startup.
-  :name (string): Optional name for the subprocess.
-  :filter (function): Optional process filter function.
-  :sentinel (function): Optional sentinel for process exit handling.
-  :emacs-path (string): Path to the Emacs executable to use.
-  :load-path (list): Paths to add to the worker's `load-path` via `-L`.
-  :require (list): A list of features to `require` via the `-l` flag.
-  :env (alist): Environment variables for the worker `(\"KEY\" . \"VAL\")`.
+- `START-FUNC` (list): The lambda expression to `funcall` on startup.
+- `:NAME` (string): Optional name for the subprocess.
+- `:FILTER` (function): Optional process filter function.
+- `:SENTINEL` (function): Optional sentinel for process exit handling.
+- `:EMACS-PATH` (string): Path to the Emacs executable to use.
+- `:LOAD-PATH` (list): Paths to add to the worker's `load-path` via `-L`.
+- `:REQUIRE` (list): A list of features to `require` via the `-l` flag.
+- `:ENV` (alist): Environment variables for the worker `(\"KEY\" . \"VAL\")`.
 
 Returns:
-  (process): The newly created Emacs worker process."
+- `(process)`: The newly created Emacs worker process."
   (let* ((exec (or emacs-path concur-async-emacs-executable))
          (proc-name (or name "concur-worker")))
     (unless (and exec (executable-find exec))
@@ -325,21 +325,21 @@ Returns:
 
 (cl-defun concur:async-start (form &key vars cancel-token load-path require
                                     timeout env)
-  "Execute FORM in a subordinate Emacs process, returning a promise.
+  "Execute `FORM` in a subordinate Emacs process, returning a promise.
 This is for a single-shot task. For streaming or high-throughput
 work, use `concur:async-stream` or a worker pool.
 
 Arguments:
-  FORM (form): The Lisp form to execute in the background.
-  :vars (alist): An alist of `(symbol . value)` pairs to `let`-bind around FORM.
-  :cancel-token (concur-cancel-token): A token to cancel the process.
-  :load-path (list): Paths to add to the worker's `load-path`.
-  :require (list): Features to `require` in the worker.
-  :timeout (number): Seconds to wait before killing the process and rejecting.
-  :env (alist): Environment variables for the worker `(\"KEY\" . \"VAL\")`.
+- `FORM` (form): The Lisp form to execute in the background.
+- `:VARS` (alist): An alist of `(symbol . value)` pairs to `let`-bind around `FORM`.
+- `:CANCEL-TOKEN` (concur-cancel-token): A token to cancel the process.
+- `:LOAD-PATH` (list): Paths to add to the worker's `load-path`.
+- `:REQUIRE` (list): Features to `require` in the worker.
+- `:TIMEOUT` (number): Seconds to wait before killing the process and rejecting.
+- `:ENV` (alist): Environment variables for the worker `(\"KEY\" . \"VAL\")`.
 
 Returns:
-  (concur-promise): A promise that resolves with the result of FORM."
+- `(concur-promise)`: A promise that resolves with the result of `FORM`."
   (let* ((id (format "async-task-%s" (make-temp-name "")))
          (proc (concur:async-launch 'concur-async-batch-invoke
                                     :name (format "concur-worker-batch-%s" id)
@@ -357,7 +357,7 @@ Returns:
             (run-at-time
              timeout nil
              (lambda ()
-               (concur--log :warn nil "Async task %S timed out." id)
+               (concur-log :warn nil "Async task %S timed out." id)
                (when (process-live-p proc) (delete-process proc))
                (concur-async--reject-with-context
                 promise (concur:make-error :type 'concur-async-timeout) task)))))
@@ -366,7 +366,7 @@ Returns:
       (concur:cancel-token-add-callback
        cancel-token
        (lambda ()
-         (concur--log :info nil "Cancellation requested for async task %S." id)
+         (concur-log :info nil "Cancellation requested for async task %S." id)
          (when (process-live-p proc) (delete-process proc))
          (concur-async--reject-with-context
           promise (concur:make-error :type 'concur-cancel-error) task))))
@@ -378,21 +378,21 @@ Returns:
 
 (cl-defun concur:async-stream (form &key vars cancel-token load-path require
                                      timeout env)
-  "Execute FORM in a subordinate process, returning a stream of its output.
+  "Execute `FORM` in a subordinate process, returning a stream of its output.
 Each S-expression `prin1`'d to stdout by the worker becomes an item
 in the returned stream.
 
 Arguments:
-  FORM (form): The Lisp form to execute in the background.
-  :vars (alist): An alist of `(symbol . value)` pairs to `let`-bind around FORM.
-  :cancel-token (concur-cancel-token): A token to cancel the process.
-  :load-path (list): Paths to add to the worker's `load-path`.
-  :require (list): Features to `require` in the worker.
-  :timeout (number): Seconds to wait before killing the process and erroring.
-  :env (alist): Environment variables for the worker `(\"KEY\" . \"VAL\")`.
+- `FORM` (form): The Lisp form to execute in the background.
+- `:VARS` (alist): An alist of `(symbol . value)` pairs to `let`-bind around `FORM`.
+- `:CANCEL-TOKEN` (concur-cancel-token): A token to cancel the process.
+- `:LOAD-PATH` (list): Paths to add to the worker's `load-path`.
+- `:REQUIRE` (list): Features to `require` in the worker.
+- `:TIMEOUT` (number): Seconds to wait before killing the process and erroring.
+- `:ENV` (alist): Environment variables for the worker `(\"KEY\" . \"VAL\")`.
 
 Returns:
-  (concur-stream): A stream that emits items from the worker."
+- `(concur-stream)`: A stream that emits items from the worker."
   (let* ((stream (concur:stream-create))
          (proc-name (format "concur-worker-stream-%s" (concur-stream-name stream)))
          (proc (concur:async-launch
@@ -410,7 +410,7 @@ Returns:
        (run-at-time
         timeout nil
         (lambda ()
-          (concur--log :warn nil "Async stream %S timed out."
+          (concur-log :warn nil "Async stream %S timed out."
                        (concur-stream-name stream))
           (when (process-live-p proc) (delete-process proc))
           (concur:stream-error

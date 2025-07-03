@@ -52,7 +52,7 @@ Returns:
 
         (when step-name
           (push `(:tap (lambda (val err)
-                         (concur--log :info nil "[Pipeline START] %s" ,step-name)))
+                         (concur-log :info nil "[Pipeline START] %s" ,step-name)))
                 expanded-steps))
 
         (pcase step
@@ -78,7 +78,7 @@ Returns:
 
         (when step-name
           (push `(:tap (lambda (val err)
-                         (concur--log :info nil "[Pipeline END]   %s -> %S"
+                         (concur-log :info nil "[Pipeline END]   %s -> %S"
                                       ,step-name (or val err))))
                 expanded-steps))))
     (nreverse expanded-steps)))
@@ -114,7 +114,7 @@ Returns:
   step, or rejects if any step fails."
   (declare (indent 1) (debug t))
   (unless (listp steps) (error "STEPS must be a list. Got: %S" steps))
-  (concur--log :info nil "Defining pipeline with %d steps." (length steps))
+  (concur-log :info nil "Defining pipeline with %d steps." (length steps))
 
   ;; Use a `shell-session` to ensure all :shell steps run in the same
   ;; stateful environment, preserving CWD, env vars, etc.

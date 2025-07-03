@@ -45,16 +45,16 @@ This applies when `concur-log-hook` is not set. Log levels are
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Internal Default Logger
 
-(defvar concur--log-level-values
-  '((:debug . 0) (:info . 1) (:warn . 2) (:error . 3) (:fatal . 4) (:none . 100)) ; Added missing levels
+(defvar concur-log-level-values
+  '((:debug . 0) (:info . 1) (:warn . 2) (:error . 3) (:fatal . 4) (:none . 100)) 
   "Alist mapping log level keywords to integer values for comparison.")
 
 (defun concur--get-log-level-value (level)
   "Return the integer value for a given log LEVEL keyword.
 Returns -1 for unknown levels."
-  (cdr (assoc level concur--log-level-values)))
+  (cdr (assoc level concur-log-level-values)))
 
-(defun concur--default-log-function (level target-symbol fmt &rest args) ; **FIXED: Added target-symbol**
+(defun concur--default-log-function (level target-symbol fmt &rest args) 
   "Default log function that prints messages to `*Messages*` buffer.
 Messages are printed if `LEVEL` is equal to or more severe than
 `concur-log-default-level`.
@@ -67,20 +67,20 @@ Arguments:
   (when (>= (concur--get-log-level-value level)
             (concur--get-log-level-value concur-log-default-level))
     (let* ((prefix (pcase level
-                     (:trace "[debrief:trace] ") ; Using debrief-style prefixes for clarity
-                     (:debug "[debrief:debug] ")
-                     (:info "[debrief:info] ")
-                     (:warn "[debrief:warn] ")
-                     (:error "[debrief:error] ")
-                     (:fatal "[debrief:fatal] ")
-                     (_ (format "[debrief:%S]" level))))
-           (target-prefix (if target-symbol (format "[%s] " target-symbol) ""))) ; Added target prefix
+                     (:trace "[concur:trace] ") 
+                     (:debug "[concur:debug] ")
+                     (:info "[concur:info] ")
+                     (:warn "[concur:warn] ")
+                     (:error "[concur:error] ")
+                     (:fatal "[concur:fatal] ")
+                     (_ (format "[concur:%S]" level))))
+           (target-prefix (if target-symbol (format "[%s] " target-symbol) ""))) 
       (apply #'message (concat "Concur " prefix target-prefix fmt) args)))) 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Public API
 
-(defun concur--log (level target-symbol fmt &rest args) 
+(defun concur-log (level target-symbol fmt &rest args) 
   "Run the `concur-log-hook` with LEVEL, TARGET-SYMBOL, FMT, and ARGS.
 If `concur-log-hook` is empty, it falls back to `concur--default-log-function`.
 This is the internal entry point for all of Concur's logging needs.
@@ -90,7 +90,7 @@ Arguments:
 - `TARGET-SYMBOL` (symbol|nil): The target symbol this log pertains to.
 - `FMT` (string): The format-control string for the message.
 - `ARGS` (rest): Arguments for the format string."
-  (interactive "sLog Level (debug/info/warn/error): \nsFormat string: \n") ; interactive args need to be adapted if used directly
+  (interactive "sLog Level (debug/info/warn/error): \nsFormat string: \n")
   (if concur-log-hook
       (apply #'run-hook-with-args 'concur-log-hook level target-symbol fmt args) 
     (apply #'concur--default-log-function level target-symbol fmt args))) 

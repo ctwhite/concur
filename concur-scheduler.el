@@ -114,7 +114,7 @@ This function must be called from within the scheduler's lock."
       (setf (concur-scheduler-timer scheduler)
             (run-with-idle-timer delay nil #'concur--scheduler-timer-callback
                                  scheduler))
-      (concur--log :debug (concur-scheduler-id scheduler)
+      (concur-log :debug (concur-scheduler-id scheduler)
                    "Scheduler timer started with delay %.3fs." delay))))
 
 (defun concur--scheduler-timer-callback (scheduler)
@@ -183,7 +183,7 @@ Returns:
           (concur-priority-queue-create
            :comparator (lambda (a b) (< (funcall priority-fn a)
                                         (funcall priority-fn b)))))
-    (concur--log :info (concur-scheduler-id scheduler) "Scheduler created.")
+    (concur-log :info (concur-scheduler-id scheduler) "Scheduler created.")
     scheduler))
 
 ;;;###autoload
@@ -202,7 +202,7 @@ Returns:
     (when-let ((timer (concur-scheduler-timer scheduler)))
       (cancel-timer timer)
       (setf (concur-scheduler-timer scheduler) nil)
-      (concur--log :info (concur-scheduler-id scheduler) "Scheduler stopped."))))
+      (concur-log :info (concur-scheduler-id scheduler) "Scheduler stopped."))))
 
 ;;;###autoload
 (defun concur:scheduler-status (scheduler)

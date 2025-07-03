@@ -11,8 +11,8 @@
 ;; -----------------------
 ;;
 ;; The core of this library is the `concur:process` function, which creates
-;; and manages an external process, returning a `concur-promise` that represents
-;; the entire lifecycle of that process.
+;; and manages an external process, returning a `concur-promise` that
+;; represents the entire lifecycle of that process.
 ;;
 ;; Key features include:
 ;;
@@ -30,12 +30,13 @@
 ;;     information, and captured output, simplifying debugging.
 ;;
 ;; 4.  **Resource Management**: All associated resources (timers, I/O streams,
-;;     temporary files, process buffers) are meticulously cleaned up automatically
-;;     when the process terminates, is cancelled, or times out.
+;;     temporary files, process buffers) are meticulously cleaned up
+;;     automatically when the process terminates, is cancelled, or times out.
 ;;
-;; 5.  **High-Level Macros**: Provides convenience macros like `concur:command`
-;;     (for simple command-and-response workflows) and `concur:pipe!` (for
-;;     executing stateful command sequences in the same shell environment).
+;; 5.  **High-Level Macros**: Provides convenience macros like
+;;     `concur:command` (for simple command-and-response workflows) and
+;;     `concur:pipe!` (for executing stateful command sequences in the same
+;;     shell environment).
 ;;
 ;; 6.  **Cancellation & Timeout**: Integrated support for cancelling processes
 ;;     via `concur-cancel-token`s and enforcing execution timeouts.
@@ -49,11 +50,13 @@
 (require 'subr-x)     ; Extended Emacs Lisp built-in functions
 (require 'ansi-color) ; For handling ANSI escape codes in process output
 (require 'f)          ; File system utilities
-(require 'cl-extra)   ; Explicitly require cl-extra for cl-serialize-error/deserialize-error
+(require 'cl-extra)   ; Explicitly require cl-extra for
+                      ; cl-serialize-error/deserialize-error
 
 ;; Concur-specific libraries
 (require 'concur-core)        ; Core promise implementation
-(require 'concur-chain)       ; Promise chaining primitives and high-level flow control
+(require 'concur-chain)       ; Promise chaining primitives and high-level
+                              ; flow control
 (require 'concur-combinators) ; Promise combinators (e.g., all, race)
 (require 'concur-lock)        ; Concurrency locks/mutexes
 (require 'concur-log)         ; Concur-specific logging utility
@@ -66,27 +69,40 @@
 ;; to represent process results and internal state.
 
 ;; Custom error types for process-related failures
-(define-error 'concur-process-error "A generic error during external process execution." 'concur-error)
-(define-error 'concur-process-creation-error "Failed to create the external process." 'concur-process-error)
-(define-error 'concur-process-cancelled "External process was cancelled." 'concur-process-error)
-(define-error 'concur-process-timeout "External process execution timed out." 'concur-process-error)
-(define-error 'concur-process-exit-error "External process exited with a non-zero status code." 'concur-process-error)
-(define-error 'concur-process-signal-error "External process was terminated by a signal." 'concur-process-error)
-(define-error 'concur-process-stdin-error "An error occurred while writing to process stdin." 'concur-process-error)
-(define-error 'concur-process-stderr-output-error "A command produced output on stderr when none was expected." 'concur-process-error)
-(define-error 'concur-pipe-error "An error occurred during sequential pipe execution." 'concur-process-error)
+(define-error 'concur-process-error
+  "A generic error during external process execution." 'concur-error)
+(define-error 'concur-process-creation-error
+  "Failed to create the external process." 'concur-process-error)
+(define-error 'concur-process-cancelled
+  "External process was cancelled." 'concur-process-error)
+(define-error 'concur-process-timeout
+  "External process execution timed out." 'concur-process-error)
+(define-error 'concur-process-exit-error
+  "External process exited with a non-zero status code." 'concur-process-error)
+(define-error 'concur-process-signal-error
+  "External process was terminated by a signal." 'concur-process-error)
+(define-error 'concur-process-stdin-error
+  "An error occurred while writing to process stdin." 'concur-process-stdin-error)
+(define-error 'concur-process-stderr-output-error
+  "A command produced output on stderr when none was expected."
+  'concur-process-stderr-output-error)
+(define-error 'concur-pipe-error
+  "An error occurred during sequential pipe execution." 'concur-process-error)
 
-;; `concur-process-result` struct: Represents the successful outcome of a process
+;; `concur-process-result` struct: Represents the successful outcome of a
+;; process
 (cl-defstruct (concur-process-result
                (:constructor make-concur-process-result)
                (:copier nil))
   "Represents the successful result of an external process execution.
-This object is the resolution value of a promise returned by `concur:process`.
+This object is the resolution value of a promise returned by
+`concur:process`.
 
 Fields:
 - `cmd` (string): The command executable that was run.
 - `args` (list): The list of arguments passed to the command.
-- `exit-code` (integer): The final exit code of the process (usually 0 for success).
+- `exit-code` (integer): The final exit code of the process (usually 0 for
+  success).
 - `stdout-stream` (concur-stream): The stream for standard output. Use
   `concur:stream-drain` or `concur:stream-for-each` to consume its content.
 - `stderr-stream` (concur-stream): The stream for standard error.
@@ -108,14 +124,17 @@ Fields:
   Invoked immediately as data arrives.
 - `on-stderr-user-cb` (function): User-provided callback for stderr chunks.
   Invoked immediately as data arrives.
-- `stdout-stream` (concur-stream): The internal stream where stdout data is buffered.
-- `stderr-stream` (concur-stream): The internal stream where stderr data is buffered."
+- `stdout-stream` (concur-stream): The internal stream where stdout data is
+  buffered.
+- `stderr-stream` (concur-stream): The internal stream where stderr data is
+  buffered."
   (on-stdout-user-cb nil :type (or null function))
   (on-stderr-user-cb nil :type (or null function))
   (stdout-stream nil :type (or null concur-stream))
   (stderr-stream nil :type (or null concur-stream)))
 
-;; `concur-process-state` struct: Internal state management for an executing process
+;; `concur-process-state` struct: Internal state management for an executing
+;; process
 (cl-defstruct (concur-process-state
                (:constructor %%make-concur-process-state)
                (:copier nil))
@@ -123,9 +142,10 @@ Fields:
 This struct holds all necessary runtime information about a spawned process.
 
 Fields:
-- `promise` (concur-promise): The top-level promise associated with this process,
-  which will be settled upon process termination.
-- `process` (process): The actual Emacs `process` object created by `make-process`.
+- `promise` (concur-promise): The top-level promise associated with this
+  process, which will be settled upon process termination.
+- `process` (process): The actual Emacs `process` object created by
+  `make-process`.
 - `command` (string): The base command executable string.
 - `args` (list): Arguments passed to the command.
 - `cwd` (string): The current working directory for the process.
@@ -133,13 +153,19 @@ Fields:
 - `io` (concur-process-io): The struct holding I/O configuration and streams.
 - `stdin-data` (string): Data string to be sent to the process's stdin.
 - `stdin-file` (string): A file path from which to stream data to stdin.
-- `stdin-buffer` (buffer): A temporary buffer used when streaming stdin from data/file.
-- `stdin-read-pos` (marker): A marker tracking the current read position in `stdin-buffer`.
-- `stdin-send-timer` (timer): Timer for chunked stdin sending, ensuring non-blocking I/O.
-- `die-on-error` (boolean): If `t`, the promise is rejected on non-zero exit code.
+- `stdin-buffer` (buffer): A temporary buffer used when streaming stdin from
+  data/file.
+- `stdin-read-pos` (marker): A marker tracking the current read position in
+  `stdin-buffer`.
+- `stdin-send-timer` (timer): Timer for chunked stdin sending, ensuring
+  non-blocking I/O.
+- `die-on-error` (boolean): If `t`, the promise is rejected on non-zero
+  exit code.
 - `timeout-timer` (timer): Timer to enforce specified execution timeouts.
-- `cancel-token` (concur-cancel-token): Token for external cancellation signals.
-- `stdin-temp-file-path` (string): Path to a temporary file created for `stdin-data`."
+- `cancel-token` (concur-cancel-token): Token for external cancellation
+  signals.
+- `stdin-temp-file-path` (string): Path to a temporary file created for
+  `stdin-data`."
   (promise nil :type (or null concur-promise))
   (process nil :type (or null process))
   (command nil :type string)
@@ -171,19 +197,19 @@ Fields:
   "A list of temporary file paths to be deleted by the cleanup timer.")
 
 (defun concur--proc-delete-file-if-exists (file-path)
-  "Delete FILE-PATH if it exists, logging any errors during the operation."
+  "Delete `FILE-PATH` if it exists, logging any errors during the operation."
   (when (and file-path (file-exists-p file-path))
     (condition-case err
         (delete-file file-path)
       (error
-       (concur--log :error nil "Failed to delete temp file %s: %S"
+       (concur-log :error nil "Failed to delete temp file %s: %S"
                     file-path err)))))
 
 (defun concur--proc-schedule-file-for-deletion (file)
-  "Add a FILE to a global list for deferred, thread-safe deletion.
+  "Add a `FILE` to a global list for deferred, thread-safe deletion.
 A cleanup timer will be started if not already running."
   (when file
-    (concur--log :debug nil "Scheduling temp file for deletion: %s" file)
+    (concur-log :debug nil "Scheduling temp file for deletion: %s" file)
     (concur:with-mutex! concur--proc-cleanup-lock
       (push file concur--proc-files-to-delete)
       ;; Start the cleanup timer if it's not already active
@@ -195,7 +221,7 @@ A cleanup timer will be started if not already running."
 (defun concur--proc-process-deletions ()
   "Process the list of files scheduled for deletion.
 This function is typically run by `concur--proc-cleanup-timer`."
-  (concur--log :debug nil "Running deferred file deletion task.")
+  (concur-log :debug nil "Running deferred file deletion task.")
   (concur:with-mutex! concur--proc-cleanup-lock
     (let ((files-to-process concur--proc-files-to-delete))
       (setq concur--proc-files-to-delete '()) ; Clear the list under lock
@@ -220,10 +246,11 @@ This function is typically run by `concur--proc-cleanup-timer`."
                                             signal
                                             process-status)
   "Centralized function to reject a process promise with a rich error object.
-Ensures streams are errored and the top-level promise is rejected consistently."
+Ensures streams are errored and the top-level promise is rejected
+consistently."
   (let* ((promise (concur-process-state-promise process-state))
          (io (concur-process-state-io process-state)))
-    (concur--log :error (concur-promise-id promise)
+    (concur-log :error (concur-promise-id promise)
                  "Rejecting process promise: %s" message)
     (let ((error-obj
            (concur:make-error
@@ -254,13 +281,15 @@ Rejects the promise with a `concur-process-creation-error`."
      'concur-process-creation-error msg :cause err)))
 
 (defun concur--proc-get-signal-from-event (event-string)
-  "Parse a process sentinel EVENT-STRING to extract a signal name (e.g., 'SIGKILL')."
+  "Parse a process sentinel `EVENT-STRING` to extract a signal name (e.g.,
+'SIGKILL')."
   (when (string-match "signal-killed-by-\\(SIG[A-Z]+\\)" event-string)
     (match-string 1 event-string)))
 
 (defun concur--proc-finalize-promise (process-state event)
-  "Finalize the promise based on the process termination event.
-Checks for signals, exit codes, and resolves or rejects the promise accordingly."
+  "Finalize the promise based on the process termination `EVENT`.
+Checks for signals, exit codes, and resolves or rejects the promise
+accordingly."
   (let* ((promise (concur-process-state-promise process-state))
          (proc (concur-process-state-process process-state))
          (cmd (concur-process-state-command process-state))
@@ -283,7 +312,7 @@ Checks for signals, exit codes, and resolves or rejects the promise accordingly.
        :exit-code exit-code :process-status (process-status proc)))
      ;; Otherwise, success (exit code 0 or `die-on-error` is nil)
      (t
-      (concur--log :info (concur-promise-id promise)
+      (concur-log :info (concur-promise-id promise)
                    "Resolving process promise with exit code %d" exit-code)
       (concur:resolve
        promise
@@ -295,8 +324,9 @@ Checks for signals, exit codes, and resolves or rejects the promise accordingly.
 
 (defun concur--proc-cleanup-resources (process-state)
   "Clean up internal timers, temporary buffers, and scheduled temp files
-associated with a finished process. This is crucial for preventing resource leaks."
-  (concur--log :debug (concur-promise-id
+associated with a finished process. This is crucial for preventing
+resource leaks."
+  (concur-log :debug (concur-promise-id
                        (concur-process-state-promise process-state))
                "Cleaning up process resources.")
   ;; Cancel any active timers
@@ -322,7 +352,7 @@ associated with a finished process. This is crucial for preventing resource leak
 ;; communication with external processes and trigger promise settlement.
 
 (defun concur--proc-cleanup-buffers (process)
-  "Kill the stdout and stderr buffers created by Emacs for a process.
+  "Kill the stdout and stderr buffers created by Emacs for a `PROCESS`.
 These are different from the `concur-stream` buffers."
   (when-let (buf (process-buffer process))
     (when (buffer-live-p buf) (kill-buffer buf)))
@@ -330,13 +360,14 @@ These are different from the `concur-stream` buffers."
     (when (buffer-live-p buf) (kill-buffer buf))))
 
 (defun concur--proc-sentinel (process event)
-  "The main process sentinel. This is the central coordinator for process teardown.
-It's called by Emacs when the process state changes (e.g., exits, signals)."
+  "The main process sentinel. This is the central coordinator for process
+teardown. It's called by Emacs when the `PROCESS` state changes (e.g.,
+exits, signals)."
   (when (memq (process-status process) '(exit signal finished))
     (when-let ((process-state (process-get process 'concur-process-state)))
       (let* ((promise (concur-process-state-promise process-state))
              (io (concur-process-state-io process-state)))
-        (concur--log :debug (concur-promise-id promise)
+        (concur-log :debug (concur-promise-id promise)
                      "Sentinel fired for %S (event: '%s')"
                      (process-name process) event)
 
@@ -355,10 +386,11 @@ It's called by Emacs when the process state changes (e.g., exits, signals)."
           (concur--proc-finalize-promise process-state event))))))
 
 (defun concur--proc-dispatch-to-stream (process chunk stream-type)
-  "Dispatch a CHUNK of data from PROCESS to the correct user callback and `concur-stream`.
-This function is called by process filters (stdout/stderr)."
+  "Dispatch a `CHUNK` of data from `PROCESS` to the correct user callback
+and `concur-stream`. This function is called by process filters
+(stdout/stderr)."
   (when-let ((process-state (process-get process 'concur-process-state)))
-    (let* ((io (concur-process-state-io process-state))
+    (let* ((io (concur-process-io-io process-state))
            (stream (if (eq stream-type :stdout)
                        (concur-process-io-stdout-stream io)
                      (concur-process-io-stderr-stream io)))
@@ -370,13 +402,13 @@ This function is called by process filters (stdout/stderr)."
 
       ;; Write chunk to the internal concur-stream
       (when stream
-        (concur--log :trace (concur-promise-id
+        (concur-log :trace (concur-promise-id
                              (concur-process-state-promise process-state))
                      "Dispatching %s chunk of %d bytes"
                      stream-type (length chunk))
         (let ((write-result (concur:stream-write stream chunk)))
-          ;; If stream-write returns a promise (e.g., if stream buffer is full),
-          ;; handle its potential rejection.
+          ;; If stream-write returns a promise (e.g., if stream buffer is
+          ;; full), handle its potential rejection.
           (when (eq (type-of write-result) 'concur-promise)
             (concur:then write-result nil
                          (lambda (err)
@@ -385,11 +417,11 @@ This function is called by process filters (stdout/stderr)."
                             "Output stream write failed" :cause err)))))))))
 
 (defun concur--proc-stdout-filter (process chunk)
-  "Process filter for standard output. Dispatches chunks to `concur-stream`."
+  "Process filter for standard output. Dispatches `CHUNKS` to `concur-stream`."
   (concur--proc-dispatch-to-stream process chunk :stdout))
 
 (defun concur--proc-stderr-filter (process chunk)
-  "Process filter for standard error. Dispatches chunks to `concur-stream`."
+  "Process filter for standard error. Dispatches `CHUNKS` to `concur-stream`."
   (concur--proc-dispatch-to-stream process chunk :stderr))
 
 (defun concur--proc-read-from-stdin-buffer (process-state)
@@ -404,7 +436,8 @@ This function is driven by an idle timer for non-blocking stdin streaming."
           (if (>= (marker-position pos-marker) (point-max))
               ;; All data sent, send EOF to the process
               (progn
-                (concur--log :debug nil "Finished streaming stdin; sending EOF to %S." proc)
+                (concur-log :debug nil
+                             "Finished streaming stdin; sending EOF to %S." proc)
                 (process-send-eof proc)
                 ;; Cancel the timer once all stdin is sent
                 (when-let (timer (concur-process-state-stdin-send-timer
@@ -436,7 +469,7 @@ Sets up a temporary buffer and an idle timer to send data in chunks."
       (cond
        ;; Stream from a file
        (stdin-file
-        (concur--log :debug nil "Setting up stdin streaming from file: %s"
+        (concur-log :debug nil "Setting up stdin streaming from file: %s"
                      stdin-file)
         (unless (file-exists-p stdin-file)
           (concur--proc-reject-promise
@@ -465,7 +498,7 @@ Sets up a temporary buffer and an idle timer to send data in chunks."
             :cause err))))
        ;; Stream from a data string (by writing to a temp file first)
        (stdin-data
-        (concur--log :debug nil "Setting up stdin from data string.")
+        (concur-log :debug nil "Setting up stdin from data string.")
         (condition-case err
             (let ((temp-file (make-temp-file "concur-stdin-")))
               (with-temp-file temp-file (insert stdin-data))
@@ -482,39 +515,40 @@ Sets up a temporary buffer and an idle timer to send data in chunks."
        (t (process-send-eof proc))))))
 
 (defun concur--proc-setup-timeout (process-state timeout)
-  "Set up a timer that kills the process and rejects its promise on timeout."
+  "Set up a timer that kills the process and rejects its promise on `TIMEOUT`."
   (when timeout
     (let* ((promise (concur-process-state-promise process-state))
            (proc (concur-process-state-process process-state))
            (cmd (concur-process-state-command process-state)))
-      (concur--log :debug (concur-promise-id promise)
+      (concur-log :debug (concur-promise-id promise)
                    "Setting process timeout: %Ss" timeout)
       (setf (concur-process-state-timeout-timer process-state)
             (run-at-time
              timeout nil
              (lambda ()
-               (concur--log :warn (concur-promise-id promise)
+               (concur-log :warn (concur-promise-id promise)
                             "Process timed out after %Ss" timeout)
                (when (process-live-p proc)
-                 (ignore-errors (kill-process proc)) ; Attempt to kill the process
+                 (ignore-errors (kill-process proc)) ; Attempt to kill
+                                                     ; the process
                  (concur--proc-reject-promise
                   process-state 'concur-process-timeout
                   (format "Command '%s' timed out after %Ss." cmd timeout)
-                  :cause "timeout"))))))))
+                  :cause "timeout")))))))
 
 (defun concur--proc-setup-cancellation (process-state cancel-token)
   "Set up a handler that kills the process and rejects its promise
-when the provided `cancel-token` is signaled."
+when the provided `CANCEL-TOKEN` is signaled."
   (when cancel-token
     (let* ((promise (concur-process-state-promise process-state))
            (proc (concur-process-state-process process-state))
            (cmd (concur-process-state-command process-state)))
-      (concur--log :debug (concur-promise-id promise)
+      (concur-log :debug (concur-promise-id promise)
                    "Setting up cancellation handler.")
       (concur:cancel-token-add-callback
        cancel-token
        (lambda ()
-         (concur--log :info (concur-promise-id promise)
+         (concur-log :info (concur-promise-id promise)
                       "Cancellation requested for process %S." proc)
          (when (process-live-p proc)
            (ignore-errors (kill-process proc)) ; Attempt to kill the process
@@ -530,11 +564,12 @@ when the provided `cancel-token` is signaled."
 
 (defun concur--spawn-standard-process (promise plist)
   "Orchestrates the creation and configuration of a standard Emacs process.
-This function is called by `concur:process` when a persistent shell is not used."
+This function is called by `concur:process` when a persistent shell is
+not used."
   (let* ((command (plist-get plist :command))
          (args (plist-get plist :args))
          (cwd (or (plist-get plist :cwd) default-directory)))
-    (concur--log :info (concur-promise-id promise) "Spawning command: %s %s"
+    (concur-log :info (concur-promise-id promise) "Spawning command: %s %s"
                  command (s-join " " args))
 
     (let* ((io (%%make-concur-process-io
@@ -554,8 +589,10 @@ This function is called by `concur:process` when a persistent shell is not used.
           ;; Attempt to create the Emacs process
           (let* ((proc-env (if-let ((env (concur-process-state-env
                                           process-state)))
-                               ;; Merge custom environment with existing process-environment
-                               (append (--map (format "%s=%s" (car it) (cdr it)) env)
+                               ;; Merge custom environment with existing
+                               ;; process-environment
+                               (append (--map (format "%s=%s" (car it) (cdr it))
+                                              env)
                                        process-environment)
                              process-environment))
                  (stderr-buf (generate-new-buffer
@@ -569,12 +606,15 @@ This function is called by `concur:process` when a persistent shell is not used.
                    :stderr stderr-buf                   ; Buffer for stderr
                    :sentinel #'concur--proc-sentinel    ; Main process sentinel
                    :filter #'concur--proc-stdout-filter ; Filter for stdout data
-                   :stderr-filter #'concur--proc-stderr-filter ; Filter for stderr data
+                   :stderr-filter #'concur--proc-stderr-filter ; Filter for stderr
+                                                          ; data
                    :noquery t :connection-type 'pipe :coding 'utf-8
                    :current-directory cwd :environment proc-env)))
-            ;; Store process-state on the Emacs process object for retrieval in filters/sentinel
+            ;; Store process-state on the Emacs process object for retrieval
+            ;; in filters/sentinel
             (process-put proc 'concur-process-state process-state)
-            (process-put proc 'concur-stderr-buffer stderr-buf) ; Store stderr buffer reference
+            (process-put proc 'concur-stderr-buffer stderr-buf) ; Store stderr
+                                                                ; buffer reference
             ;; Update process-state with the created Emacs process
             (setf (concur-process-state-process process-state) proc)
             ;; Associate the Emacs process with the Concur promise
@@ -604,28 +644,34 @@ completion. This result object contains the final exit code and the
 `concur-stream`s for stdout and stderr, which you can then consume.
 
 Arguments:
-  PLIST (plist): A property list of options:
-  - `:command` (string or list): The command and its initial arguments
+  `PLIST` (plist): A property list of options:
+  - `:COMMAND` (string or list): The command and its initial arguments
     (e.g., `\"git status\"` or `(\"git\" \"status\")`).
-  - `:args` (list, optional): Additional arguments to append to the command.
-  - `:cwd` (string, optional): Working directory. Defaults to `default-directory`.
-  - `:env` (alist, optional): Environment variables, e.g., `'((\"VAR\" . \"val\"))`.
-  - `:stdin` (string, optional): Data to send to standard input.
-  - `:stdin-file` (string, optional): Path to a file to stream to stdin.
-  - `:on-stdout` (function, optional): A callback `(lambda (chunk))` invoked for each
-    chunk of stdout data as it arrives. Useful for real-time output processing.
-  - `:on-stderr` (function, optional): A callback `(lambda (chunk))` for stderr.
-  - `:persistent` (boolean, optional): If non-nil, use a persistent shell from
+  - `:ARGS` (list, optional): Additional arguments to append to the command.
+  - `:CWD` (string, optional): Working directory. Defaults to
+    `default-directory`.
+  - `:ENV` (alist, optional): Environment variables, e.g.,
+    `'((\"VAR\" . \"val\"))`.
+  - `:STDIN` (string, optional): Data to send to standard input.
+  - `:STDIN-FILE` (string, optional): Path to a file to stream to stdin.
+  - `:ON-STDOUT` (function, optional): A callback `(lambda (chunk))` invoked
+    for each chunk of stdout data as it arrives. Useful for real-time
+    output processing.
+  - `:ON-STDERR` (function, optional): A callback `(lambda (chunk))` for
+    stderr.
+  - `:PERSISTENT` (boolean, optional): If non-nil, use a persistent shell from
     `concur-shell.el`. This is faster for frequent, small commands but
     offers less isolation.
-  - `:timeout` (number, optional): Timeout in seconds. If the process runs longer,
-    it will be killed and the promise rejected with a `concur-process-timeout` error.
-  - `:cancel-token` (concur-cancel-token, optional): A token to cancel the process.
-    If the token is signaled, the promise is rejected with a `concur-process-cancelled` error.
-  - `:die-on-error` (boolean, optional): If non-nil (the default), the promise is
-    rejected if the process exits with a non-zero status code. Set to `nil` to
-    resolve successfully even with non-zero exit codes.
-  - `:mode` (symbol, optional): Promise concurrency mode (default `:async`).
+  - `:TIMEOUT` (number, optional): Timeout in seconds. If the process runs
+    longer, it will be killed and the promise rejected with a
+    `concur-process-timeout` error.
+  - `:CANCEL-TOKEN` (concur-cancel-token, optional): A token to cancel the
+    process. If the token is signaled, the promise is rejected with a
+    `concur-process-cancelled` error.
+  - `:DIE-ON-ERROR` (boolean, optional): If non-nil (the default), the
+    promise is rejected if the process exits with a non-zero status code.
+    Set to `nil` to resolve successfully even with non-zero exit codes.
+  - `:MODE` (symbol, optional): Promise concurrency mode (default `:async`).
 
 Returns:
   (concur-promise): A promise for the `concur-process-result`."
@@ -646,8 +692,9 @@ Returns:
                    :cancel-token (plist-get plist :cancel-token)
                    :mode (or (plist-get plist :mode) :async))))
 
-    ;; Always execute as a standard, non-persistent Emacs process for `concur:process`.
-    ;; Users wanting persistent shells should explicitly call concur:shell-submit-command.
+    ;; Always execute as a standard, non-persistent Emacs process for
+    ;; `concur:process`. Users wanting persistent shells should explicitly
+    ;; call concur:shell-submit-command.
     (concur--spawn-standard-process promise final-plist)
     promise))
 
@@ -656,8 +703,9 @@ Returns:
 ;; Convenience macros built on top of `concur:process` for common patterns.
 
 (defun concur--proc-helper-parse-command-and-keys (command-form keys)
-  "Internal helper to parse COMMAND-FORM and merge KEYWORD arguments.
-Extracts the base command, its arguments, and a processed plist of other keys."
+  "Internal helper to parse `COMMAND-FORM` and merge `KEYWORD` arguments.
+Extracts the base command, its arguments, and a processed plist of
+other keys."
   (let (cmd cmd-args)
     ;; Determine base command and its initial arguments
     (if (stringp command-form)
@@ -666,9 +714,11 @@ Extracts the base command, its arguments, and a processed plist of other keys."
       (setq cmd (car command-form) cmd-args (cdr command-form)))
 
     (let* ((user-args (plist-get keys :args))
-           (final-cwd (or (plist-get keys :cwd) (plist-get keys :dir))) ; Support :dir alias
+           (final-cwd (or (plist-get keys :cwd) (plist-get keys :dir))) ; Support
+                                                                         ; :dir alias
            (other-keys (cl-loop for (k v) on keys by #'cddr
-                                unless (memq k '(:args :cwd :dir)) ; Filter out processed keys
+                                unless (memq k '(:args :cwd :dir)) ; Filter out
+                                                                   ; processed keys
                                 nconc (list k v))))
       ;; Return a list: (command-executable final-arguments other-keys)
       (list cmd (append cmd-args user-args)
@@ -677,30 +727,33 @@ Extracts the base command, its arguments, and a processed plist of other keys."
 
 (defun concur--proc-helper-chain-pipe-commands (session command-forms)
   "Recursively builds a promise chain for `concur:pipe!` commands.
-Each command is submitted to the same shell SESSION."
+Each command is submitted to the same shell `SESSION`."
   (if (null command-forms)
       (concur:resolved! t) ; Base case: all commands succeeded
     (let* ((cmd-form (car command-forms))
            (parsed (concur--proc-helper-parse-command-and-keys
                     (car cmd-form) (cdr cmd-form)))
-           (cmd-str (s-join " " (cl-cons (car parsed) (cl-cadr parsed)))) ;; Use cl-cons and cl-cadr for clarity
-           (cmd-keys (cl-caddr parsed))) ;; Use cl-caddr for clarity
+           (cmd-str (s-join " " (cl-cons (car parsed) (cl-cadr parsed)))) 
+           (cmd-keys (cl-caddr parsed))) 
       (concur:chain (funcall session cmd-str ; Submit command to the shell session
                              :cwd (plist-get cmd-keys :cwd)
                              :timeout (plist-get cmd-keys :timeout))
-        ;; Extract the error promise from the shell session result (stdout, stderr, error-promise)
+        ;; Extract the error promise from the shell session result (stdout,
+        ;; stderr, error-promise)
         (:then (lambda (shell-session-result)
                  (nth 2 shell-session-result)))
         ;; Continue chaining recursively with the rest of the commands
-        (:then (lambda (_) ; Ignore the result of the error-promise (it resolved successfully)
+        (:then (lambda (_) ; Ignore the result of the error-promise
+                                        ; (it resolved successfully)
                  (concur--proc-helper-chain-pipe-commands
                   session (cdr command-forms))))))))
 
 (defun concur--maybe-reject-process-result (exit-code stderr stdout cmd)
   "Helper to determine if a process result warrants a rejection error.
-Returns a `concur-error` object if failure conditions are met, otherwise `nil`."
+Returns a `concur-error` object if failure conditions are met, otherwise
+`nil`."
   (pcase (list exit-code stderr)
-    ;; Non-zero exit code → failure
+    ;; Non-zero exit code -> failure
     (`(,(and code (pred (lambda (c) (/= c 0)))) ,stderr)
      (concur:make-error
       :type 'concur-process-exit-error
@@ -710,7 +763,8 @@ Returns a `concur-error` object if failure conditions are met, otherwise `nil`."
       :stdout stdout
       :stderr stderr))
 
-    ;; Zero exit but non-empty stderr → warning/error (if stderr is considered an error)
+    ;; Zero exit but non-empty stderr -> warning/error (if stderr is
+    ;; considered an error)
     (`(0 ,(and stderr (pred (lambda (s) (not (string-empty-p s))))))
      (concur:make-error
       :type 'concur-process-stderr-output-error
@@ -722,12 +776,13 @@ Returns a `concur-error` object if failure conditions are met, otherwise `nil`."
     ;; Otherwise: success
     (_ nil)))
 
-;; Reverting to the explicit chaining for stream draining (as in original working version)
 (defun concur--finalize-command-promise (process-promise)
   "Chains from an raw `concur:process` promise to drain streams and
-resolve with the final stdout string. Handles errors based on exit code and stderr."
+resolve with the final stdout string. Handles errors based on exit code
+and stderr."
   (concur:chain process-promise
-    ;; Step 1: When the process finishes, get the `concur-process-result` struct.
+    ;; Step 1: When the process finishes, get the `concur-process-result`
+    ;; struct.
     (:then
      (lambda (proc-result)
        ;; Step 2: Drain stdout stream and pass both the collected chunks
@@ -736,7 +791,7 @@ resolve with the final stdout string. Handles errors based on exit code and stde
         (concur:stream-drain
          (concur-process-result-stdout-stream proc-result))
         (lambda (stdout-chunks)
-          (list stdout-chunks proc-result))))) ; Return list (stdout-chunks proc-result)
+          (list stdout-chunks proc-result))))) 
 
     ;; Step 3: Now we have stdout chunks and the `proc-result`. Drain stderr.
     (:then
@@ -747,7 +802,7 @@ resolve with the final stdout string. Handles errors based on exit code and stde
           (concur:stream-drain
            (concur-process-result-stderr-stream proc-result))
           (lambda (stderr-chunks)
-            (list stdout-chunks stderr-chunks proc-result)))))) ; Return list (stdout-chunks stderr-chunks proc-result)
+            (list stdout-chunks stderr-chunks proc-result)))))) 
 
     ;; Step 4: Now we have all drained streams and the process result.
     ;; Use the helper to process the combined results and settle the promise.
@@ -778,13 +833,14 @@ resolve with the final stdout string. Handles errors based on exit code and stde
 (defmacro concur:command (command &rest keys)
   "Run a command and return a promise for its complete stdout string.
 This high-level wrapper around `concur:process` handles common cases:
-- Rejects if the process exits with a non-zero code (unless `:die-on-error nil`).
+- Rejects if the process exits with a non-zero code (unless
+  `:die-on-error nil`).
 - Rejects if the process produces any output on stderr.
 - Resolves with the complete, trimmed stdout content on success.
 
 Arguments:
-  COMMAND (string or list): The command to run (e.g., `\"ls -l\"`).
-  KEYS (plist): Options, same as `concur:process`. Accepts `:dir` as an
+  `COMMAND` (string or list): The command to run (e.g., `\"ls -l\"`).
+  `KEYS` (plist): Options, same as `concur:process`. Accepts `:dir` as an
     alias for `:cwd`.
 
 Returns:
@@ -797,11 +853,10 @@ Returns:
           (final-keys (nth 2 parsed-parts))
           (process-promise (apply #'concur:process
                                   :command cmd :args args
-                                  :die-on-error nil ; Override default to allow custom error handling
+                                  :die-on-error nil ; Override default to allow
+                                                    ; custom error handling
                                   final-keys)))
      (concur:then (concur--finalize-command-promise process-promise)
-                  ;; The `concur:then` macro (in concur-chain.el) now internally handles forwarding
-                  ;; only the value, maintaining the clean API here.
                   (lambda (output-string) (s-trim output-string)))))
 
 ;;;###autoload
@@ -816,7 +871,7 @@ Arguments:
   `COMMAND-EXPR` (form): A form evaluating to the command list/string,
     which can use the variables bound in `ARGLIST`.
   `KEYS` (plist): Default options for `concur:command`.
-    - `:interactive` (form, optional): An interactive spec for the function.
+    - `:INTERACTIVE` (form, optional): An interactive spec for the function.
 
 Returns:
   The defined function name `NAME`."

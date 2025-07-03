@@ -93,7 +93,7 @@ Returns:
 - (concur-queue): A new `concur-queue` instance."
   (let* ((name (format "queue-lock-%S" (gensym)))
          (queue (%%make-queue :lock (concur:make-lock name))))
-    (concur--log :debug nil "Created new queue %S." queue)
+    (concur-log :debug nil "Created new queue %S." queue)
     queue))
 
 ;;;###autoload

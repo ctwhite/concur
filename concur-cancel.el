@@ -102,7 +102,7 @@ Returns:
                                      :lock (concur:make-lock
                                             (format "cancel-lock-%s"
                                                     token-name)))))
-    (concur--log :debug nil "Created cancel token: %S"
+    (concur-log :debug nil "Created cancel token: %S"
                  (or name (format "token-%s" (sxhash token))))
     token))
 
@@ -162,7 +162,7 @@ Returns:
         (setf (concur-cancel-token-callbacks token) '())))
 
     (when was-active-now-cancelled
-      (concur--log :info nil "Canceling token: %S"
+      (concur-log :info nil "Canceling token: %S"
                    (concur-cancel-token-name token))
       (dolist (info callbacks-to-run)
         (let ((fn (concur-cancel-callback-info-callback info))
@@ -170,7 +170,7 @@ Returns:
           (condition-case err
               (if dispatcher (funcall dispatcher fn) (run-at-time 0 nil fn))
             (error
-             (concur--log :error nil "Cancel callback failed for token %S: %S"
+             (concur-log :error nil "Cancel callback failed for token %S: %S"
                           (concur-cancel-token-name token) err))))))
     was-active-now-cancelled))
 

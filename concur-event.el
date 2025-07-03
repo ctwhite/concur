@@ -81,7 +81,7 @@ Returns:
          (event (%%make-event :name event-name
                               :lock lock
                               :wait-queue (concur-queue-create))))
-    (concur--log :debug event-name "Created event.")
+    (concur-log :debug event-name "Created event.")
     event))
 
 ;;;###autoload
@@ -116,7 +116,7 @@ Returns:
         (setf (concur-event-value event) (or value t))
         (setq waiters-to-resolve (concur-queue-drain (concur-event-wait-queue event)))
         (setq resolve-value (concur-event-value event))
-        (concur--log :debug (concur-event-name event)
+        (concur-log :debug (concur-event-name event)
                      "Event set with value %S. Waking up %d waiters."
                      resolve-value (length waiters-to-resolve))))
     (dolist (promise waiters-to-resolve)
@@ -135,7 +135,7 @@ Returns:
   (concur:with-mutex! (concur-event-lock event)
     (setf (concur-event-is-set-p event) nil)
     (setf (concur-event-value event) t) ; Reset value to default.
-    (concur--log :debug (concur-event-name event) "Event cleared.")))
+    (concur-log :debug (concur-event-name event) "Event cleared.")))
 
 ;;;###autoload
 (cl-defun concur:event-wait (event &key timeout)
@@ -157,7 +157,7 @@ Returns:
       (if (concur-event-is-set-p event)
           (setq wait-promise (concur:resolved! (concur-event-value event)))
         (setq wait-promise (concur:make-promise :name "event-wait"))
-        (concur--log :debug (concur-event-name event) "Task is waiting for event.")
+        (concur-log :debug (concur-event-name event) "Task is waiting for event.")
         (concur:queue-enqueue (concur-event-wait-queue event) wait-promise)))
     (if timeout
         (concur:timeout wait-promise timeout)

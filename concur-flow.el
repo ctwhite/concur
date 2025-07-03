@@ -117,7 +117,7 @@ Returns:
   (unless (functionp fn) (error "FN must be a function: %S" fn))
   (let ((promise (concur:make-promise :name name :cancel-token cancel-token
                                       :mode mode)))
-    (concur--log :info (concur-promise-id promise)
+    (concur-log :info (concur-promise-id promise)
                  "Starting task '%S' in mode %S." (or name "unnamed") mode)
     (pcase mode
       ('deferred
