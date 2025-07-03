@@ -80,58 +80,58 @@
 (require 'concur-nursery)
 
 ;; Load the coroutine bridge, which is essential for the async/await syntax.
-(require 'coroutines)        ; Core Emacs library for coroutines
+;; (require 'coroutines)        ; Core Emacs library for coroutines
 (require 'concur-coroutine)  ; Bridge between `concur` and `coroutines.el`
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; High-Level Async/Await Syntax (Recommended API)
 
-;; The key used by `await` to yield a promise to the underlying driver.
-(declare-function yield--await-external-status-key "yield")
+;; ;; The key used by `await` to yield a promise to the underlying driver.
+;; (declare-function yield--await-external-status-key "yield")
 
-;;;###autoload
-(defmacro concur:await! (promise-form)
-  "Wait for a promise to settle inside a `concur:defasync!` block.
-This macro is the asynchronous equivalent of a blocking function call,
-but it yields control instead of freezing the UI. It can only be used
-inside a function defined with `concur:defasync!`.
+;; ;;;###autoload
+;; (defmacro concur:await! (promise-form)
+;;   "Wait for a promise to settle inside a `concur:defasync!` block.
+;; This macro is the asynchronous equivalent of a blocking function call,
+;; but it yields control instead of freezing the UI. It can only be used
+;; inside a function defined with `concur:defasync!`.
 
-  Arguments:
-  - `PROMISE-FORM` (form): An expression that evaluates to a `concur-promise`
-    or another awaitable object (like a future or coroutine).
+;;   Arguments:
+;;   - `PROMISE-FORM` (form): An expression that evaluates to a `concur-promise`
+;;     or another awaitable object (like a future or coroutine).
 
-  Returns:
-  - (any): The resolved value of the promise. Signals an error if the
-    promise rejects."
-  (declare (indent 1) (debug t))
-  (concur--log :debug nil "Expanding concur:await! for promise: %S."
-               promise-form)
-  `(yield! (list yield--await-external-status-key ,promise-form)))
+;;   Returns:
+;;   - (any): The resolved value of the promise. Signals an error if the
+;;     promise rejects."
+;;   (declare (indent 1) (debug t))
+;;   (concur--log :debug nil "Expanding concur:await! for promise: %S."
+;;                promise-form)
+;;   `(yield! (list yield--await-external-status-key ,promise-form)))
 
-;;;###autoload
-(defmacro concur:defasync! (name arglist &rest body)
-  "Define an asynchronous function `NAME` with `ARGLIST` and `BODY`.
-This creates a function that, when called, immediately returns a
-`concur-promise`. The `BODY` of the function is executed as a coroutine.
-Inside the `BODY`, you can use `(concur:await! ...)` to wait for other
-promises to complete, allowing you to write asynchronous code that reads
-like standard, sequential code.
+;; ;;;###autoload
+;; (defmacro concur:defasync! (name arglist &rest body)
+;;   "Define an asynchronous function `NAME` with `ARGLIST` and `BODY`.
+;; This creates a function that, when called, immediately returns a
+;; `concur-promise`. The `BODY` of the function is executed as a coroutine.
+;; Inside the `BODY`, you can use `(concur:await! ...)` to wait for other
+;; promises to complete, allowing you to write asynchronous code that reads
+;; like standard, sequential code.
 
-  Arguments:
-  - `NAME` (symbol): The name for the new asynchronous function.
-  - `ARGLIST` (list): The argument list for the function.
-  - `BODY` (forms): The forms that make up the function's logic.
+;;   Arguments:
+;;   - `NAME` (symbol): The name for the new asynchronous function.
+;;   - `ARGLIST` (list): The argument list for the function.
+;;   - `BODY` (forms): The forms that make up the function's logic.
 
-  Returns:
-  - (symbol): The symbol `NAME`, now defined as an async function."
-  (declare (indent defun))
-  (let ((docstring (if (stringp (car body)) (pop body)
-                     (format "Asynchronous function %S." name))))
-    (concur--log :info nil "Defining async function: %S." name)
-    `(defun ,name (,@arglist)
-       ,docstring
-       (let ((coroutine-runner (coroutine-create (lambda () ,@body))))
-         (concur:from-coroutine coroutine-runner)))))
+;;   Returns:
+;;   - (symbol): The symbol `NAME`, now defined as an async function."
+;;   (declare (indent defun))
+;;   (let ((docstring (if (stringp (car body)) (pop body)
+;;                      (format "Asynchronous function %S." name))))
+;;     (concur--log :info nil "Defining async function: %S." name)
+;;     `(defun ,name (,@arglist)
+;;        ,docstring
+;;        (let ((coroutine-runner (coroutine-create (lambda () ,@body))))
+;;          (concur:from-coroutine coroutine-runner)))))
 
 ;;;###autoload
 (defmacro concur:await-with-timeout! (promise-form timeout-seconds)
