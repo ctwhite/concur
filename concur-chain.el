@@ -290,15 +290,61 @@ Arguments:
 Returns:
 - `(concur-promise)`: A new promise."
   (declare (indent 1) (debug t))
-  `(concur:then
-    ,promise-form
-    ;; on-resolved: run callback, then resolve with original value.
-    (lambda (val)
-      (concur:then (funcall ,callback-form) (lambda (_) val)))
-    ;; on-rejected: run callback, then reject with original error.
-    (lambda (err)
-      (concur:then (funcall ,callback-form)
-                   (lambda (_) (concur:rejected! err))))))
+  (let ((p-sym (gensym "promise-"))
+        (new-p-sym (gensym "new-promise-"))
+        (val-sym (gensym "val-"))
+        (err-sym (gensym "err-"))
+        (cb-res-sym (gensym "callback-result-"))) ; To hold the result of the callback
+
+    `(let* ((,p-sym ,promise-form)
+            (,new-p-sym (concur:make-promise :parent-promise ,p-sym))) ; New promise from finally
+
+       (concur-attach-then-callbacks
+        ,p-sym
+        ,new-p-sym
+
+        ;; ON-RESOLVED handler for the original promise:
+        (lambda (,new-p-sym ,val-sym) ; new-p-sym is the target promise for this handler
+          (condition-case cb-err
+              (let ((,cb-res-sym (funcall ,callback-form))) ; Execute the finally callback
+                (if (concur-promise-p ,cb-res-sym)
+                    ;; If callback returns a promise, assimilate its state.
+                    ;; When it resolves, resolve new-p-sym with original value.
+                    ;; When it rejects, reject new-p-sym with callback's error.
+                    (concur:then ,cb-res-sym
+                                 (lambda (_) (concur:resolve ,new-p-sym ,val-sym))
+                                 (lambda (actual-cb-err) (concur:reject ,new-p-sym actual-cb-err)))
+                  ;; If callback returns a non-promise, resolve new-p-sym with original value.
+                  (concur:resolve ,new-p-sym ,val-sym)))
+            ;; If callback signals a Lisp error, reject new-p-sym.
+            (error
+             (concur:reject ,new-p-sym
+                            (concur:make-error
+                             :type :callback-error
+                             :message (format "Finally resolved handler failed: %S" cb-err)
+                             :cause cb-err :promise ,new-p-sym)))))
+
+        ;; ON-REJECTED handler for the original promise:
+        (lambda (,new-p-sym ,err-sym) ; new-p-sym is the target promise for this handler
+          (condition-case cb-err
+              (let ((,cb-res-sym (funcall ,callback-form))) ; Execute the finally callback
+                (if (concur-promise-p ,cb-res-sym)
+                    ;; If callback returns a promise, assimilate its state.
+                    ;; When it resolves, reject new-p-sym with original error.
+                    ;; When it rejects, reject new-p-sym with callback's error (overrides original).
+                    (concur:then ,cb-res-sym
+                                 (lambda (_) (concur:reject ,new-p-sym ,err-sym))
+                                 (lambda (actual-cb-err) (concur:reject ,new-p-sym actual-cb-err)))
+                  ;; If callback returns a non-promise, reject new-p-sym with original error.
+                  (concur:reject ,new-p-sym ,err-sym)))
+            ;; If callback signals a Lisp error, reject new-p-sym.
+            (error
+             (concur:reject ,new-p-sym
+                            (concur:make-error
+                             :type :callback-error
+                             :message (format "Finally rejected handler failed: %S" cb-err)
+                             :cause cb-err :promise ,new-p-sym))))))
+       ,new-p-sym)))
 
 ;;;###autoload
 (defmacro concur:tap (promise-form callback-form)

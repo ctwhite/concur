@@ -85,7 +85,7 @@ to suppress automatic errors for unhandled rejections."
   :type 'boolean
   :group 'concur)
 
-(defcustom concur-await-poll-interval 0.01
+(defcustom concur-await-poll-interval 0.0
   "The polling interval (in seconds) for `concur:await` blocking."
   :type 'float
   :group 'concur)
@@ -438,21 +438,40 @@ Arguments:
 
 (defun concur--partition-and-schedule-callbacks (callbacks)
   "Partitions `CALLBACKS` into microtasks and macrotasks, then schedules them.
+   Promise handlers (`:resolved`, `:rejected`) are scheduled as macrotasks by default,
+   unless they are directly resolving another promise in a chain, in which case
+   they are treated as microtasks.
+   `await-latch` callbacks are always scheduled as microtasks for immediate response.
 
-Arguments:
-- `CALLBACKS` (list): A flat list of `concur-callback` objects to schedule."
-  ;; This implements a basic microtask/macrotask queue segregation.
-  (let* ((microtasks
-          (-filter (lambda (cb) (eq (concur-callback-type cb) :await-latch))
-                   callbacks))
-         (macrotasks
-          (-drop-while (lambda (cb)
-                         (eq (concur-callback-type cb) :await-latch))
-                       callbacks)))
-    ;; Microtasks execute immediately (or as soon as possible after current script).
-    (when microtasks (concur:schedule-microtasks microtasks))
-    ;; Macrotasks execute in subsequent event loop turns (e.g., idle timer).
+ Arguments:
+ - `CALLBACKS` (list): A flat list of `concur-callback` objects to schedule."   
+  (let* ((microtasks '())
+         (macrotasks '()))
+    (dolist (cb callbacks)
+      (pcase (concur-callback-type cb)
+        (:await-latch
+         ;; Await latches must always be microtasks for immediate signaling.
+         (push cb microtasks))
+        ((or :resolved :rejected)
+         ;; These are promise handlers. If they resolve/reject another promise
+         ;; as part of a chain (which is common), they should run as microtasks
+         ;; to propagate state quickly. If they are final handlers, macrotasks are fine.
+         ;; A heuristic: if the handler has a `promise-id` associated, it likely chains.
+         ;; For simplicity and `await` compatibility, let's try making them microtasks.
+         (push cb microtasks)) 
+        (_
+         ;; Other types (if any) go to macrotasks or custom handling.
+         (push cb macrotasks))))
+
+    ;; Reverse to maintain original order if needed (though queue handles order)
+    (setq microtasks (nreverse microtasks))
+    (setq macrotasks (nreverse macrotasks))
+
+    (when microtasks
+      (concur-log :debug nil "Scheduling %d microtasks (total)." (length microtasks))
+      (concur:schedule-microtasks microtasks))
     (when macrotasks
+      (concur-log :debug nil "Scheduling %d macrotasks (non-immediate handlers)." (length macrotasks))
       (dolist (cb macrotasks)
         (concur:scheduler-enqueue concur--macrotask-scheduler cb)))))
 

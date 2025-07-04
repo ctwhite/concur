@@ -1,3 +1,4 @@
+
 ;;; concur-future.el --- Lazy Asynchronous Computations -*- lexical-binding: t; -*-
 
 ;;; Commentary:
@@ -25,6 +26,7 @@
 (require 'concur-chain)
 (require 'concur-lock)
 (require 'concur-log)
+(require 'concur-ast)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors
@@ -110,39 +112,40 @@ Arguments:
 Returns:
 - (concur-promise): The promise associated with the future's result."
   (concur--validate-future future 'concur:force)
-  ;; Fast path: If already evaluated, just return the cached promise.
-  (when (concur-future-evaluated-p future)
-    (return-from concur:force (concur-future-promise future)))
+  (cl-block concur:force
+    ;; Fast path: If already evaluated, just return the cached promise.
+    (when (concur-future-evaluated-p future)
+      (cl-return-from concur:force (concur-future-promise future)))
 
-  (let (promise-to-return thunk-to-run)
-    ;; The critical section is minimized to only handle the state transition.
-    (concur:with-mutex! (concur-future-lock future)
-      (if (concur-future-evaluated-p future)
-          ;; Another thread evaluated it while we waited for the lock.
-          (setq promise-to-return (concur-future-promise future))
-        ;; We are the first to force this future.
-        (setf (concur-future-evaluated-p future) t)
-        (setq thunk-to-run (concur-future-thunk future))
-        (setq promise-to-return
-              (concur:make-promise :mode (concur-future-mode future)
-                                   :name "future-promise"))
-        (setf (concur-future-promise future) promise-to-return)))
+    (let (promise-to-return thunk-to-run)
+      ;; The critical section is minimized to only handle the state transition.
+      (concur:with-mutex! (concur-future-lock future)
+        (if (concur-future-evaluated-p future)
+            ;; Another thread evaluated it while we waited for the lock.
+            (setq promise-to-return (concur-future-promise future))
+          ;; We are the first to force this future.
+          (setf (concur-future-evaluated-p future) t)
+          (setq thunk-to-run (concur-future-thunk future))
+          (setq promise-to-return
+                (concur:make-promise :mode (concur-future-mode future)
+                                    :name "future-promise"))
+          (setf (concur-future-promise future) promise-to-return)))
 
-    ;; If we got a thunk, we are responsible for running it outside the lock.
-    (when thunk-to-run
-      (concur-log :info nil "Forcing future - executing thunk for first time.")
-      (condition-case err
-          (let ((thunk-result (funcall thunk-to-run)))
-            ;; The result can be another promise/future. `resolve` handles this.
-            (concur:resolve promise-to-return thunk-result))
-        (error
-         (concur-log :error nil "Future thunk failed synchronously: %S" err)
-         (concur:reject
-          promise-to-return
-          (concur:make-error :type :executor-error
-                             :message (format "Future thunk failed: %S" err)
-                             :cause err :promise promise-to-return)))))
-    promise-to-return))
+      ;; If we got a thunk, we are responsible for running it outside the lock.
+      (when thunk-to-run
+        (concur-log :info nil "Forcing future - executing thunk for first time.")
+        (condition-case err
+            (let ((thunk-result (funcall thunk-to-run)))
+              ;; The result can be another promise/future. `resolve` handles this.
+              (concur:resolve promise-to-return thunk-result))
+          (error
+          (concur-log :error nil "Future thunk failed synchronously: %S" err)
+          (concur:reject
+            promise-to-return
+            (concur:make-error :type :executor-error
+                              :message (format "Future thunk failed: %S" err)
+                              :cause err :promise promise-to-return)))))
+      promise-to-return)))
 
 ;;;###autoload
 (defun concur:future-get (future &optional timeout)

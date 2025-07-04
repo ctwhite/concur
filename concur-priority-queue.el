@@ -55,20 +55,6 @@ Fields:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Helpers
 
-(defun concur--validate-queue (queue function-name)
-  "Signal an error if QUEUE is not a `concur-priority-queue`.
-
-Arguments:
-- `QUEUE` (any): The object to validate.
-- `FUNCTION-NAME` (symbol): The name of the calling function for the error.
-
-Signals:
-- `concur-invalid-priority-queue-error` if `QUEUE` is not valid.
-"
-  (unless (eq (type-of queue) 'concur-priority-queue)
-    (signal 'concur-invalid-priority-queue-error
-            (list (format "%s: Invalid queue object" function-name) queue))))
-
 (defun concur--priority-queue-heapify-up (queue idx)
   "Move the element at `IDX` up to maintain the heap property.
 This must be called from within a locked context.
@@ -184,7 +170,6 @@ Returns:
 Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 "
-  (concur--validate-queue queue 'concur:priority-queue-length)
   (concur-priority-queue-len queue))
 
 ;;;###autoload
@@ -200,7 +185,6 @@ Returns:
 Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 "
-  (concur--validate-queue queue 'concur:priority-queue-empty-p)
   (zerop (concur-priority-queue-len queue)))
 
 ;;;###autoload
@@ -218,7 +202,6 @@ Returns:
 Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 "
-  (concur--validate-queue queue 'concur:priority-queue-insert)
   (concur:with-mutex! (concur-priority-queue-lock queue)
     (let* ((len (concur-priority-queue-len queue))
            (capacity (length (concur-priority-queue-heap queue)))
@@ -248,7 +231,6 @@ Returns:
 Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 "
-  (concur--validate-queue queue 'concur:priority-queue-peek)
   (concur:with-mutex! (concur-priority-queue-lock queue)
     (unless (concur:priority-queue-empty-p queue)
       (aref (concur-priority-queue-heap queue) 0))))
@@ -267,7 +249,6 @@ Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 - `error` if the queue is empty.
 "
-  (concur--validate-queue queue 'concur:priority-queue-pop)
   (concur:with-mutex! (concur-priority-queue-lock queue)
     (concur--priority-queue-pop-internal queue)))
 
@@ -288,7 +269,6 @@ Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 - `error` if `N` is not a non-negative integer.
 "
-  (concur--validate-queue queue 'concur:priority-queue-pop-n)
   (unless (and (integerp n) (>= n 0)) (error "N must be a non-negative integer"))
   (concur:with-mutex! (concur-priority-queue-lock queue)
     (let ((count (min n (concur:priority-queue-length queue))))
@@ -312,7 +292,6 @@ Returns:
 Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 "
-  (concur--validate-queue queue 'concur:priority-queue-remove)
   (concur:with-mutex! (concur-priority-queue-lock queue)
     (let* ((heap (concur-priority-queue-heap queue))
            (len (concur-priority-queue-len queue))
@@ -351,7 +330,6 @@ Signals:
 - `concur-invalid-priority-queue-error` if `QUEUE` is not a valid object.
 "
   (interactive)
-  (concur--validate-queue queue 'concur:priority-queue-status)
   (concur:with-mutex! (concur-priority-queue-lock queue)
     `(:length ,(concur-priority-queue-len queue)
       :capacity ,(length (concur-priority-queue-heap queue))

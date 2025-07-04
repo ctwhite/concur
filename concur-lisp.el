@@ -8,6 +8,7 @@
 ;;
 ;; By maintaining a pool of ready-to-use background Emacs processes, it
 ;; avoids the overhead of starting a new process for each task. This makes
+
 ;; it ideal for parallelizing CPU-bound Lisp computations without freezing
 ;; the user interface.
 ;;
@@ -194,7 +195,7 @@ Returns:
 - `(concur-promise)`: A promise that resolves with the value of the target node."
   (declare (indent 1) (debug t))
   (let* ((user-nodes (cadr let-block))
-         ;; Wrap nodes to be compatible with the generic `task-graph` macro.
+         ;; Wrap nodes to be compatible with the generic `task-graph` function.
          (wrapped-nodes (mapcar (lambda (it) `(,(car it) (:lisp ,@(cdr it))))
                                 user-nodes))
          (wrapped-let-block `(:let ,wrapped-nodes))
@@ -205,10 +206,12 @@ Returns:
              (concur:lisp-submit-task (concur--lisp-pool-get-default)
                                       form
                                       :vars dep-alist))))
-    ;; Delegate to the generic graph macro.
-    `(concur:task-graph! ,wrapped-let-block
-       :executors (:lisp ,lisp-executor)
-       ,@body)))
+    ;; Delegate to the generic graph FUNCTION using `apply`.
+    ;; This is the robust way to handle the variable arguments in `body`.
+    `(apply #'concur:task-graph!
+            ',wrapped-let-block
+            (append '(:executors ,lisp-executor)
+                    ,body))))
 
 (provide 'concur-lisp)
 ;;; concur-lisp.el ends here

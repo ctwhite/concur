@@ -8,16 +8,15 @@
 ;; What is a microtask?
 ;; A microtask is a small piece of work (like executing a promise callback)
 ;; that must run "as soon as possible" after the current operation finishes,
-;; but *before* Emacs handles new user input or other timers.
+;; but *before* Emacs handles new user input or other timers. Microtasks execute
+;; synchronously within the current call stack until the queue is empty.
 ;;
 ;; Why are microtasks necessary for promises?
 ;; The Promise/A+ specification (section 2.2.4) requires that promise
 ;; callbacks (`onFulfilled` or `onRejected`) are called asynchronously, never
-;; in the same turn of the event loop that settled the promise. This prevents
-;; "Zalgo" (unpredictable code that is sometimes sync, sometimes async) and
-;; guarantees a consistent execution flow. This module fulfills that
-;; requirement by using `(run-with-timer 0 nil ...)` to schedule work on the
-;; very next tick of the Emacs event loop.
+;; in the same turn of the event loop that settled the promise. For specific
+;; high-priority internal tasks (like `await` latch signaling), microtasks ensure
+;; immediate processing.
 
 ;;; Code:
 
@@ -68,7 +67,7 @@ Fields:
 - `queue` (concur-queue): The underlying FIFO queue of callbacks.
 - `lock` (concur-lock): A mutex to synchronize access to the queue.
 - `drain-scheduled-p` (boolean): `t` if a drain operation has already
-  been scheduled, preventing redundant timers.
+  been scheduled, preventing redundant runs.
 - `drain-tick-counter` (integer): A counter for drain cycles, for debugging."
   (queue nil :type (or null concur-queue-p))
   (lock nil :type (or null concur-lock-p))
@@ -104,54 +103,46 @@ Arguments:
                             :message msg))))))
 
 (defun concur--drain-microtask-queue ()
-  "Process a batch of microtasks from the global queue.
-This function is designed to avoid deadlocks by separating locking from
-execution. It is intended to be called by a timer.
+  "Process all microtasks from the global queue until it is empty.
+This function repeatedly grabs batches and executes them until the queue
+is exhausted. It manages its own internal locking for queue access."
+  (cl-block concur--drain-microtask-queue
+    (cl-incf (concur-microtask-queue-drain-tick-counter
+              concur--global-microtask-queue))
+    (let ((tick (concur-microtask-queue-drain-tick-counter
+                concur--global-microtask-queue)))
+      (concur-log :debug nil "Microtask drain tick %d starting." tick))
 
-The logic proceeds in phases:
-1.  Reset the scheduling flag under a lock.
-2.  Grab a batch of tasks from the queue, also under a lock.
-3.  Execute the batch *without* holding the lock. This is critical to
-    allow callbacks to safely schedule more microtasks.
-4.  Re-acquire the lock to check if more work was added during execution,
-    and reschedule a new drain if necessary."
-  ;; Phase 1: Reset scheduling flag.
-  (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
-    (setf (concur-microtask-queue-drain-scheduled-p
-           concur--global-microtask-queue) nil))
+    ;; Loop to process all batches until queue is empty
+    (while t ; Loop indefinitely until explicitly broken or queue becomes empty
+      (let ((batch)
+            (queue (concur-microtask-queue-queue concur--global-microtask-queue)))
 
-  (cl-incf (concur-microtask-queue-drain-tick-counter
-            concur--global-microtask-queue))
-  (let ((tick (concur-microtask-queue-drain-tick-counter
-               concur--global-microtask-queue)))
-    (concur-log :debug nil "Microtask drain tick %d starting." tick)
+        ;; Phase 1: Grab a batch of tasks from the queue under a lock.
+        (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
+          (let ((batch-size (min (concur:queue-length queue)
+                                  concur-microtask-max-batch-size)))
+            (setq batch (cl-loop repeat batch-size
+                                collect (concur:queue-dequeue queue)))))
 
-    ;; Phase 2: Lock, grab a batch of tasks, and immediately unlock.
-    (let ((batch)
-          (queue (concur-microtask-queue-queue concur--global-microtask-queue)))
-      (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
-        (let ((batch-size (min (concur:queue-length queue)
-                                concur-microtask-max-batch-size)))
-          (setq batch (cl-loop repeat batch-size
-                               collect (concur:queue-dequeue queue)))))
+        ;; If no batch was obtained, the queue is (now) empty, so we're done draining.
+        (unless batch
+          ;; Reset the scheduled flag here as the queue is now empty.
+          (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
+            (setf (concur-microtask-queue-drain-scheduled-p
+                  concur--global-microtask-queue) nil))
+          (cl-return-from concur--drain-microtask-queue nil)) ; Exit the function
 
-      ;; Phase 3: Execute the batch without holding the lock.
-      (when batch
-        (concur-log :debug nil "Processing %d microtasks in tick %d." (length batch) tick)
+        ;; Phase 2: Execute the batch *without* holding the lock.
+        (concur-log :debug nil "Processing %d microtasks in tick %d." (length batch)
+                    (concur-microtask-queue-drain-tick-counter concur--global-microtask-queue))
         (dolist (cb batch)
           (condition-case err (concur-execute-callback cb)
-            (error (concur-log :error nil "Unhandled error in microtask: %S" err))))))
+            (error (concur-log :error nil "Unhandled error in microtask: %S" err))))
 
-    ;; Phase 4: Lock again to check for more work and reschedule if needed.
-    (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
-      (let ((queue (concur-microtask-queue-queue concur--global-microtask-queue)))
-        (when (and (not (concur:queue-empty-p queue))
-                   (not (concur-microtask-queue-drain-scheduled-p
-                         concur--global-microtask-queue)))
-          (setf (concur-microtask-queue-drain-scheduled-p
-                 concur--global-microtask-queue) t)
-          (concur-log :debug nil "More microtasks remain; rescheduling drain.")
-          (run-with-timer 0 nil #'concur--drain-microtask-queue))))))
+        ;; Loop back to grab the next batch immediately until the queue is empty.
+        ;; No explicit re-scheduling or recursive call here; the `while t` handles continuous draining.
+        ))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -171,22 +162,13 @@ Returns:
 ;;;###autoload
 (defun concur:schedule-microtasks (callbacks)
   "Add a list of `CALLBACKS` to the global microtask queue.
-This function adds tasks and ensures a drain operation is scheduled
-to process them on the next tick of the Emacs event loop.
-
-Arguments:
-- `CALLBACKS` (list): A list of `concur-callback` structs to add.
-
-Returns:
-- `nil`.
-
-Signals:
-- `error` if `CALLBACKS` is not a list. If the queue overflows,
-  the promises associated with the dropped callbacks are rejected."
+This function adds tasks and, if a drain is not already in progress,
+triggers an immediate drain operation to process them before Emacs
+returns control to the caller."
   (unless (listp callbacks)
     (error "Argument must be a list of callbacks: %S" callbacks))
 
-  (let (overflowed)
+  (let (overflowed trigger-drain-now)
     (concur:with-mutex! (concur-microtask-queue-lock concur--global-microtask-queue)
       (let* ((capacity concur-microtask-queue-capacity)
              (queue (concur-microtask-queue-queue concur--global-microtask-queue)))
@@ -202,7 +184,8 @@ Signals:
              concur--global-microtask-queue)
       (setf (concur-microtask-queue-drain-scheduled-p
              concur--global-microtask-queue) t)
-      (run-with-timer 0 nil #'concur--drain-microtask-queue))))
+      (concur-log :debug nil "Scheduling initial microtask drain immediately (top-level).")
+      (concur--drain-microtask-queue))))
 
 (provide 'concur-microtask)
-;;; concur-microtask.el ends here
+;;; concur-microtask.el ends here   

@@ -4,7 +4,7 @@
 ;; Author: Christian White <christiantwhite@protonmail.com>
 ;; Version: 2.0.0
 ;; Package-Requires: ((emacs "29.1") (cl-lib "0.5") (s "1.12.0")
-;;                    (dash "2.19.1") (coroutines "1.0"))
+;;                    (dash "2.19.1"))
 ;; Homepage: https://github.com/ctwhite/concur.el
 ;; Keywords: concurrency, async, promises, futures, tasks, lisp, emacs
 

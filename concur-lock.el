@@ -8,8 +8,10 @@
 ;; various concurrency modes within the Concur library.
 ;;
 ;; Key features include:
-;; - Cooperative Locks: For single-threaded async operations, preventing re-entry.
-;; - Native Thread Locks: For preemptive thread-safety using Emacs's native mutexes.
+;; - Cooperative Locks: For single-threaded async operations, with reentrant
+;;   support.
+;; - Native Thread Locks: For preemptive thread-safety using Emacs's native
+;;   mutexes (implicitly reentrant).
 ;; - Non-Blocking `try-acquire`: For cooperative locks, allows attempting to
 ;;   acquire a lock without blocking.
 ;; - Resource Tracking Hooks: Integrates with higher-level libraries to monitor
@@ -18,18 +20,18 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'subr-x)
+(require 'subr-x) ; Provides `timerp`.
 (require 'concur-log)
 
 ;; Ensure native Emacs thread functions are loaded if available.
 (when (fboundp 'make-thread) (require 'thread))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
 
 (declare-function concur:make-error "concur-core")
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors
 
 (define-error 'concur-lock-error
@@ -48,25 +50,27 @@
   "An operation is not supported for the lock's mode."
   'concur-lock-error)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Data Structures
 
 (cl-defstruct (concur-lock (:constructor %%make-lock))
   "A mutual exclusion lock (mutex).
 
 Fields:
-- `name` (string): A descriptive name for debugging.
-- `mode` (symbol): The lock's operating mode (`:deferred` or `:thread`).
+- `name` (string): Descriptive name for debugging.
+- `mode` (symbol): Lock's operating mode (`:deferred` or `:thread`).
 - `locked-p` (boolean): `t` if held (for cooperative `:deferred` mode).
-- `native-mutex` (mutex): The underlying native Emacs mutex for `:thread` mode.
-- `owner` (any): Identifier of the entity currently holding the lock."
+- `native-mutex` (mutex): Underlying native Emacs mutex for `:thread` mode.
+- `owner` (any): Identifier of the entity holding the lock.
+- `reentrant-count` (integer): Tracks nested acquisitions for `:deferred` mode."
   (name "" :type string)
   (mode :deferred :type (member :deferred :thread))
   (locked-p nil :type boolean)
   (native-mutex nil :type (or null (satisfies mutex-p)))
-  (owner nil))
+  (owner nil)
+  (reentrant-count 0 :type integer))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Helpers
 
 (defun concur--validate-lock (lock function-name)
@@ -74,7 +78,7 @@ Fields:
 
 Arguments:
 - `LOCK` (any): The object to validate.
-- `FUNCTION-NAME` (symbol): The name of the calling function for the error."
+- `FUNCTION-NAME` (symbol): The name of the calling function for error reporting."
   (unless (concur-lock-p lock)
     (signal 'concur-invalid-lock-error
             (list (format "%s: Invalid lock object" function-name) lock))))
@@ -105,15 +109,17 @@ Arguments:
              concur-resource-tracking-function)
     (funcall concur-resource-tracking-function action lock)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
 (cl-defun concur:make-lock (&optional name &key (mode :deferred))
   "Create a new lock object (mutex).
 The lock's behavior depends on its `MODE`:
-- `:deferred`: A cooperative, non-blocking lock for the main Emacs thread.
-- `:thread`: A native OS thread mutex (blocking acquire, preemptive).
+- `:deferred`: A cooperative, non-blocking, reentrant lock for the main
+  Emacs thread.
+- `:thread`: A native OS thread mutex (blocking acquire, preemptive,
+  implicitly reentrant).
 
 Arguments:
 - `NAME` (string): A descriptive name for debugging.
@@ -133,17 +139,18 @@ Signals:
              (unless (fboundp 'make-mutex)
                (error "Cannot create :thread mode lock: thread support missing."))
              (%%make-lock :name lock-name :mode :thread
-                          :native-mutex (make-mutex lock-name)))
+                          :native-mutex (make-mutex lock-name)
+                          :reentrant-count 0))
             (:deferred
-             (%%make-lock :name lock-name :mode mode)))))
-    (concur-log :debug (concur-lock-name new-lock) "Created lock.")
+             (%%make-lock :name lock-name :mode mode
+                          :reentrant-count 0)))))
+    (concur-log :debug (concur-lock-name new-lock) "Lock created.")
     new-lock))
 
 ;;;###autoload
 (defun concur:lock-acquire (lock &optional owner)
-  "Acquire `LOCK`. This is a **blocking** operation for `:thread` mode locks.
-It waits until the lock is available. For `:deferred` mode, it is
-non-blocking and fails if the lock is already held by another owner.
+  "Acquire `LOCK`. This is a **blocking** operation for `:thread` locks.
+For `:deferred` mode, it is cooperative and reentrant for the same owner.
 
 Arguments:
 - `LOCK` (concur-lock): The lock object.
@@ -157,19 +164,41 @@ Signals:
 - `error` if a `:deferred` lock is already held by another owner."
   (concur--validate-lock lock 'concur:lock-acquire)
   (let ((effective-owner (concur--lock-get-effective-owner lock owner)))
+    (concur-log :trace (concur-lock-name lock)
+                 "Acquire attempt by %S. State: owner=%S, locked=%S, count=%d"
+                 effective-owner (concur-lock-owner lock)
+                 (concur-lock-locked-p lock) (concur-lock-reentrant-count lock))
+
     (pcase (concur-lock-mode lock)
       (:thread
+       (unless (fboundp 'mutex-lock)
+         (error "Thread mutex functions not available."))
        (mutex-lock (concur-lock-native-mutex lock))
-       (setf (concur-lock-owner lock) effective-owner))
+       (setf (concur-lock-owner lock) effective-owner)
+       (concur-log :debug (concur-lock-name lock)
+                    "Native lock acquired by %S." effective-owner))
       (:deferred
-       (if (or (not (concur-lock-locked-p lock))
-               (eq (concur-lock-owner lock) effective-owner))
+       (if (not (concur-lock-locked-p lock)) ; Lock is currently free
            (progn
              (setf (concur-lock-locked-p lock) t)
-             (setf (concur-lock-owner lock) effective-owner))
-         (error "Could not acquire cooperative lock %s" (concur-lock-name lock)))))
-    (concur-log :debug (concur-lock-name lock) "Acquired lock by %S."
-                 (concur-lock-owner lock))
+             (setf (concur-lock-owner lock) effective-owner)
+             (setf (concur-lock-reentrant-count lock) 1)
+             (concur-log :debug (concur-lock-name lock)
+                          "Deferred lock acquired (first) by %S." effective-owner))
+         (if (eq (concur-lock-owner lock) effective-owner) ; Lock held by current owner (re-entry)
+             (progn
+               (cl-incf (concur-lock-reentrant-count lock))
+               (concur-log :debug (concur-lock-name lock)
+                            "Deferred lock re-acquired by %S. Count: %d."
+                            effective-owner (concur-lock-reentrant-count lock)))
+           ;; Lock held by *another* owner (true contention for cooperative lock)
+           (error "Could not acquire cooperative lock %s (held by %S)"
+                  (concur-lock-name lock) (concur-lock-owner lock))))))
+
+    (concur-log :trace (concur-lock-name lock)
+                 "Acquire complete. Final state: owner=%S, locked=%S, count=%d"
+                 (concur-lock-owner lock) (concur-lock-locked-p lock)
+                 (concur-lock-reentrant-count lock))
     (concur--lock-track-resource :acquire lock)
     t))
 
@@ -187,14 +216,17 @@ Returns:
 
 Signals:
 - `concur-invalid-lock-error` if `LOCK` is not a valid lock object.
-- `concur-lock-unsupported-operation-error` if called on a `:thread` mode lock."
+- `concur-lock-unsupported-operation-error` if called on a `:thread` lock."
   (concur--validate-lock lock 'concur:lock-try-acquire)
   (let ((acquired-p nil)
         (effective-owner (concur--lock-get-effective-owner lock owner)))
+    (concur-log :trace (concur-lock-name lock)
+                 "Try-acquire attempt by %S. State: owner=%S, locked=%S, count=%d"
+                 effective-owner (concur-lock-owner lock)
+                 (concur-lock-locked-p lock) (concur-lock-reentrant-count lock))
+
     (pcase (concur-lock-mode lock)
       (:thread
-       ;; Emacs Lisp does not provide a non-blocking `mutex-trylock`.
-       ;; Therefore, this operation is unsupported for native thread locks.
        (signal 'concur-lock-unsupported-operation-error
                (list "concur:lock-try-acquire is not supported for :thread mode locks")))
       (:deferred
@@ -203,88 +235,83 @@ Signals:
            (progn
              (setf (concur-lock-locked-p lock) t)
              (setf (concur-lock-owner lock) effective-owner)
+             (cl-incf (concur-lock-reentrant-count lock))
              (setq acquired-p t))
          (setq acquired-p nil))))
     (when acquired-p
-      (concur-log :debug (concur-lock-name lock) "Acquired lock by %S."
-                   (concur-lock-owner lock))
+      (concur-log :debug (concur-lock-name lock)
+                   "Deferred lock try-acquired by %S. Count: %d."
+                   (concur-lock-owner lock) (concur-lock-reentrant-count lock))
       (concur--lock-track-resource :acquire lock))
     acquired-p))
 
 ;;;###autoload
 (defun concur:lock-release (lock &optional owner)
   "Release `LOCK`. Requires the caller to be the current owner.
-
-Arguments:
-- `LOCK` (concur-lock): The lock object to release.
-- `OWNER` (any, optional): Identifier of the entity releasing the lock.
-
-Returns:
-- `t` if the lock was successfully released.
-
-Signals:
-- `concur-invalid-lock-error` if `LOCK` is not valid.
-- `concur-lock-unowned-release-error` if attempted by a non-owner."
+For `:deferred` locks, the release is counted, and the lock is only truly
+freed when the reentrant count returns to zero."
   (concur--validate-lock lock 'concur:lock-release)
   (let ((effective-owner (concur--lock-get-effective-owner lock owner)))
+    (concur-log :trace (concur-lock-name lock)
+                 "Release attempt by %S. State: owner=%S, locked=%S, count=%d"
+                 effective-owner (concur-lock-owner lock)
+                 (concur-lock-locked-p lock) (concur-lock-reentrant-count lock))
+
     (unless (eq (concur-lock-owner lock) effective-owner)
+      (concur-log :error (concur-lock-name lock)
+                   "Release error: lock owned by %S (caller %S)."
+                   (concur-lock-owner lock) effective-owner)
       (signal 'concur-lock-unowned-release-error
               (list (format "Cannot release lock %S owned by %S (caller is %S)"
                             (concur-lock-name lock)
                             (concur-lock-owner lock)
                             effective-owner))))
+
     (concur--lock-track-resource :release lock)
-    (setf (concur-lock-owner lock) nil)
+
     (pcase (concur-lock-mode lock)
-      (:thread (mutex-unlock (concur-lock-native-mutex lock)))
-      (:deferred (setf (concur-lock-locked-p lock) nil)))
-    (concur-log :debug (concur-lock-name lock) "Released lock by %S."
-                 effective-owner)
+      (:thread
+       (unless (fboundp 'mutex-unlock) (error "Thread mutex functions not available."))
+       (mutex-unlock (concur-lock-native-mutex lock))
+       (setf (concur-lock-owner lock) nil) ; Clear owner for thread locks
+       (concur-log :debug (concur-lock-name lock)
+                    "Native lock released by %S." effective-owner))
+      (:deferred
+       (cl-decf (concur-lock-reentrant-count lock))
+       (concur-log :debug (concur-lock-name lock)
+                    "Deferred lock released by %S. New count: %d."
+                    effective-owner (concur-lock-reentrant-count lock))
+       (when (zerop (concur-lock-reentrant-count lock)) ; Truly release if count is zero
+         (setf (concur-lock-owner lock) nil)
+         (setf (concur-lock-locked-p lock) nil)
+         (concur-log :debug (concur-lock-name lock)
+                      "Deferred lock fully freed by %S." effective-owner))))
+
+    (concur-log :trace (concur-lock-name lock)
+                 "Release complete. Final state: owner=%S, locked=%S, count=%d"
+                 (concur-lock-owner lock) (concur-lock-locked-p lock)
+                 (concur-lock-reentrant-count lock))
     t))
 
 ;;;###autoload
 (defmacro concur:with-mutex! (lock-form &rest body)
   "Execute BODY within a critical section guarded by the lock from `LOCK-FORM`.
 This macro ensures the lock is always released, even if an error occurs
-within the BODY. It uses a **blocking** acquire.
-
-Arguments:
-- `LOCK-FORM` (form): A form that evaluates to a `concur-lock` object.
-- `BODY` (forms): The forms to execute.
-
-Returns:
-- (any): The result of executing the BODY."
+within the BODY. It uses a **blocking** acquire for `:thread` locks. For
+`:deferred` locks, it attempts a cooperative reentrant acquire."
   (declare (indent 1) (debug t))
   (let ((lock-var (gensym "lock-")))
     `(let ((,lock-var ,lock-form))
        (if (concur:lock-acquire ,lock-var)
            (unwind-protect
                (progn ,@body)
+             ;; Always call concur:lock-release. It handles the reentrant count.
              (concur:lock-release ,lock-var))
-         ;; This fallback is primarily for `:deferred` locks that are
-         ;; already held. `:thread` locks will block in `lock-acquire`.
-         (error "Failed to acquire lock for with-mutex!")))))
-
-;;;###autoload
-(defun concur:lock-status (lock)
-  "Return a snapshot of the `LOCK`'s current status.
-
-Arguments:
-- `LOCK` (concur-lock): The lock to inspect.
-
-Returns:
-- (plist): A property list with lock metrics, including `:name`, `:mode`,
-  `:locked-p`, and `:owner`.
-
-Signals:
-- `concur-invalid-lock-error` if `LOCK` is not a valid lock object."
-  (concur--validate-lock lock 'concur:lock-status)
-  `(:name ,(concur-lock-name lock)
-    :mode ,(concur-lock-mode lock)
-    :locked-p ,(if (eq (concur-lock-mode lock) :thread)
-                   (not (eq (concur-lock-owner lock) nil))
-                 (concur-lock-locked-p lock))
-    :owner ,(concur-lock-owner lock)))
+         ;; This branch should only be reached if `concur:lock-acquire`
+         ;; signals an error (e.g., contention for a :deferred lock by a
+         ;; different owner, which is an error in cooperative mode).
+         (error "Failed to acquire lock %S for with-mutex! (unexpected path)"
+                (concur-lock-name ,lock-var))))))
 
 (provide 'concur-lock)
 ;;; concur-lock.el ends here

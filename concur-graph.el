@@ -2,7 +2,7 @@
 
 ;;; Commentary:
 ;;
-;; This library provides a generic, high-level macro, `concur:task-graph!`,
+;; This library provides a generic, high-level function, `concur:task-graph!`,
 ;; for defining and executing a dependency graph of asynchronous tasks. It
 ;; allows developers to specify tasks and their relationships declaratively,
 ;; and the system automatically executes them with maximum parallelism.
@@ -106,7 +106,7 @@ Signals:
           (signal 'concur-graph-parse-error (list "Duplicate node name" name)))
         (puthash name (%%make-graph-node
                        :name name :type type :form form
-                       :dependencies (if (listp deps) deps (list deps)))
+                       :dependencies (if (listp deps) deps (and deps (list deps))))
                  graph-nodes)))
     graph-nodes))
 
@@ -181,48 +181,48 @@ Returns:
   (concur-log :info nil "Starting graph execution for target '%S'." target-node)
 
   (cl-labels ((execute-node-memo (node-name)
-                (let ((node (gethash node-name nodes)))
-                  (unless node
-                    (signal 'concur-graph-node-not-found-error
-                            (list "Node not found in dependency list" node-name)))
-                  ;; Return memoized promise if already executing/done.
-                  (or (concur-graph-node-promise node)
-                      (let* ((deps (concur-graph-node-dependencies node))
-                             ;; Recursively get promises for dependencies.
-                             (dep-promises (mapcar #'execute-node-memo deps)))
-                        (concur-log :debug nil "Executing node '%S' (deps: %S)."
-                                     node-name deps)
-                        ;; Store new promise immediately for memoization.
-                        (setf (concur-graph-node-promise node)
-                              (concur:chain
-                                  ;; Wait for all dependencies to resolve.
-                                  (concur:all dep-promises :cancel-token cancel-token)
-                                (:then
-                                 (lambda (dep-values)
-                                   (let* ((type (concur-graph-node-type node))
-                                          (form (concur-graph-node-form node))
-                                          (executor (concur--graph-get-executor
-                                                     type executors))
-                                          (dep-alist (mapcar #'cons deps dep-values)))
-                                     (unless executor
-                                       (signal 'concur-graph-unknown-executor-error
-                                               (list "No executor for type" type)))
-                                     (concur-log :debug nil "Node '%S' running." node-name)
-                                     ;; Execute task via its executor.
-                                     (funcall executor form dep-alist))))))))))
+             (let ((node (gethash node-name nodes)))
+               (unless node
+                 (signal 'concur-graph-node-not-found-error
+                         (list "Node not found in dependency list" node-name)))
+               ;; Return memoized promise if already executing/done.
+               (or (concur-graph-node-promise node)
+                   (let* ((deps (concur-graph-node-dependencies node))
+                          ;; Recursively get promises for dependencies.
+                          (dep-promises (mapcar #'execute-node-memo deps)))
+                     (concur-log :debug nil "Executing node '%S' (deps: %S)."
+                                 node-name deps)
+                     ;; Store new promise immediately for memoization.
+                     (setf (concur-graph-node-promise node)
+                           (concur:chain
+                               ;; Wait for all dependencies to resolve.
+                               (concur:all dep-promises :cancel-token cancel-token)
+                             (:then
+                              (lambda (dep-values)
+                                (let* ((type (concur-graph-node-type node))
+                                       (form (concur-graph-node-form node))
+                                       (executor (concur--graph-get-executor
+                                                  type executors))
+                                       (dep-alist (mapcar #'cons deps dep-values)))
+                                  (unless executor
+                                    (signal 'concur-graph-unknown-executor-error
+                                            (list "No executor for type" type)))
+                                  (concur-log :debug nil "Node '%S' running." node-name)
+                                  ;; Execute task via its executor.
+                                  (funcall executor form dep-alist)))))))))))
     ;; Start execution from the target node.
-    (execute-node-memo target-node))))
+    (execute-node-memo target-node)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(defmacro concur:task-graph! (let-block &rest body)
+(defun concur:task-graph! (let-block &rest body)
   "Define and execute a dependency graph of asynchronous tasks.
-This macro provides a declarative way to define a complex workflow,
+This function provides a declarative way to define a complex workflow,
 which the system then executes with maximum parallelism.
 
-The macro takes a `:let` block to define tasks, an optional `:executors`
+It takes a `:let` block to define tasks, an optional `:executors`
 block, and a final `TARGET-NODE`.
 
 Each node in `:let` has the form: `(NAME (TYPE FORM &key DEPENDS-ON))`
@@ -246,26 +246,23 @@ Returns:
 
 Signals:
 - `error` for invalid syntax or if a cycle is detected."
-  (declare (indent 1) (debug t))
   (unless (and (listp let-block) (eq (car let-block) :let) (listp (cadr let-block)))
     (error "concur:task-graph!: `let-block` must be like `(:let (...))`"))
 
-  (let* ((target-node (car (last body)))
+  (let* ((let-definitions (cadr let-block))
+         (target-node (car (last body)))
          (executors (plist-get body :executors))
          (cancel-token (plist-get body :cancel-token))
          (show-p (plist-get body :show))
-         (nodes (concur--graph-parse-let-block (cadr let-block))))
+         (nodes (concur--graph-parse-let-block let-definitions)))
 
-    (concur-log :debug nil "Parsing task graph for target %S." target-node)
-    (concur--graph-detect-cycle nodes) ; Signals error on cycle.
+    (concur--graph-detect-cycle nodes)
 
     (if show-p
         (progn
           (concur--graph-visualize nodes target-node)
-          `(concur:resolved! ',(format "Graph for %S visualized." target-node)))
-      (progn
-        (concur-log :info nil "Generating graph exec for target %S." target-node)
-        `(concur--graph-run ',nodes ',executors ',target-node ,cancel-token)))))
+          (concur:resolved! (format "Graph for %S visualized." target-node)))
+      (concur--graph-run nodes executors target-node cancel-token))))
 
 ;;;###autoload
 (defun concur:graph-status (graph-nodes &optional target-node)
